@@ -144,8 +144,13 @@ two cashier values to the page:
 HTML-escape both when templating (Jinja's autoescape does it for you). They are per-payment
 session values, not your credentials.
 
-That's the whole integration: the session call, the script tag, and your domain bound to your
-checkout by Dominaite during onboarding.
+**6. Learn the outcome from a webhook.** The payer finishing on the widget is not your
+signal that you got paid - your backend does not see that at all. Point an endpoint at your
+server, verify the signature, and act on `payment.succeeded`. See [Webhooks](#webhooks) below;
+that is the step that closes the loop, not `get_status` in a loop.
+
+That's the whole integration: the session call, the script tag, the webhook, and your domain
+bound to your checkout by Dominaite during onboarding.
 
 ## Amounts are minor units
 
@@ -178,7 +183,132 @@ are raised immediately.
 
 A session is valid for 2 hours. If the payer comes back later, create a new session.
 
-## Status polling
+## Webhooks
+
+Webhooks are how you find out what happened to a payment. Create an endpoint in the Dominaite
+dashboard, pick the events you care about, and store the `whsec_...` secret it shows you - like
+the API secret, it is shown **once**.
+
+Dominaite POSTs each event to your URL with an `X-Webhook-Signature` header:
+
+```
+X-Webhook-Signature: t=1755700000,v1=5305bcf1302fdaba8f8c19a20c899e916fb4d2a7d8d547c62529ff87c4697b72
+```
+
+`verify_webhook` checks it and hands you the decoded event:
+
+```python
+import os
+
+from flask import Flask, request
+
+from dominaite import WebhookVerificationError, verify_webhook
+
+app = Flask(__name__)
+SECRET = os.environ["DOMINAITE_WEBHOOK_SECRET"]
+
+
+@app.post("/webhooks/dominaite")
+def dominaite_webhook():
+    try:
+        event = verify_webhook(
+            request.get_data(),                          # RAW body, not request.json
+            request.headers.get("X-Webhook-Signature", ""),
+            SECRET,
+        )
+    except WebhookVerificationError:
+        return "", 400
+
+    if already_handled(event["id"]):                     # delivery is at-least-once
+        return "", 200
+
+    enqueue(event)                                       # do the work outside the request
+    return "", 200
+```
+
+**Pass the raw body.** `request.json` (or any parse-then-re-serialize round trip) gives you
+different bytes than the ones that were signed, and verification will fail. This is the single
+most common webhook integration bug.
+
+**Verify before you read anything.** Until `verify_webhook` returns, the body is just bytes a
+stranger POSTed at you. Do not branch on `event["type"]` or trust an amount from an unverified
+payload.
+
+### The events
+
+`payment.succeeded`, `payment.failed`, `payment.requires_capture`, `payment.cancelled`,
+`payment.abandoned`, `payment.refunded`, `payment.disputed`.
+
+`payment.succeeded` is the only one that means money in hand. `requires_capture` is an approved
+hold, not a payment. `pending` and `processing` are never webhooked - if you want to show an
+in-flight state to a customer, poll the session.
+
+Each delivery is a flat JSON object - there is no `success` wrapper, so do not branch on one:
+
+```json
+{
+  "id": "7f9c24e5-1d1f-4c0a-9b6c-2f3a4d5e6f70",
+  "type": "payment.succeeded",
+  "createdAt": "2026-08-20T14:00:00Z",
+  "data": {
+    "transactionId": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+    "status": "succeeded",
+    "previousStatus": "pending",
+    "kind": "sale",
+    "amount": 8440,
+    "grossAmount": 8701,
+    "surchargeAmount": 261,
+    "currency": "EUR",
+    "originalTransactionId": null,
+    "idempotencyKey": "order-123"
+  }
+}
+```
+
+Amounts are minor units. On `payment.*` events `amount` is what you get paid and `grossAmount`
+is what moved on the card; on `payment.refunded` `amount` is what went back to the customer.
+
+### Delivery, retries, and staying enabled
+
+- **At-least-once.** The same event can arrive twice. Dedupe on `event["id"]` and make your
+  handler idempotent.
+- **Answer fast.** Return 2xx as soon as the signature checks out and queue the real work.
+  Doing it inline is how endpoints end up timing out and getting retried.
+- **Retries** follow your endpoint's configured count (default 3, max 10), spaced 1m, 5m, 30m,
+  2h, 12h.
+- **Circuit breaker.** An endpoint whose first attempt and every retry fail, over and over, is
+  disabled automatically. Any later successful delivery re-enables it. A disable you did
+  yourself in the dashboard is never undone for you.
+
+### Reconcile anyway
+
+Webhooks complement your reconciliation sweep, they do not replace it. There are real loss
+windows: a chain parked on an endpoint the breaker disabled, an event that never got published.
+The only thing that closes them is a periodic sweep of your own open orders against
+`get_status`. Keep the sweep. It is what catches the payment nobody told you about.
+
+### Tolerance and clocks
+
+Deliveries more than 300 seconds away from your clock are rejected as replays. If you see
+`TIMESTAMP_OUT_OF_RANGE` on genuine traffic, your server clock has drifted - fix NTP rather than
+widening `tolerance_seconds`.
+
+Pass `now` to keep your own tests deterministic, and `sign_webhook` to forge a delivery in them:
+
+```python
+from dominaite import sign_webhook, verify_webhook
+
+body = '{"id":"evt-1","type":"payment.succeeded","createdAt":"2026-08-20T14:00:00Z","data":{}}'
+header = "t=1755700000,v1=" + sign_webhook("whsec_test", "1755700000", body)
+
+event = verify_webhook(body, header, "whsec_test", now=1755700000)
+```
+
+## Status polling (fallback)
+
+Polling is the fallback and the reconciliation tool, not the primary path - use
+[webhooks](#webhooks) to learn that a payment completed, and use this to sweep your own open
+orders and to answer "what is this order doing right now".
 
 ```python
 status = client.get_status(session["transactionId"])
@@ -230,8 +360,14 @@ The full refusal payload is on `refusal.result`.
 | `CheckoutRefusedError` | The gateway refused to open the session (`error_code`) | Depends on the code |
 | `ApiError` | Unexpected response, or a 4xx like an unknown transaction id (`http_status`) | No |
 | `TransportError` | Network failure or 5xx; you don't know if it landed | Yes, same idempotency key |
+| `WebhookVerificationError` | An incoming webhook is not authentic or not fresh (`error_code`) | No - respond 400 |
 
-All four inherit from `DominaiteError` if you only care that the call failed.
+All of them inherit from `DominaiteError` if you only care that the call failed.
+
+`WebhookVerificationError.error_code` is one of `MALFORMED_SIGNATURE` (wrong header, or a proxy
+rewrote it), `INVALID_SIGNATURE` (wrong secret, modified body, or you passed a re-serialized
+body instead of the raw one), `TIMESTAMP_OUT_OF_RANGE` (replay, or your clock drifted), and
+`INVALID_PAYLOAD` (signed, but not a JSON object).
 
 ## Running the tests
 
@@ -243,3 +379,7 @@ python -m venv .venv && .venv/bin/pip install pytest
 `tests/test_signing.py` reproduces the signing test vector published on the dashboard's
 Website-integration tab. If it ever fails, the SDK cannot authenticate - fix the signing, never
 the expected value.
+
+`tests/test_webhooks.py` pins the cross-SDK webhook vector: the same secret, timestamp and
+body bytes every Dominaite SDK verifies against. A failure there means the SDK is rejecting
+genuine deliveries or accepting forged ones. Same rule - fix the code, not the vector.
