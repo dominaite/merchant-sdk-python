@@ -2,6 +2,7 @@
 
 from .client import (
     DEFAULT_BASE_URL,
+    PING_PATH,
     SESSIONS_PATH,
     DominaiteClient,
     __version__,
@@ -17,6 +18,7 @@ from .exceptions import (
 
 __all__ = [
     "DEFAULT_BASE_URL",
+    "PING_PATH",
     "SESSIONS_PATH",
     "ApiError",
     "AuthenticationError",
