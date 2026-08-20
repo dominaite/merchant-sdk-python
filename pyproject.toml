@@ -5,10 +5,10 @@ build-backend = "hatchling.build"
 [project]
 # PyPI name settled as "dominaite" (verified free 2026-08-17); matches the import name.
 name = "dominaite"
-version = "0.1.0"
+version = "0.1.1"
 description = "Server-side Python client for the Dominaite merchant API: create hosted checkout sessions from your own backend."
 requires-python = ">=3.9"
-license = { text = "Proprietary" }
+license = { text = "MIT" }
 readme = "README.md"
 dependencies = []
 
