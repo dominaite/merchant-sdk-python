@@ -82,6 +82,27 @@ class CheckoutRefusedError(DominaiteError):
         self.result = result if result is not None else {}
 
 
+class WebhookVerificationError(DominaiteError):
+    """An incoming webhook is not authentic, or not fresh.
+
+    Raised by :func:`dominaite.verify_webhook`. Never process the body after this -
+    respond 400 and drop it. Machine-readable code on ``error_code``:
+
+    - ``MALFORMED_SIGNATURE``: the header is missing, or not ``t=...,v1=...``. Usually
+      the wrong header was read, or a proxy rewrote it.
+    - ``INVALID_SIGNATURE``: wrong endpoint secret, or the body was modified. Also what
+      you get when the body was re-serialized before verifying instead of passed raw.
+    - ``TIMESTAMP_OUT_OF_RANGE``: the signature is genuine but too old or too far in the
+      future - a replay, or your server clock has drifted. Fix NTP; do not widen the
+      tolerance to make it go away.
+    - ``INVALID_PAYLOAD``: signed correctly but not a JSON object.
+    """
+
+    def __init__(self, error_code: str, message: str) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+
+
 class TransportError(DominaiteError):
     """Network-level failure or a 5xx.
 
