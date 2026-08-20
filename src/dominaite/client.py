@@ -17,7 +17,7 @@ from .exceptions import (
     TransportError,
 )
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 
 DEFAULT_BASE_URL = "https://api.dominaite.com/payments"
 SESSIONS_PATH = "/merchant-api/bridgerpay/checkout/sessions"
