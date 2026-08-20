@@ -54,7 +54,28 @@ test vector and authenticates nothing, so it can never fail for credential reaso
 python -m pytest tests/test_signing.py
 ```
 
-**3. Mint a session** (`mint.py`):
+**3. Ping before your first mint.** One signed GET that creates nothing, so a failure here
+is your credentials, your signing or your clock and nothing else:
+
+```python
+import os
+
+from dominaite import DominaiteClient
+
+client = DominaiteClient(
+    os.environ["DOMINAITE_KEY_ID"],
+    os.environ["DOMINAITE_SECRET"],
+    base_url=os.environ.get("DOMINAITE_BASE_URL", "https://api.dominaite.com/payments"),
+)
+
+print(client.ping())
+# {'pong': True, 'merchantId': '...', 'serverTime': '...', 'clockSkewSeconds': 0}
+```
+
+Watch `clockSkewSeconds`: requests start failing once it passes 300, so a drifting number
+is your warning to fix NTP before payments break.
+
+**4. Mint a session** (`mint.py`):
 
 ```python
 import os
@@ -110,7 +131,7 @@ credentials, your clock, your signing, and the dev gateway.
 | `CheckoutRefusedError` | You authenticated fine; the gateway declined to open a session. |
 | `TransportError` | Wrong base URL, or the service is down. Retry with the same key. |
 
-**4. Render the widget.** Store `session["transactionId"]` against your order, then hand the
+**5. Render the widget.** Store `session["transactionId"]` against your order, then hand the
 two cashier values to the page:
 
 ```html
@@ -166,12 +187,40 @@ status = client.get_status(session["transactionId"])
 ```
 
 `status` is one of: `pending`, `processing`, `succeeded`, `failed`, `refunded`,
-`partially_refunded`, `cancelled`, `disputed`, `abandoned`. While the session is still payable
-the response also carries `expiresAt`; after that instant a `pending` session can only become
-`abandoned`. An unknown transaction id raises `ApiError` with `http_status == 404`.
+`partially_refunded`, `cancelled`, `disputed`, `requires_capture`, `abandoned`. While the
+session is still payable the response also carries `expiresAt`; after that instant a `pending`
+session can only become `abandoned`. An unknown transaction id raises `ApiError` with
+`http_status == 404`.
+
+`succeeded` is the only value that means the payment is complete. Keep polling on `pending`,
+`processing` and `requires_capture` - none of them is terminal.
+
+`requires_capture` is **not** "unpaid": the payer has already paid and the funds are held
+awaiting capture. Never treat it as an abandoned order.
+
+Treat any status you do not recognise as still-open as well: a value the API adds later should
+make you keep polling, never silently close an order that is still live.
 
 Poll after the payer returns to you, or on your order timeout - not in a tight loop; the
 endpoint is rate limited per key.
+
+### Recovering from a replay refusal
+
+When your idempotency key collides with an earlier attempt, the refusal names the transaction
+it collided with, so you can reconcile instead of minting a second payment:
+
+```python
+try:
+    session = client.create_checkout_session(...)
+except CheckoutRefusedError as refusal:
+    if refusal.transaction_id:
+        status = client.get_status(refusal.transaction_id)
+        # Now you know what the earlier attempt actually did.
+```
+
+`refusal.transaction_id` is `None` when the API did not name one (a concurrent-race
+`DUPLICATE_REQUEST` knows the key is taken but not yet by which row), so check it before use.
+The full refusal payload is on `refusal.result`.
 
 ## Errors
 

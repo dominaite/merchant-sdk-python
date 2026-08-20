@@ -9,6 +9,7 @@ import urllib.request
 import pytest
 
 from dominaite import (
+    PING_PATH,
     SESSIONS_PATH,
     ApiError,
     AuthenticationError,
@@ -196,6 +197,55 @@ def test_get_status_signs_empty_idempotency_key_and_empty_body(client, urlopen):
     assert payload.count("\n") == 4
 
 
+def test_ping_signs_empty_idempotency_key_and_empty_body(client, urlopen):
+    recorder = urlopen(
+        (
+            200,
+            {
+                "success": True,
+                "data": {
+                    "pong": True,
+                    "merchantId": "mer_1",
+                    "serverTime": "2026-08-20T12:00:00Z",
+                    "serverUnixTime": 1755691200,
+                    "clockSkewSeconds": 2,
+                },
+            },
+        )
+    )
+
+    result = client.ping()
+
+    request = recorder.last
+    headers = _headers(request)
+
+    assert request.full_url == BASE_URL + PING_PATH
+    assert request.get_method() == "GET"
+    assert request.data is None
+    assert "idempotency-key" not in headers
+
+    # The signed path is the canonical path only - never the base URL's own prefix.
+    expected = sign_request(SECRET, headers["x-timestamp"], "GET", PING_PATH, "", "")
+    assert headers["x-signature"] == expected
+
+    payload = "\n".join([headers["x-timestamp"], "GET", PING_PATH, "", EMPTY_SHA256])
+    assert payload.count("\n") == 4
+
+    # The ping read is FLAT inside the envelope: no checkout wrapper, no inner success.
+    assert result["pong"] is True
+    assert result["merchantId"] == "mer_1"
+    assert result["clockSkewSeconds"] == 2
+
+
+def test_ping_401_raises_authentication_with_the_error_code(client, urlopen):
+    urlopen((401, {"errorCode": "IP_NOT_ALLOWED"}))
+
+    with pytest.raises(AuthenticationError) as caught:
+        client.ping()
+
+    assert caught.value.error_code == "IP_NOT_ALLOWED"
+
+
 def test_get_status_normalizes_transaction_id_casing(client, urlopen):
     recorder = urlopen((200, {"transactionId": TRANSACTION_ID}))
 
@@ -271,6 +321,46 @@ def test_business_refusal_raises_checkout_refused_with_the_error_code(client, ur
         )
 
     assert caught.value.error_code == "PAYMENT_PROCESSING_UNAVAILABLE"
+
+
+def test_replay_refusal_carries_the_transaction_id_for_recovery(client, urlopen):
+    """A DUPLICATE_REQUEST names the payment the key collided with.
+
+    Without this the documented recovery - read it back with get_status() - is
+    unreachable from the exception, and the caller's only option is a second payment.
+    """
+    urlopen(
+        (
+            200,
+            {
+                "success": False,
+                "transactionId": TRANSACTION_ID,
+                "errorCode": "DUPLICATE_REQUEST",
+                "errorMessage": "A checkout session for this idempotency key is already open.",
+            },
+        )
+    )
+
+    with pytest.raises(CheckoutRefusedError) as caught:
+        client.create_checkout_session(
+            amount=2500, currency="EUR", order_reference="order-1042"
+        )
+
+    assert caught.value.error_code == "DUPLICATE_REQUEST"
+    assert caught.value.transaction_id == TRANSACTION_ID
+    assert caught.value.result["errorCode"] == "DUPLICATE_REQUEST"
+
+
+def test_refusal_without_a_transaction_id_leaves_it_none(client, urlopen):
+    """The concurrent-race DUPLICATE_REQUEST knows the key is taken, but not by which row."""
+    urlopen((200, {"success": False, "errorCode": "DUPLICATE_REQUEST"}))
+
+    with pytest.raises(CheckoutRefusedError) as caught:
+        client.create_checkout_session(
+            amount=2500, currency="EUR", order_reference="order-1042"
+        )
+
+    assert caught.value.transaction_id is None
 
 
 def test_503_raises_transport_not_refusal(client, urlopen):

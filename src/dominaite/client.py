@@ -17,10 +17,11 @@ from .exceptions import (
     TransportError,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.1.2"
 
 DEFAULT_BASE_URL = "https://api.dominaite.com/payments"
 SESSIONS_PATH = "/merchant-api/bridgerpay/checkout/sessions"
+PING_PATH = "/merchant-api/ping"
 DEFAULT_TIMEOUT_SECONDS = 45.0  # serverless cold starts hit 10+s on dev; 15s was a coin flip
 
 _TRANSACTION_ID_RE = re.compile(
@@ -95,6 +96,26 @@ class DominaiteClient:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
 
+    def ping(self) -> Dict[str, Any]:
+        """Check your credentials, your signing and your clock without creating anything.
+
+        Make this your first live call. It isolates the setup problems from the payment
+        ones: a failure here is the key id, the secret, the signing or the clock, and
+        never anything about the payment you were about to create.
+
+        :returns: ``{"pong", "merchantId", "serverTime", "serverUnixTime",
+            "clockSkewSeconds"}``. Watch ``clockSkewSeconds`` - the server rejects
+            requests once it passes 300, so fix NTP well before then.
+
+        :raises AuthenticationError: Wrong/revoked credentials, bad signature, clock
+            too far off, or the IP is not allowlisted.
+        :raises ApiError: Unexpected API response.
+        :raises TransportError: Network-level failure.
+        """
+        # GET signs an EMPTY idempotency key and an EMPTY body, and sends no
+        # Idempotency-Key header.
+        return self._request("GET", PING_PATH, None, "")
+
     def create_checkout_session(
         self,
         amount: int,
@@ -168,9 +189,15 @@ class DominaiteClient:
         response = self._request("POST", SESSIONS_PATH, body, key)
 
         if response.get("success") is not True or "checkout" not in response:
+            # A replay refusal names the transaction your key collided with. Carry it
+            # (and the whole payload) so the caller can reconcile with get_status()
+            # instead of minting a second payment for the same order.
+            transaction_id = response.get("transactionId")
             raise CheckoutRefusedError(
                 str(response.get("errorCode") or "UNKNOWN"),
                 str(response.get("errorMessage") or "The checkout session was refused."),
+                transaction_id=str(transaction_id) if transaction_id else None,
+                result=dict(response),
             )
 
         return response["checkout"]
@@ -219,8 +246,19 @@ class DominaiteClient:
 
         Status values: ``pending``, ``processing``, ``succeeded``, ``failed``,
         ``refunded``, ``partially_refunded``, ``cancelled``, ``disputed``,
-        ``abandoned``. While a session is still payable the response carries
-        ``expiresAt``; amounts are integers in MINOR units.
+        ``requires_capture``, ``abandoned``. While a session is still payable the
+        response carries ``expiresAt``; amounts are integers in MINOR units.
+
+        ``succeeded`` is the only value that means the payment is complete. Keep
+        polling on ``pending``, ``processing`` and ``requires_capture`` - none of them
+        is terminal.
+
+        ``requires_capture`` is NOT "unpaid": the payer has already paid and the funds
+        are held awaiting capture. Never treat it as an abandoned order.
+
+        Treat any status you do not recognise as still-open too: a value added to the
+        API later must make you keep polling, never silently close an order that is
+        still live.
 
         :param transaction_id: The ``transactionId`` from
             :meth:`create_checkout_session`.
