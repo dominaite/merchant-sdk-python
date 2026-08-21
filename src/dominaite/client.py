@@ -44,6 +44,7 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        fp.close()
         raise ApiError(
             code,
             "Unexpected redirect response; the Dominaite API never redirects. "
