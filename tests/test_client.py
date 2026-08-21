@@ -4,6 +4,8 @@ import email
 import hashlib
 import io
 import json
+import pickle
+import pprint
 import urllib.error
 import urllib.request
 
@@ -126,6 +128,76 @@ def test_rejects_key_id_without_dmk_prefix():
 def test_rejects_secret_without_dms_prefix():
     with pytest.raises(ValueError, match="dms_"):
         DominaiteClient(KEY_ID, "nope")
+
+
+# --- the secret does not escape ----------------------------------------------
+
+SENTINEL_SECRET = "dms_" + "S3CRET" * 5
+
+
+@pytest.mark.parametrize(
+    "surface",
+    [
+        repr,
+        str,
+        lambda c: str(vars(c)),
+        lambda c: json.dumps(vars(c), default=str),
+        lambda c: pprint.pformat(vars(c)),
+    ],
+    ids=["repr", "str", "vars", "json.dumps(vars)", "pprint"],
+)
+def test_the_secret_never_appears_when_the_client_is_shown_or_serialized(surface):
+    """Each of these is a real way a client ends up in a log line or a crash dump."""
+    client = DominaiteClient(KEY_ID, SENTINEL_SECRET)
+
+    assert SENTINEL_SECRET not in surface(client)
+
+
+def test_the_client_defines_its_own_repr_as_a_guard():
+    """Today the inherited repr prints nothing, so this is about tomorrow.
+
+    A dataclass conversion, or a convenience repr added later, prints every attribute
+    by default. Owning __repr__ means the redaction survives that change instead of
+    silently reopening the display path.
+    """
+    assert DominaiteClient.__repr__ is not object.__repr__
+
+    text = repr(DominaiteClient(KEY_ID, SENTINEL_SECRET))
+    assert "***redacted***" in text
+    assert KEY_ID in text, "the key id is not secret - keep the repr useful"
+
+
+def test_the_secret_cannot_be_pickled():
+    client = DominaiteClient(KEY_ID, SENTINEL_SECRET)
+
+    with pytest.raises(TypeError):
+        pickle.dumps(client._secret)
+
+
+def test_reveal_returns_the_real_secret_so_signing_still_works(urlopen):
+    """The redaction is a display concern; signing must still see the real value."""
+    client = DominaiteClient(KEY_ID, SENTINEL_SECRET, base_url=BASE_URL)
+    recorder = urlopen(_ok())
+
+    assert client._secret.reveal() == SENTINEL_SECRET
+
+    client.create_checkout_session(
+        amount=2500,
+        currency="EUR",
+        order_reference="order-1042",
+        idempotency_key="00000000-0000-4000-8000-000000000001",
+    )
+
+    headers = _headers(recorder.last)
+    expected = sign_request(
+        SENTINEL_SECRET,
+        headers["x-timestamp"],
+        "POST",
+        SESSIONS_PATH,
+        "00000000-0000-4000-8000-000000000001",
+        recorder.last.data.decode("utf-8"),
+    )
+    assert headers["x-signature"] == expected
 
 
 # --- what goes on the wire ---------------------------------------------------

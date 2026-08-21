@@ -29,6 +29,36 @@ _TRANSACTION_ID_RE = re.compile(
 )
 
 
+class _Secret:
+    """Holds the API secret so that showing or serializing the client cannot leak it.
+
+    ``repr`` and ``str`` redact, and pickling refuses outright. That covers the accidents:
+    ``vars(client)`` in a debugger, ``json.dumps(vars(client), default=str)`` in a
+    structured log line, ``pprint`` in a crash dump. :meth:`reveal` is the only way back
+    to the real value, and signing is the only caller.
+    """
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def reveal(self) -> str:
+        """Return the real secret. Only for signing - never log or serialize this."""
+        return self._value
+
+    def __repr__(self) -> str:
+        return "dms_***redacted***"
+
+    __str__ = __repr__
+
+    def __reduce__(self) -> Any:
+        # Refuses pickle and, through it, copy.deepcopy. The client is already
+        # unpicklable because of its opener; this keeps the secret unpicklable on its
+        # own, so a future picklable client cannot quietly start shipping it.
+        raise TypeError("the Dominaite API secret cannot be pickled or copied")
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Refuses every 3xx instead of following it.
 
@@ -120,12 +150,19 @@ class DominaiteClient:
         if not secret.startswith("dms_"):
             raise ValueError("secret must start with dms_")
         self._key_id = key_id
-        self._secret = secret
+        self._secret = _Secret(secret)
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         # Own opener rather than urlopen(): the default one follows redirects, and the
         # signed headers must never leave the host we addressed.
         self._opener = urllib.request.build_opener(_NoRedirectHandler)
+
+    def __repr__(self) -> str:
+        # Explicit, so that a later convenience repr (or a dataclass conversion) cannot
+        # reopen the display path by falling back to one that prints every attribute.
+        return "DominaiteClient(key_id={0!r}, base_url={1!r}, secret={2})".format(
+            self._key_id, self._base_url, self._secret
+        )
 
     def ping(self) -> Dict[str, Any]:
         """Check your credentials, your signing and your clock without creating anything.
@@ -338,7 +375,7 @@ class DominaiteClient:
 
         timestamp = str(int(time.time()))
         signature = sign_request(
-            self._secret, timestamp, method, path, idempotency_key, payload
+            self._secret.reveal(), timestamp, method, path, idempotency_key, payload
         )
 
         headers = {
