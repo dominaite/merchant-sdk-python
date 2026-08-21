@@ -37,6 +37,10 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     301/302/303 would downgrade the POST to a GET, so whatever JSON came back would be
     accepted as a real checkout session. Not retryable: this is a misdirected request,
     not a blip.
+
+    This stops the header leak on the codes urllib dispatches here. The codes it does
+    not dispatch (300, 305) never reach a redirect handler at all - the 2xx gate in
+    ``_request`` is what refuses those.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -46,6 +50,10 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
             "Check base_url and anything proxying it.",
             error_code="UNEXPECTED_REDIRECT",
         )
+
+    # CPython grew http_error_308 in 3.11; we support 3.9, where a 308 would otherwise
+    # skip the handler entirely.
+    http_error_308 = urllib.request.HTTPRedirectHandler.http_error_301
 
 
 def sign_request(
@@ -399,6 +407,17 @@ class DominaiteClient:
                     or "Request rejected"
                 ),
                 error_code=str(error_code) if error_code else None,
+            )
+        if not 200 <= status < 300:
+            # Everything above tests for a KNOWN failure, so anything left that is not a
+            # 2xx would be decoded into a session on the way out. A 300 or a 305 reaches
+            # here (no redirect handler claims those codes), and so would any status the
+            # API does not send. Not the API talking: refuse it, and do not retry it.
+            raise ApiError(
+                status,
+                "Unexpected HTTP {0} response; the Dominaite API answers 2xx or a "
+                "documented error. Check base_url and anything proxying it.".format(status),
+                error_code="UNEXPECTED_STATUS",
             )
 
         return result

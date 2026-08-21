@@ -562,8 +562,18 @@ def test_retry_helper_treats_an_explicit_none_key_as_omitted(client, urlopen):
 # --- redirects ---------------------------------------------------------------
 
 
+FORGED = {
+    "success": True,
+    "checkout": dict(CHECKOUT, cashierKey="ck_ATTACKER", cashierToken="ct_ATTACKER"),
+}
+
+
 class _Redirect:
-    """A 3xx as it arrives from the transport, before any handler has seen it."""
+    """A 3xx as it arrives from the transport, before any handler has seen it.
+
+    The body is what an attacker's proxy would answer with: a complete, plausible
+    checkout session the merchant would hand straight to a payer.
+    """
 
     def __init__(self, code, location="https://attacker.test/steal"):
         self.code = code
@@ -571,7 +581,7 @@ class _Redirect:
         self.msg = "redirect"
         self.url = BASE_URL + SESSIONS_PATH
         self.headers = email.message_from_string("Location: " + location + "\n")
-        self._body = io.BytesIO(json.dumps({"success": True, "checkout": CHECKOUT}).encode())
+        self._body = io.BytesIO(json.dumps(FORGED).encode())
 
     def info(self):
         return self.headers
@@ -595,12 +605,14 @@ def _redirecting_transport(monkeypatch, code):
     return sent
 
 
-@pytest.mark.parametrize("code", [301, 302, 303, 307])
-def test_redirects_are_refused_and_the_target_is_never_called(client, monkeypatch, code):
-    """Following a 3xx would replay the signed headers at a host we never authenticated.
+@pytest.mark.parametrize("code", [300, 301, 302, 303, 305, 307, 308])
+def test_no_3xx_is_ever_accepted_as_a_session(client, monkeypatch, code):
+    """No 3xx may come back as a checkout session, whoever answered it.
 
-    On 301/302/303 the POST also degrades to a GET, so the target's own JSON would come
-    back as a checkout session the merchant then hands to a payer.
+    301/302/303/307/308 are refused by the redirect handler, which is also what keeps
+    the signed headers from being replayed at the Location host. 300 and 305 reach no
+    redirect handler at all - urllib dispatches neither - so the 2xx gate is what stops
+    those from being decoded into a session.
     """
     sent = _redirecting_transport(monkeypatch, code)
 
@@ -609,10 +621,58 @@ def test_redirects_are_refused_and_the_target_is_never_called(client, monkeypatc
             amount=2500, currency="EUR", order_reference="order-1042"
         )
 
-    assert caught.value.error_code == "UNEXPECTED_REDIRECT"
     assert caught.value.http_status == code
+    assert caught.value.error_code in ("UNEXPECTED_REDIRECT", "UNEXPECTED_STATUS")
+    assert "ATTACKER" not in str(caught.value)
     assert len(sent) == 1, "the redirect target must never be requested"
     assert sent[0].full_url == BASE_URL + SESSIONS_PATH
+
+
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+def test_followable_redirects_are_refused_by_the_redirect_handler(
+    client, monkeypatch, code
+):
+    """The codes urllib would otherwise follow, carrying the signed headers with them.
+
+    308 is pinned because CPython only grew http_error_308 in 3.11, and the package
+    supports 3.9.
+    """
+    _redirecting_transport(monkeypatch, code)
+
+    with pytest.raises(ApiError) as caught:
+        client.create_checkout_session(
+            amount=2500, currency="EUR", order_reference="order-1042"
+        )
+
+    assert caught.value.error_code == "UNEXPECTED_REDIRECT"
+
+
+@pytest.mark.parametrize("code", [300, 305])
+def test_undispatched_3xx_is_refused_by_the_success_gate(client, monkeypatch, code):
+    """A 300 or 305 with a session-shaped body used to be returned as a real session.
+
+    Nothing dispatches these to a redirect handler, so they arrive as an HTTPError with
+    a JSON body and, without a positive 2xx gate, sail past the 4xx and 5xx branches.
+    """
+    _redirecting_transport(monkeypatch, code)
+
+    with pytest.raises(ApiError) as caught:
+        client.create_checkout_session(
+            amount=2500, currency="EUR", order_reference="order-1042"
+        )
+
+    assert caught.value.error_code == "UNEXPECTED_STATUS"
+
+
+def test_the_success_gate_does_not_disturb_a_2xx(client, urlopen):
+    """201 is still a real answer - the gate refuses non-2xx, not non-200."""
+    urlopen((201, {"success": True, "checkout": CHECKOUT}))
+
+    session = client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference="order-1042"
+    )
+
+    assert session == CHECKOUT
 
 
 def test_a_redirect_is_not_retried(client, monkeypatch):
