@@ -234,9 +234,16 @@ class DominaiteClient:
 
         A ``TransportError`` (network blip, 5xx, ``MERCHANT_API_UNAVAILABLE``) leaves you
         not knowing whether the request landed. Reusing the key is what makes the retry
-        safe: the server returns the original session instead of opening a second one.
-        Generating a fresh key here would be the double-charge bug this method exists to
-        prevent.
+        safe: if the first attempt did land, the server refuses the retry instead of
+        opening a second session. Generating a fresh key here would be the double-charge
+        bug this method exists to prevent.
+
+        The refusal does NOT hand back the original session. It arrives as a
+        :class:`CheckoutRefusedError` with a replay code (``DUPLICATE_REQUEST``,
+        ``ALREADY_PROCESSED``, ``PRIOR_ATTEMPT_FAILED``, ``IDEMPOTENCY_KEY_REUSED``) and
+        no cashier fields, so there is nothing to hand the embed snippet. When the
+        refusal names a ``transaction_id``, read it with :meth:`get_status` to find out
+        what the earlier attempt did.
 
         Refusals and authentication failures are raised immediately - retrying them just
         burns time.
