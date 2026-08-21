@@ -10,6 +10,7 @@ from .client import (
 )
 from .exceptions import (
     SESSION_REFUSAL_ERROR_CODES,
+    VALIDATION_ERROR_CODES,
     ApiError,
     AuthenticationError,
     CheckoutRefusedError,
@@ -32,6 +33,7 @@ __all__ = [
     "PING_PATH",
     "SESSIONS_PATH",
     "SESSION_REFUSAL_ERROR_CODES",
+    "VALIDATION_ERROR_CODES",
     "WEBHOOK_SIGNATURE_HEADER",
     "ApiError",
     "AuthenticationError",

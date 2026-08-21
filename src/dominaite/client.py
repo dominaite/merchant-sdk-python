@@ -354,6 +354,10 @@ class DominaiteClient:
                 "retry with the same idempotency key.".format(status)
             )
         if status >= 400:
+            # Input validation (IDEMPOTENCY_KEY_REQUIRED and friends) answers 400 with
+            # the code at error.code, not as a success=false refusal. Carry it through
+            # instead of flattening every 4xx into a bare message.
+            error_code = result.get("errorCode") or envelope_error.get("code")
             raise ApiError(
                 status,
                 str(
@@ -361,6 +365,7 @@ class DominaiteClient:
                     or envelope_error.get("message")
                     or "Request rejected"
                 ),
+                error_code=str(error_code) if error_code else None,
             )
 
         return result

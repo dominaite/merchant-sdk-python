@@ -362,11 +362,16 @@ The full refusal payload is on `refusal.result`.
 |---|---|---|
 | `AuthenticationError` | Bad credentials, bad signature, clock skew, IP not allowlisted | No - fix config |
 | `CheckoutRefusedError` | The gateway refused to open the session (`error_code`) | Depends on the code |
-| `ApiError` | Unexpected response, or a 4xx like an unknown transaction id (`http_status`) | No |
+| `ApiError` | Unexpected response, or a 4xx like an unknown transaction id (`http_status`, `error_code`) | No |
 | `TransportError` | Network failure or 5xx; you don't know if it landed | Yes, same idempotency key |
 | `WebhookVerificationError` | An incoming webhook is not authentic or not fresh (`error_code`) | No - respond 400 |
 
 All of them inherit from `DominaiteError` if you only care that the call failed.
+
+Note the two different failure shapes on the create endpoint. A business refusal is HTTP 200
+with `success: false` and raises `CheckoutRefusedError`; input validation is HTTP 400 and raises
+`ApiError` with the code on `error_code` (currently `IDEMPOTENCY_KEY_REQUIRED`, exported as
+`VALIDATION_ERROR_CODES`). Branch on the exception type, never on the HTTP status.
 
 `WebhookVerificationError.error_code` is one of `MALFORMED_SIGNATURE` (wrong header, or a proxy
 rewrote it), `INVALID_SIGNATURE` (wrong secret, modified body, or you passed a re-serialized
