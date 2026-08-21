@@ -21,8 +21,9 @@ WEBHOOK_SIGNATURE_HEADER = "X-Webhook-Signature"
 #: How far the delivery timestamp may sit from your clock before it is rejected.
 DEFAULT_WEBHOOK_TOLERANCE_SECONDS = 300
 
-_TIMESTAMP_RE = re.compile(r"^[0-9]{1,19}$")
+_TIMESTAMP_RE = re.compile(r"^[0-9]+$")
 _V1_RE = re.compile(r"^[0-9a-f]{64}$")
+_WHITESPACE_RE = re.compile(r"\s")
 
 
 def sign_webhook(secret: str, timestamp: str, payload: str) -> str:
@@ -84,7 +85,20 @@ def verify_webhook(
     if tolerance_seconds < 0:
         raise ValueError("tolerance_seconds must not be negative")
 
-    body = payload.decode("utf-8") if isinstance(payload, bytes) else payload
+    if isinstance(payload, (bytes, bytearray)):
+        try:
+            body = payload.decode("utf-8")
+        except UnicodeDecodeError as error:
+            # Anyone can POST arbitrary bytes at a public webhook URL. We sign UTF-8, so
+            # bytes that are not UTF-8 cannot carry our MAC - answer that, rather than
+            # letting a decode error become an unauthenticated 500.
+            raise WebhookVerificationError(
+                "INVALID_SIGNATURE",
+                "Webhook body is not valid UTF-8, so it cannot carry a Dominaite "
+                "signature.",
+            ) from error
+    else:
+        body = payload
     timestamp, provided = _parse_signature_header(signature_header)
 
     expected = sign_webhook(secret, timestamp, body)
@@ -98,7 +112,7 @@ def verify_webhook(
         )
 
     current = int(time.time()) if now is None else int(now)
-    if abs(current - int(timestamp)) > tolerance_seconds:
+    if _drift_seconds(current, timestamp) > tolerance_seconds:
         # The MAC was good, so this is a replay or your clock. Fix NTP before you widen
         # the tolerance.
         raise WebhookVerificationError(
@@ -121,8 +135,27 @@ def verify_webhook(
     return event
 
 
+def _drift_seconds(current: int, timestamp: str) -> float:
+    """Distance between the delivery timestamp and now, in seconds.
+
+    The grammar puts no length cap on ``t``, and CPython refuses to convert an integer
+    literal past its digit limit. A timestamp that long is not a clock skew anyone can
+    fix, so report it as infinitely far away rather than letting ValueError escape.
+    """
+    try:
+        return abs(current - int(timestamp))
+    except ValueError:
+        return float("inf")
+
+
 def _parse_signature_header(signature_header: str) -> Tuple[str, str]:
     """Pull ``t`` and ``v1`` out of the header, or say why it cannot be read.
+
+    The grammar is the cross-SDK one: a comma-separated list of ``key=value`` elements
+    with no whitespace anywhere, exactly one ``t`` (ASCII digits) and exactly one ``v1``
+    (64 lowercase hex), unknown keys ignored. Everything outside it is rejected with the
+    same error as a bad signature, so a malformed header tells an attacker nothing a
+    wrong MAC would not.
 
     Returns them as strings: ``t`` is re-signed as text, so parsing it to an int and
     back could silently change the bytes we hash.
@@ -133,11 +166,15 @@ def _parse_signature_header(signature_header: str) -> Tuple[str, str]:
     )
     if not isinstance(signature_header, str) or not signature_header:
         raise malformed
+    # The platform never emits whitespace. Accepting it here would only widen what a
+    # proxy or an attacker can smuggle past the parser.
+    if _WHITESPACE_RE.search(signature_header):
+        raise malformed
 
     timestamp = None
     provided = None
     for part in signature_header.split(","):
-        name, separator, value = part.strip().partition("=")
+        name, separator, value = part.partition("=")
         if not separator:
             raise malformed
         if name == "t":
