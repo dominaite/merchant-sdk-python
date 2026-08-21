@@ -164,6 +164,11 @@ Every `create_checkout_session` call carries an idempotency key (auto-generated,
 own as `idempotency_key`). Retrying with the same key never opens a second payment - on a
 timeout, retry with the same key rather than generating a new one.
 
+If the first attempt did land, the retry comes back as a `CheckoutRefusedError` with a replay
+code, not as the original session: there are no cashier fields to hand the embed snippet. Use
+`refusal.transaction_id` with `get_status()` to find out what the first attempt did (see
+[Recovering from a replay refusal](#recovering-from-a-replay-refusal)).
+
 There is a helper that does exactly that:
 
 ```python

@@ -1,8 +1,11 @@
 """Contract tests for DominaiteClient: what it sends, and how it classifies answers."""
 
+import email
 import hashlib
 import io
 import json
+import pickle
+import pprint
 import urllib.error
 import urllib.request
 
@@ -53,7 +56,7 @@ class _Response:
 
 
 class _Recorder:
-    """Stands in for urlopen and records every request the client builds."""
+    """Stands in for the client's opener and records every request it builds."""
 
     def __init__(self, *outcomes):
         self.outcomes = list(outcomes)
@@ -89,10 +92,20 @@ def client():
 def urlopen(monkeypatch):
     def install(*outcomes):
         recorder = _Recorder(*outcomes)
-        monkeypatch.setattr(urllib.request, "urlopen", recorder)
+        _patch_opener(monkeypatch, recorder)
         return recorder
 
     return install
+
+
+def _patch_opener(monkeypatch, handler):
+    # The client sends through its own opener (see _NoRedirectHandler), so the seam is
+    # OpenerDirector.open rather than urlopen.
+    monkeypatch.setattr(
+        urllib.request.OpenerDirector,
+        "open",
+        lambda _self, request, timeout=None: handler(request, timeout=timeout),
+    )
 
 
 def _ok():
@@ -115,6 +128,76 @@ def test_rejects_key_id_without_dmk_prefix():
 def test_rejects_secret_without_dms_prefix():
     with pytest.raises(ValueError, match="dms_"):
         DominaiteClient(KEY_ID, "nope")
+
+
+# --- the secret does not escape ----------------------------------------------
+
+SENTINEL_SECRET = "dms_" + "S3CRET" * 5
+
+
+@pytest.mark.parametrize(
+    "surface",
+    [
+        repr,
+        str,
+        lambda c: str(vars(c)),
+        lambda c: json.dumps(vars(c), default=str),
+        lambda c: pprint.pformat(vars(c)),
+    ],
+    ids=["repr", "str", "vars", "json.dumps(vars)", "pprint"],
+)
+def test_the_secret_never_appears_when_the_client_is_shown_or_serialized(surface):
+    """Each of these is a real way a client ends up in a log line or a crash dump."""
+    client = DominaiteClient(KEY_ID, SENTINEL_SECRET)
+
+    assert SENTINEL_SECRET not in surface(client)
+
+
+def test_the_client_defines_its_own_repr_as_a_guard():
+    """Today the inherited repr prints nothing, so this is about tomorrow.
+
+    A dataclass conversion, or a convenience repr added later, prints every attribute
+    by default. Owning __repr__ means the redaction survives that change instead of
+    silently reopening the display path.
+    """
+    assert DominaiteClient.__repr__ is not object.__repr__
+
+    text = repr(DominaiteClient(KEY_ID, SENTINEL_SECRET))
+    assert "***redacted***" in text
+    assert KEY_ID in text, "the key id is not secret - keep the repr useful"
+
+
+def test_the_secret_cannot_be_pickled():
+    client = DominaiteClient(KEY_ID, SENTINEL_SECRET)
+
+    with pytest.raises(TypeError):
+        pickle.dumps(client._secret)
+
+
+def test_reveal_returns_the_real_secret_so_signing_still_works(urlopen):
+    """The redaction is a display concern; signing must still see the real value."""
+    client = DominaiteClient(KEY_ID, SENTINEL_SECRET, base_url=BASE_URL)
+    recorder = urlopen(_ok())
+
+    assert client._secret.reveal() == SENTINEL_SECRET
+
+    client.create_checkout_session(
+        amount=2500,
+        currency="EUR",
+        order_reference="order-1042",
+        idempotency_key="00000000-0000-4000-8000-000000000001",
+    )
+
+    headers = _headers(recorder.last)
+    expected = sign_request(
+        SENTINEL_SECRET,
+        headers["x-timestamp"],
+        "POST",
+        SESSIONS_PATH,
+        "00000000-0000-4000-8000-000000000001",
+        recorder.last.data.decode("utf-8"),
+    )
+    assert headers["x-signature"] == expected
 
 
 # --- what goes on the wire ---------------------------------------------------
@@ -412,9 +495,7 @@ def test_non_json_response_raises_api_error(client, urlopen, monkeypatch):
         def read(self):
             return b"<html>502 Bad Gateway</html>"
 
-    monkeypatch.setattr(
-        urllib.request, "urlopen", lambda request, timeout=None: _Garbage(200, {})
-    )
+    _patch_opener(monkeypatch, lambda request, timeout=None: _Garbage(200, {}))
 
     with pytest.raises(ApiError):
         client.create_checkout_session(
@@ -510,3 +591,172 @@ def test_retry_helper_gives_up_and_raises_the_transport_error(client, urlopen):
         )
 
     assert len(recorder.requests) == 3
+
+
+def test_retry_helper_mints_one_key_for_all_attempts_when_none_is_given(client, urlopen):
+    recorder = urlopen((503, {}), (503, {}), _ok())
+
+    client.create_checkout_session_with_retry(
+        amount=2500,
+        currency="EUR",
+        order_reference="order-1042",
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+
+    assert len(recorder.requests) == 3
+    keys = {_headers(r)["idempotency-key"] for r in recorder.requests}
+    assert len(keys) == 1
+
+
+def test_retry_helper_treats_an_explicit_none_key_as_omitted(client, urlopen):
+    """An explicit None used to slip past setdefault, so every attempt minted its own key.
+
+    That turns one timed-out order into a second real payment, which is the whole thing
+    this helper is for.
+    """
+    recorder = urlopen((503, {}), (503, {}), _ok())
+
+    client.create_checkout_session_with_retry(
+        amount=2500,
+        currency="EUR",
+        order_reference="order-1042",
+        idempotency_key=None,
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+
+    assert len(recorder.requests) == 3
+    keys = {_headers(r)["idempotency-key"] for r in recorder.requests}
+    assert len(keys) == 1, "a retry must not mint a new key - that is the double-charge bug"
+
+
+# --- redirects ---------------------------------------------------------------
+
+
+FORGED = {
+    "success": True,
+    "checkout": dict(CHECKOUT, cashierKey="ck_ATTACKER", cashierToken="ct_ATTACKER"),
+}
+
+
+class _Redirect:
+    """A 3xx as it arrives from the transport, before any handler has seen it.
+
+    The body is what an attacker's proxy would answer with: a complete, plausible
+    checkout session the merchant would hand straight to a payer.
+    """
+
+    def __init__(self, code, location="https://attacker.test/steal"):
+        self.code = code
+        self.status = code
+        self.msg = "redirect"
+        self.url = BASE_URL + SESSIONS_PATH
+        self.headers = email.message_from_string("Location: " + location + "\n")
+        self._body = io.BytesIO(json.dumps(FORGED).encode())
+
+    def info(self):
+        return self.headers
+
+    def read(self, *args):
+        return self._body.read(*args)
+
+    def close(self):
+        pass
+
+
+def _redirecting_transport(monkeypatch, code):
+    """Answers every real HTTPS request with a 3xx, and counts the requests."""
+    sent = []
+
+    def https_open(_handler, request):
+        sent.append(request)
+        return _Redirect(code)
+
+    monkeypatch.setattr(urllib.request.HTTPSHandler, "https_open", https_open)
+    return sent
+
+
+@pytest.mark.parametrize("code", [300, 301, 302, 303, 305, 307, 308])
+def test_no_3xx_is_ever_accepted_as_a_session(client, monkeypatch, code):
+    """No 3xx may come back as a checkout session, whoever answered it.
+
+    301/302/303/307/308 are refused by the redirect handler, which is also what keeps
+    the signed headers from being replayed at the Location host. 300 and 305 reach no
+    redirect handler at all - urllib dispatches neither - so the 2xx gate is what stops
+    those from being decoded into a session.
+    """
+    sent = _redirecting_transport(monkeypatch, code)
+
+    with pytest.raises(ApiError) as caught:
+        client.create_checkout_session(
+            amount=2500, currency="EUR", order_reference="order-1042"
+        )
+
+    assert caught.value.http_status == code
+    assert caught.value.error_code in ("UNEXPECTED_REDIRECT", "UNEXPECTED_STATUS")
+    assert "ATTACKER" not in str(caught.value)
+    assert len(sent) == 1, "the redirect target must never be requested"
+    assert sent[0].full_url == BASE_URL + SESSIONS_PATH
+
+
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+def test_followable_redirects_are_refused_by_the_redirect_handler(
+    client, monkeypatch, code
+):
+    """The codes urllib would otherwise follow, carrying the signed headers with them.
+
+    308 is pinned because CPython only grew http_error_308 in 3.11, and the package
+    supports 3.9.
+    """
+    _redirecting_transport(monkeypatch, code)
+
+    with pytest.raises(ApiError) as caught:
+        client.create_checkout_session(
+            amount=2500, currency="EUR", order_reference="order-1042"
+        )
+
+    assert caught.value.error_code == "UNEXPECTED_REDIRECT"
+
+
+@pytest.mark.parametrize("code", [300, 305])
+def test_undispatched_3xx_is_refused_by_the_success_gate(client, monkeypatch, code):
+    """A 300 or 305 with a session-shaped body used to be returned as a real session.
+
+    Nothing dispatches these to a redirect handler, so they arrive as an HTTPError with
+    a JSON body and, without a positive 2xx gate, sail past the 4xx and 5xx branches.
+    """
+    _redirecting_transport(monkeypatch, code)
+
+    with pytest.raises(ApiError) as caught:
+        client.create_checkout_session(
+            amount=2500, currency="EUR", order_reference="order-1042"
+        )
+
+    assert caught.value.error_code == "UNEXPECTED_STATUS"
+
+
+def test_the_success_gate_does_not_disturb_a_2xx(client, urlopen):
+    """201 is still a real answer - the gate refuses non-2xx, not non-200."""
+    urlopen((201, {"success": True, "checkout": CHECKOUT}))
+
+    session = client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference="order-1042"
+    )
+
+    assert session == CHECKOUT
+
+
+def test_a_redirect_is_not_retried(client, monkeypatch):
+    sent = _redirecting_transport(monkeypatch, 302)
+
+    with pytest.raises(ApiError):
+        client.create_checkout_session_with_retry(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            max_attempts=3,
+            backoff_seconds=0,
+        )
+
+    assert len(sent) == 1
