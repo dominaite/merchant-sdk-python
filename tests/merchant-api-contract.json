@@ -1,5 +1,5 @@
 {
-  "$comment": "CANONICAL merchant-API response contract (v1). Source of truth: gateway src/dominaite-gateway-payments/Requests/MerchantApi/{MerchantApiPingResponse,MerchantCheckoutSessionResponse,MerchantCheckoutSessionStatusResponse}.cs and Contracts/Constants/TransactionStatus.cs. Every Dominaite SDK vendors a byte-identical copy of this file and asserts, in its own suite, that (1) its response types deserialize each example below, (2) it exposes EXACTLY the fields listed per endpoint (no more, no fewer), and (3) its status enum equals statusVocabulary. This pins the response contract so a field or status value cannot silently ship in one SDK and be sibling-mirrored wrong into the others. Do NOT add, rename or drop anything here without the matching gateway DTO change landing first.",
+  "$comment": "CANONICAL merchant-API response contract (v1). Source of truth is the gateway CODE on origin/dev, not any DTO docblock (the MerchantCheckoutSessionResponse docblock is stale - it omits PRIOR_ATTEMPT_FAILED). Error codes taken from Services/MerchantApi/MerchantCheckoutSessionService.cs and Functions/MerchantApiFunctions.cs; response shapes from Requests/MerchantApi/{MerchantApiPingResponse,MerchantCheckoutSessionResponse,MerchantCheckoutSessionStatusResponse}.cs; status enum from Contracts/Constants/TransactionStatus.cs. NOTE: the ping endpoint (#2440) is live on origin/dev but NOT yet on origin/main (prod) as of 2026-08-21 - the SDK ships ping() and it works against dev. Every Dominaite SDK vendors a byte-identical copy of this file and asserts, in its own suite, that (1) its response types deserialize each example below, (2) it exposes EXACTLY the fields listed per endpoint (no more, no fewer), and (3) its status enum equals statusVocabulary. This pins the response contract so a field or status value cannot silently ship in one SDK and be sibling-mirrored wrong into the others. Do NOT add, rename or drop anything here without the matching gateway change landing first.",
   "version": "v1",
   "statusVocabulary": [
     "pending",
@@ -17,8 +17,14 @@
     "PAYMENT_PROCESSING_UNAVAILABLE",
     "DUPLICATE_REQUEST",
     "ALREADY_PROCESSED",
-    "IDEMPOTENCY_KEY_REUSED"
+    "IDEMPOTENCY_KEY_REUSED",
+    "PRIOR_ATTEMPT_FAILED"
   ],
+  "$sessionRefusalNote": "Business refusals: HTTP 200 with success=false and one of these codes. PRIOR_ATTEMPT_FAILED = the idempotency key hit a Failed/Cancelled/Abandoned transaction.",
+  "validationErrorCodes": [
+    "IDEMPOTENCY_KEY_REQUIRED"
+  ],
+  "$validationNote": "Input validation on the create endpoint: HTTP 400 (not the success=false shape). IDEMPOTENCY_KEY_REQUIRED = missing/empty Idempotency-Key header (1-100 chars, part of the signature).",
   "endpoints": {
     "ping": {
       "method": "GET",

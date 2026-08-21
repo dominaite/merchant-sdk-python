@@ -2,8 +2,9 @@
 
 ``merchant-api-contract.json`` in this directory is a byte-identical vendored copy of
 the cross-SDK fixture. Every Dominaite SDK carries the same file and asserts the same
-three things against it, so a field or status value cannot ship in one SDK and be
-mirrored wrong into the siblings.
+things against it - the status vocabulary, the per-endpoint response fields, the
+refusal codes and the validation codes - so a field or status value cannot ship in one
+SDK and be mirrored wrong into the siblings.
 
 If one of these fails, the fixture is right and this SDK is wrong - change the SDK.
 The only way the fixture moves is a gateway DTO change landing first, and then the
@@ -21,6 +22,8 @@ import pytest
 from dominaite import (
     PAYMENT_STATUSES,
     SESSION_REFUSAL_ERROR_CODES,
+    VALIDATION_ERROR_CODES,
+    ApiError,
     CheckoutRefusedError,
     DominaiteClient,
     PaymentStatus,
@@ -200,14 +203,74 @@ def test_every_contract_refusal_code_surfaces_on_the_exception(
     assert raised.value.transaction_id is None
 
 
-def test_the_sdk_also_recognizes_prior_attempt_failed():
-    """The gateway emits it (MerchantCheckoutSessionService.cs) but the fixture omits it.
+def test_the_recognized_refusal_codes_are_exactly_the_contract_set():
+    """No extras either: a code the SDK invents is drift the same as a missing one."""
+    assert sorted(SESSION_REFUSAL_ERROR_CODES) == sorted(
+        CONTRACT["sessionRefusalErrorCodes"]
+    )
 
-    Deliberately asserted OUTSIDE the fixture loop: the fixture is the source of truth
-    for what it lists, not proof that its list is complete. Drop this test only when
-    PRIOR_ATTEMPT_FAILED is added to sessionRefusalErrorCodes in every SDK's copy.
-    """
-    assert "PRIOR_ATTEMPT_FAILED" in SESSION_REFUSAL_ERROR_CODES
+
+# --- (4) validation error codes -----------------------------------------------
+#
+# These are the OTHER failure shape on the create endpoint: HTTP 400 with the code at
+# error.code, not a 200 with success=false. Mixing the two up is the bug worth pinning
+# - a validation error must not surface as a refusal, and must not lose its code.
+
+
+def test_the_recognized_validation_codes_are_exactly_the_contract_set():
+    assert sorted(VALIDATION_ERROR_CODES) == sorted(CONTRACT["validationErrorCodes"])
+
+
+@pytest.mark.parametrize("code", CONTRACT["validationErrorCodes"])
+def test_a_validation_error_surfaces_as_an_api_error_carrying_its_code(
+    code, client, monkeypatch
+):
+    body = {
+        "success": False,
+        "error": {"code": code, "message": "Idempotency-Key header is required.", "statusCode": 400},
+    }
+
+    def raise_400(request, timeout=None):
+        raise urllib.error.HTTPError(
+            request.full_url, 400, "error", {}, io.BytesIO(json.dumps(body).encode("utf-8"))
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", raise_400)
+
+    with pytest.raises(ApiError) as raised:
+        client.create_checkout_session(
+            amount=8440, currency="EUR", order_reference="order-1042"
+        )
+
+    assert raised.value.error_code == code
+    assert raised.value.http_status == 400
+    assert str(raised.value) == body["error"]["message"]
+
+
+def test_a_validation_error_is_not_reported_as_a_refusal(client, monkeypatch):
+    """400 is a malformed call; 200 + success=false is a business refusal. Different bugs."""
+
+    def raise_400(request, timeout=None):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            400,
+            "error",
+            {},
+            io.BytesIO(
+                json.dumps(
+                    {"success": False, "error": {"code": "IDEMPOTENCY_KEY_REQUIRED"}}
+                ).encode("utf-8")
+            ),
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", raise_400)
+
+    with pytest.raises(ApiError) as raised:
+        client.create_checkout_session(
+            amount=8440, currency="EUR", order_reference="order-1042"
+        )
+
+    assert not isinstance(raised.value, CheckoutRefusedError)
 
 
 # --- the vendored copy itself -------------------------------------------------
