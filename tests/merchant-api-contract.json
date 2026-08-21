@@ -46,7 +46,7 @@
     },
     "createCheckoutSession": {
       "method": "POST",
-      "path": "/merchant-api/bridgerpay/checkout/sessions",
+      "path": "/merchant-api/checkout/sessions",
       "note": "Business refusals are HTTP 200 with success=false and a machine-readable errorCode. Branch on success, never on HTTP status. checkout is present only on success; transactionId/errorCode/errorMessage only on refusal.",
       "fields": [
         "success",
@@ -89,7 +89,7 @@
     },
     "getStatus": {
       "method": "GET",
-      "path": "/merchant-api/bridgerpay/checkout/sessions/{transactionId}",
+      "path": "/merchant-api/checkout/sessions/{transactionId}",
       "note": "status carries a statusVocabulary value. expiresAt answers only 'until when can the payer act' - null once the payer's part is over, which is NOT the same as terminal (requires_capture is non-terminal with no window). Branch on status for liveness.",
       "fields": [
         "transactionId",

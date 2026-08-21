@@ -20,7 +20,7 @@ from .exceptions import (
 __version__ = "0.2.0"
 
 DEFAULT_BASE_URL = "https://api.dominaite.com/payments"
-SESSIONS_PATH = "/merchant-api/bridgerpay/checkout/sessions"
+SESSIONS_PATH = "/merchant-api/checkout/sessions"
 PING_PATH = "/merchant-api/ping"
 DEFAULT_TIMEOUT_SECONDS = 45.0  # serverless cold starts hit 10+s on dev; 15s was a coin flip
 
