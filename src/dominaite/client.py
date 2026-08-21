@@ -29,6 +29,25 @@ _TRANSACTION_ID_RE = re.compile(
 )
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuses every 3xx instead of following it.
+
+    The API never redirects, so a 3xx means something in front of it answered. Following
+    it would replay the signed headers against a host we never authenticated, and a
+    301/302/303 would downgrade the POST to a GET, so whatever JSON came back would be
+    accepted as a real checkout session. Not retryable: this is a misdirected request,
+    not a blip.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ApiError(
+            code,
+            "Unexpected redirect response; the Dominaite API never redirects. "
+            "Check base_url and anything proxying it.",
+            error_code="UNEXPECTED_REDIRECT",
+        )
+
+
 def sign_request(
     secret: str,
     timestamp: str,
@@ -95,6 +114,9 @@ class DominaiteClient:
         self._secret = secret
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
+        # Own opener rather than urlopen(): the default one follows redirects, and the
+        # signed headers must never leave the host we addressed.
+        self._opener = urllib.request.build_opener(_NoRedirectHandler)
 
     def ping(self) -> Dict[str, Any]:
         """Check your credentials, your signing and your clock without creating anything.
@@ -316,7 +338,7 @@ class DominaiteClient:
         )
 
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+            with self._opener.open(request, timeout=self._timeout) as response:
                 status = response.status
                 raw = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as error:

@@ -1,5 +1,6 @@
 """Contract tests for DominaiteClient: what it sends, and how it classifies answers."""
 
+import email
 import hashlib
 import io
 import json
@@ -53,7 +54,7 @@ class _Response:
 
 
 class _Recorder:
-    """Stands in for urlopen and records every request the client builds."""
+    """Stands in for the client's opener and records every request it builds."""
 
     def __init__(self, *outcomes):
         self.outcomes = list(outcomes)
@@ -89,10 +90,20 @@ def client():
 def urlopen(monkeypatch):
     def install(*outcomes):
         recorder = _Recorder(*outcomes)
-        monkeypatch.setattr(urllib.request, "urlopen", recorder)
+        _patch_opener(monkeypatch, recorder)
         return recorder
 
     return install
+
+
+def _patch_opener(monkeypatch, handler):
+    # The client sends through its own opener (see _NoRedirectHandler), so the seam is
+    # OpenerDirector.open rather than urlopen.
+    monkeypatch.setattr(
+        urllib.request.OpenerDirector,
+        "open",
+        lambda _self, request, timeout=None: handler(request, timeout=timeout),
+    )
 
 
 def _ok():
@@ -412,9 +423,7 @@ def test_non_json_response_raises_api_error(client, urlopen, monkeypatch):
         def read(self):
             return b"<html>502 Bad Gateway</html>"
 
-    monkeypatch.setattr(
-        urllib.request, "urlopen", lambda request, timeout=None: _Garbage(200, {})
-    )
+    _patch_opener(monkeypatch, lambda request, timeout=None: _Garbage(200, {}))
 
     with pytest.raises(ApiError):
         client.create_checkout_session(
@@ -510,3 +519,74 @@ def test_retry_helper_gives_up_and_raises_the_transport_error(client, urlopen):
         )
 
     assert len(recorder.requests) == 3
+
+
+# --- redirects ---------------------------------------------------------------
+
+
+class _Redirect:
+    """A 3xx as it arrives from the transport, before any handler has seen it."""
+
+    def __init__(self, code, location="https://attacker.test/steal"):
+        self.code = code
+        self.status = code
+        self.msg = "redirect"
+        self.url = BASE_URL + SESSIONS_PATH
+        self.headers = email.message_from_string("Location: " + location + "\n")
+        self._body = io.BytesIO(json.dumps({"success": True, "checkout": CHECKOUT}).encode())
+
+    def info(self):
+        return self.headers
+
+    def read(self, *args):
+        return self._body.read(*args)
+
+    def close(self):
+        pass
+
+
+def _redirecting_transport(monkeypatch, code):
+    """Answers every real HTTPS request with a 3xx, and counts the requests."""
+    sent = []
+
+    def https_open(_handler, request):
+        sent.append(request)
+        return _Redirect(code)
+
+    monkeypatch.setattr(urllib.request.HTTPSHandler, "https_open", https_open)
+    return sent
+
+
+@pytest.mark.parametrize("code", [301, 302, 303, 307])
+def test_redirects_are_refused_and_the_target_is_never_called(client, monkeypatch, code):
+    """Following a 3xx would replay the signed headers at a host we never authenticated.
+
+    On 301/302/303 the POST also degrades to a GET, so the target's own JSON would come
+    back as a checkout session the merchant then hands to a payer.
+    """
+    sent = _redirecting_transport(monkeypatch, code)
+
+    with pytest.raises(ApiError) as caught:
+        client.create_checkout_session(
+            amount=2500, currency="EUR", order_reference="order-1042"
+        )
+
+    assert caught.value.error_code == "UNEXPECTED_REDIRECT"
+    assert caught.value.http_status == code
+    assert len(sent) == 1, "the redirect target must never be requested"
+    assert sent[0].full_url == BASE_URL + SESSIONS_PATH
+
+
+def test_a_redirect_is_not_retried(client, monkeypatch):
+    sent = _redirecting_transport(monkeypatch, 302)
+
+    with pytest.raises(ApiError):
+        client.create_checkout_session_with_retry(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            max_attempts=3,
+            backoff_seconds=0,
+        )
+
+    assert len(sent) == 1
