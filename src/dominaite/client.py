@@ -248,7 +248,11 @@ class DominaiteClient:
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
 
-        kwargs.setdefault("idempotency_key", secrets.token_hex(16))
+        # Minted once, here, for every attempt. setdefault() would leave an explicit
+        # None in place and let each attempt generate its own key downstream, which is
+        # exactly the second payment this method exists to prevent.
+        if kwargs.get("idempotency_key") is None:
+            kwargs["idempotency_key"] = secrets.token_hex(16)
 
         delay = backoff_seconds
         for attempt in range(1, max_attempts + 1):

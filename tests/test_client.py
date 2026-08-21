@@ -521,6 +521,44 @@ def test_retry_helper_gives_up_and_raises_the_transport_error(client, urlopen):
     assert len(recorder.requests) == 3
 
 
+def test_retry_helper_mints_one_key_for_all_attempts_when_none_is_given(client, urlopen):
+    recorder = urlopen((503, {}), (503, {}), _ok())
+
+    client.create_checkout_session_with_retry(
+        amount=2500,
+        currency="EUR",
+        order_reference="order-1042",
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+
+    assert len(recorder.requests) == 3
+    keys = {_headers(r)["idempotency-key"] for r in recorder.requests}
+    assert len(keys) == 1
+
+
+def test_retry_helper_treats_an_explicit_none_key_as_omitted(client, urlopen):
+    """An explicit None used to slip past setdefault, so every attempt minted its own key.
+
+    That turns one timed-out order into a second real payment, which is the whole thing
+    this helper is for.
+    """
+    recorder = urlopen((503, {}), (503, {}), _ok())
+
+    client.create_checkout_session_with_retry(
+        amount=2500,
+        currency="EUR",
+        order_reference="order-1042",
+        idempotency_key=None,
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+
+    assert len(recorder.requests) == 3
+    keys = {_headers(r)["idempotency-key"] for r in recorder.requests}
+    assert len(keys) == 1, "a retry must not mint a new key - that is the double-charge bug"
+
+
 # --- redirects ---------------------------------------------------------------
 
 
