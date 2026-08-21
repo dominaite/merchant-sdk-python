@@ -29,6 +29,64 @@ _TRANSACTION_ID_RE = re.compile(
 )
 
 
+class _Secret:
+    """Holds the API secret so that showing or serializing the client cannot leak it.
+
+    ``repr`` and ``str`` redact, and pickling refuses outright. That covers the accidents:
+    ``vars(client)`` in a debugger, ``json.dumps(vars(client), default=str)`` in a
+    structured log line, ``pprint`` in a crash dump. :meth:`reveal` is the only way back
+    to the real value, and signing is the only caller.
+    """
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def reveal(self) -> str:
+        """Return the real secret. Only for signing - never log or serialize this."""
+        return self._value
+
+    def __repr__(self) -> str:
+        return "dms_***redacted***"
+
+    __str__ = __repr__
+
+    def __reduce__(self) -> Any:
+        # Refuses pickle and, through it, copy.deepcopy. The client is already
+        # unpicklable because of its opener; this keeps the secret unpicklable on its
+        # own, so a future picklable client cannot quietly start shipping it.
+        raise TypeError("the Dominaite API secret cannot be pickled or copied")
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuses every 3xx instead of following it.
+
+    The API never redirects, so a 3xx means something in front of it answered. Following
+    it would replay the signed headers against a host we never authenticated, and a
+    301/302/303 would downgrade the POST to a GET, so whatever JSON came back would be
+    accepted as a real checkout session. Not retryable: this is a misdirected request,
+    not a blip.
+
+    This stops the header leak on the codes urllib dispatches here. The codes it does
+    not dispatch (300, 305) never reach a redirect handler at all - the 2xx gate in
+    ``_request`` is what refuses those.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        fp.close()
+        raise ApiError(
+            code,
+            "Unexpected redirect response; the Dominaite API never redirects. "
+            "Check base_url and anything proxying it.",
+            error_code="UNEXPECTED_REDIRECT",
+        )
+
+    # CPython grew http_error_308 in 3.11; we support 3.9, where a 308 would otherwise
+    # skip the handler entirely.
+    http_error_308 = urllib.request.HTTPRedirectHandler.http_error_301
+
+
 def sign_request(
     secret: str,
     timestamp: str,
@@ -92,9 +150,19 @@ class DominaiteClient:
         if not secret.startswith("dms_"):
             raise ValueError("secret must start with dms_")
         self._key_id = key_id
-        self._secret = secret
+        self._secret = _Secret(secret)
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
+        # Own opener rather than urlopen(): the default one follows redirects, and the
+        # signed headers must never leave the host we addressed.
+        self._opener = urllib.request.build_opener(_NoRedirectHandler)
+
+    def __repr__(self) -> str:
+        # Explicit, so that a later convenience repr (or a dataclass conversion) cannot
+        # reopen the display path by falling back to one that prints every attribute.
+        return "DominaiteClient(key_id={0!r}, base_url={1!r}, secret={2})".format(
+            self._key_id, self._base_url, self._secret
+        )
 
     def ping(self) -> Dict[str, Any]:
         """Check your credentials, your signing and your clock without creating anything.
@@ -212,9 +280,16 @@ class DominaiteClient:
 
         A ``TransportError`` (network blip, 5xx, ``MERCHANT_API_UNAVAILABLE``) leaves you
         not knowing whether the request landed. Reusing the key is what makes the retry
-        safe: the server returns the original session instead of opening a second one.
-        Generating a fresh key here would be the double-charge bug this method exists to
-        prevent.
+        safe: if the first attempt did land, the server refuses the retry instead of
+        opening a second session. Generating a fresh key here would be the double-charge
+        bug this method exists to prevent.
+
+        The refusal does NOT hand back the original session. It arrives as a
+        :class:`CheckoutRefusedError` with a replay code (``DUPLICATE_REQUEST``,
+        ``ALREADY_PROCESSED``, ``PRIOR_ATTEMPT_FAILED``, ``IDEMPOTENCY_KEY_REUSED``) and
+        no cashier fields, so there is nothing to hand the embed snippet. When the
+        refusal names a ``transaction_id``, read it with :meth:`get_status` to find out
+        what the earlier attempt did.
 
         Refusals and authentication failures are raised immediately - retrying them just
         burns time.
@@ -226,7 +301,11 @@ class DominaiteClient:
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
 
-        kwargs.setdefault("idempotency_key", secrets.token_hex(16))
+        # Minted once, here, for every attempt. setdefault() would leave an explicit
+        # None in place and let each attempt generate its own key downstream, which is
+        # exactly the second payment this method exists to prevent.
+        if kwargs.get("idempotency_key") is None:
+            kwargs["idempotency_key"] = secrets.token_hex(16)
 
         delay = backoff_seconds
         for attempt in range(1, max_attempts + 1):
@@ -296,7 +375,7 @@ class DominaiteClient:
 
         timestamp = str(int(time.time()))
         signature = sign_request(
-            self._secret, timestamp, method, path, idempotency_key, payload
+            self._secret.reveal(), timestamp, method, path, idempotency_key, payload
         )
 
         headers = {
@@ -316,7 +395,7 @@ class DominaiteClient:
         )
 
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+            with self._opener.open(request, timeout=self._timeout) as response:
                 status = response.status
                 raw = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as error:
@@ -366,6 +445,17 @@ class DominaiteClient:
                     or "Request rejected"
                 ),
                 error_code=str(error_code) if error_code else None,
+            )
+        if not 200 <= status < 300:
+            # Everything above tests for a KNOWN failure, so anything left that is not a
+            # 2xx would be decoded into a session on the way out. A 300 or a 305 reaches
+            # here (no redirect handler claims those codes), and so would any status the
+            # API does not send. Not the API talking: refuse it, and do not retry it.
+            raise ApiError(
+                status,
+                "Unexpected HTTP {0} response; the Dominaite API answers 2xx or a "
+                "documented error. Check base_url and anything proxying it.".format(status),
+                error_code="UNEXPECTED_STATUS",
             )
 
         return result

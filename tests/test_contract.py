@@ -59,14 +59,22 @@ def client():
     return DominaiteClient(KEY_ID, SECRET, base_url=BASE_URL)
 
 
+def _patch_opener(monkeypatch, handler):
+    # The client sends through its own opener (it refuses redirects), so the seam is
+    # OpenerDirector.open rather than urlopen.
+    monkeypatch.setattr(
+        urllib.request.OpenerDirector,
+        "open",
+        lambda _self, request, timeout=None: handler(request, timeout=timeout),
+    )
+
+
 @pytest.fixture
 def answers_with(monkeypatch):
     """Make the next call return one fixture example verbatim."""
 
     def install(payload):
-        monkeypatch.setattr(
-            urllib.request, "urlopen", lambda request, timeout=None: _Response(payload)
-        )
+        _patch_opener(monkeypatch, lambda request, timeout=None: _Response(payload))
 
     return install
 
@@ -235,7 +243,7 @@ def test_a_validation_error_surfaces_as_an_api_error_carrying_its_code(
             request.full_url, 400, "error", {}, io.BytesIO(json.dumps(body).encode("utf-8"))
         )
 
-    monkeypatch.setattr(urllib.request, "urlopen", raise_400)
+    _patch_opener(monkeypatch, raise_400)
 
     with pytest.raises(ApiError) as raised:
         client.create_checkout_session(
@@ -263,7 +271,7 @@ def test_a_validation_error_is_not_reported_as_a_refusal(client, monkeypatch):
             ),
         )
 
-    monkeypatch.setattr(urllib.request, "urlopen", raise_400)
+    _patch_opener(monkeypatch, raise_400)
 
     with pytest.raises(ApiError) as raised:
         client.create_checkout_session(
