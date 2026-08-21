@@ -5,7 +5,23 @@ gateway understood you and said no, a TransportError means you do not know wheth
 the request landed. Only the second one is safe to retry.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
+
+#: Every ``errorCode`` the API can refuse a checkout session with - a business refusal,
+#: sent as HTTP 200 with ``success: false``. Listed so you can assert your own handling
+#: covers all of them; treat an unlisted code as a refusal too rather than crashing.
+SESSION_REFUSAL_ERROR_CODES: Tuple[str, ...] = (
+    "PAYMENT_PROCESSING_UNAVAILABLE",
+    "DUPLICATE_REQUEST",
+    "ALREADY_PROCESSED",
+    "IDEMPOTENCY_KEY_REUSED",
+    "PRIOR_ATTEMPT_FAILED",
+)
+
+#: Input validation codes on the create endpoint. These are HTTP 400, NOT the
+#: ``success: false`` refusal shape, and arrive as :class:`ApiError` with the code on
+#: ``error_code``. They mean the request was malformed - fix the call, do not retry.
+VALIDATION_ERROR_CODES: Tuple[str, ...] = ("IDEMPOTENCY_KEY_REQUIRED",)
 
 
 class DominaiteError(Exception):
@@ -17,11 +33,21 @@ class DominaiteError(Exception):
 
 
 class ApiError(DominaiteError):
-    """The API answered, but with an unexpected or rejecting response."""
+    """The API answered, but with an unexpected or rejecting response.
 
-    def __init__(self, http_status: int, message: str) -> None:
+    ``error_code`` carries the machine-readable code when the API sent one - notably
+    the input validation codes in :data:`VALIDATION_ERROR_CODES`, which arrive as
+    HTTP 400 rather than as a business refusal. It is None when the response carried
+    no code (an unexpected shape, or a bare 404); branch on it only after checking it
+    is set.
+    """
+
+    def __init__(
+        self, http_status: int, message: str, error_code: Optional[str] = None
+    ) -> None:
         super().__init__(message)
         self.http_status = http_status
+        self.error_code = error_code
 
 
 class AuthenticationError(DominaiteError):
