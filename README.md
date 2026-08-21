@@ -322,6 +322,10 @@ session is still payable the response also carries `expiresAt`; after that insta
 session can only become `abandoned`. An unknown transaction id raises `ApiError` with
 `http_status == 404`.
 
+Those values are also exported as the `PaymentStatus` enum (and `PAYMENT_STATUSES`), so you can
+match on a named member instead of a bare string literal. It subclasses `str`, so
+`status["status"] == PaymentStatus.SUCCEEDED` works directly against what `get_status` returns.
+
 `succeeded` is the only value that means the payment is complete. Keep polling on `pending`,
 `processing` and `requires_capture` - none of them is terminal.
 

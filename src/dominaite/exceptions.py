@@ -5,7 +5,18 @@ gateway understood you and said no, a TransportError means you do not know wheth
 the request landed. Only the second one is safe to retry.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
+
+#: Every ``errorCode`` the API can refuse a checkout session with. Listed so you can
+#: assert your own handling covers all of them; treat an unlisted code as a refusal
+#: too rather than crashing on it.
+SESSION_REFUSAL_ERROR_CODES: Tuple[str, ...] = (
+    "PAYMENT_PROCESSING_UNAVAILABLE",
+    "DUPLICATE_REQUEST",
+    "ALREADY_PROCESSED",
+    "PRIOR_ATTEMPT_FAILED",
+    "IDEMPOTENCY_KEY_REUSED",
+)
 
 
 class DominaiteError(Exception):
