@@ -210,6 +210,14 @@ def test_an_absurdly_long_timestamp_is_out_of_range_not_a_crash():
     assert raised.value.error_code == "TIMESTAMP_OUT_OF_RANGE"
 
 
+def test_non_utf8_body_fails_verification_instead_of_crashing():
+    """A public webhook URL must not 500 on bytes an attacker chose."""
+    with pytest.raises(WebhookVerificationError) as raised:
+        verify_webhook(b"\xff\xfe\x00not utf-8", EXPECTED_HEADER, SECRET, now=NOW)
+
+    assert raised.value.error_code == "INVALID_SIGNATURE"
+
+
 def test_signed_body_that_is_not_a_json_object_fails():
     body = "not json at all"
     header = "t=" + TIMESTAMP + ",v1=" + sign_webhook(SECRET, TIMESTAMP, body)

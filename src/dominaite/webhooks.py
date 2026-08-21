@@ -85,7 +85,20 @@ def verify_webhook(
     if tolerance_seconds < 0:
         raise ValueError("tolerance_seconds must not be negative")
 
-    body = payload.decode("utf-8") if isinstance(payload, bytes) else payload
+    if isinstance(payload, (bytes, bytearray)):
+        try:
+            body = payload.decode("utf-8")
+        except UnicodeDecodeError as error:
+            # Anyone can POST arbitrary bytes at a public webhook URL. We sign UTF-8, so
+            # bytes that are not UTF-8 cannot carry our MAC - answer that, rather than
+            # letting a decode error become an unauthenticated 500.
+            raise WebhookVerificationError(
+                "INVALID_SIGNATURE",
+                "Webhook body is not valid UTF-8, so it cannot carry a Dominaite "
+                "signature.",
+            ) from error
+    else:
+        body = payload
     timestamp, provided = _parse_signature_header(signature_header)
 
     expected = sign_webhook(secret, timestamp, body)

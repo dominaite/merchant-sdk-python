@@ -117,7 +117,8 @@ class WebhookVerificationError(DominaiteError):
     - ``MALFORMED_SIGNATURE``: the header is missing, or not ``t=...,v1=...``. Usually
       the wrong header was read, or a proxy rewrote it.
     - ``INVALID_SIGNATURE``: wrong endpoint secret, or the body was modified. Also what
-      you get when the body was re-serialized before verifying instead of passed raw.
+      you get when the body was re-serialized before verifying instead of passed raw,
+      or when the raw bytes are not UTF-8 at all (we sign UTF-8, so they cannot be ours).
     - ``TIMESTAMP_OUT_OF_RANGE``: the signature is genuine but too old or too far in the
       future - a replay, or your server clock has drifted. Fix NTP; do not widen the
       tolerance to make it go away.
