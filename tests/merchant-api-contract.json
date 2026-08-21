@@ -1,5 +1,5 @@
 {
-  "$comment": "CANONICAL merchant-API response contract (v1). Source of truth is the gateway CODE on origin/dev, not any DTO docblock (the MerchantCheckoutSessionResponse docblock is stale - it omits PRIOR_ATTEMPT_FAILED). Error codes taken from Services/MerchantApi/MerchantCheckoutSessionService.cs and Functions/MerchantApiFunctions.cs; response shapes from Requests/MerchantApi/{MerchantApiPingResponse,MerchantCheckoutSessionResponse,MerchantCheckoutSessionStatusResponse}.cs; status enum from Contracts/Constants/TransactionStatus.cs. NOTE: the ping endpoint (#2440) is live on origin/dev but NOT yet on origin/main (prod) as of 2026-08-21 - the SDK ships ping() and it works against dev. Every Dominaite SDK vendors a byte-identical copy of this file and asserts, in its own suite, that (1) its response types deserialize each example below, (2) it exposes EXACTLY the fields listed per endpoint (no more, no fewer), and (3) its status enum equals statusVocabulary. This pins the response contract so a field or status value cannot silently ship in one SDK and be sibling-mirrored wrong into the others. Do NOT add, rename or drop anything here without the matching gateway change landing first.",
+  "$comment": "CANONICAL merchant-API response contract (v1). Every Dominaite SDK vendors a byte-identical copy of this file and asserts, in its own suite, that (1) its response types deserialize each example below, (2) it exposes EXACTLY the fields listed per endpoint (no more, no fewer), and (3) its status enum equals statusVocabulary. This pins the response contract so a field or status value cannot silently ship in one SDK and be sibling-mirrored wrong into the others. Do NOT add, rename or drop anything here without the matching platform API change shipping first. NOTE: the ping endpoint is not yet available in the production environment as of 2026-08-21 - READMEs say so too.",
   "version": "v1",
   "statusVocabulary": [
     "pending",
@@ -29,7 +29,13 @@
     "ping": {
       "method": "GET",
       "path": "/merchant-api/ping",
-      "fields": ["pong", "merchantId", "serverTime", "serverUnixTime", "clockSkewSeconds"],
+      "fields": [
+        "pong",
+        "merchantId",
+        "serverTime",
+        "serverUnixTime",
+        "clockSkewSeconds"
+      ],
       "example": {
         "pong": true,
         "merchantId": "6f2b6a1e-0c4d-4e8a-9b1c-2d3e4f5a6b70",
@@ -42,8 +48,22 @@
       "method": "POST",
       "path": "/merchant-api/bridgerpay/checkout/sessions",
       "note": "Business refusals are HTTP 200 with success=false and a machine-readable errorCode. Branch on success, never on HTTP status. checkout is present only on success; transactionId/errorCode/errorMessage only on refusal.",
-      "fields": ["success", "checkout", "transactionId", "errorCode", "errorMessage"],
-      "checkoutFields": ["transactionId", "orderId", "cashierKey", "cashierToken", "amount", "currency", "expiresAt"],
+      "fields": [
+        "success",
+        "checkout",
+        "transactionId",
+        "errorCode",
+        "errorMessage"
+      ],
+      "checkoutFields": [
+        "transactionId",
+        "orderId",
+        "cashierKey",
+        "cashierToken",
+        "amount",
+        "currency",
+        "expiresAt"
+      ],
       "successExample": {
         "success": true,
         "checkout": {
@@ -71,7 +91,18 @@
       "method": "GET",
       "path": "/merchant-api/bridgerpay/checkout/sessions/{transactionId}",
       "note": "status carries a statusVocabulary value. expiresAt answers only 'until when can the payer act' - null once the payer's part is over, which is NOT the same as terminal (requires_capture is non-terminal with no window). Branch on status for liveness.",
-      "fields": ["transactionId", "orderId", "orderReference", "status", "amount", "currency", "refundedAmount", "createdAt", "updatedAt", "expiresAt"],
+      "fields": [
+        "transactionId",
+        "orderId",
+        "orderReference",
+        "status",
+        "amount",
+        "currency",
+        "refundedAmount",
+        "createdAt",
+        "updatedAt",
+        "expiresAt"
+      ],
       "example": {
         "transactionId": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
         "orderId": "dom_9a8b7c6d5e4f",
