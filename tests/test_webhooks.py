@@ -150,11 +150,64 @@ def test_malformed_header_fails(header):
     assert raised.value.error_code == "MALFORMED_SIGNATURE"
 
 
-def test_header_tolerates_surrounding_whitespace_and_unknown_keys():
-    """A future scheme version must not break v1 consumers."""
-    header = "t=" + TIMESTAMP + ", v1=" + EXPECTED_V1 + ", v2=whatever"
+# The ten shared header-grammar vectors from the wire contract. Every SDK pins these
+# same strings, so a Python-only reading of the grammar shows up here.
+@pytest.mark.parametrize(
+    "header",
+    [
+        "t=1755700000",
+        "v1=" + EXPECTED_V1,
+        "t=1755700000,v1=" + EXPECTED_V1.upper(),
+        "t=1755700000,v1=" + EXPECTED_V1 + ",v1=" + EXPECTED_V1,
+        "t=1755700000,t=1755700000,v1=" + EXPECTED_V1,
+        "t=,v1=garbage,v1=" + EXPECTED_V1,
+        "t=1755700000, v1=" + EXPECTED_V1,
+        "t=+1755700000,v1=" + EXPECTED_V1,
+        "garbage",
+    ],
+    ids=[
+        "1-missing-v1",
+        "2-missing-t",
+        "3-uppercase-hex",
+        "4-repeated-v1",
+        "5-repeated-t",
+        "6-empty-t-plus-repeat",
+        "7-whitespace-after-comma",
+        "8-non-digit-in-t",
+        "9-element-without-equals",
+    ],
+)
+def test_contract_grammar_vector_rejects(header):
+    with pytest.raises(WebhookVerificationError) as raised:
+        verify_webhook(BODY, header, SECRET, now=NOW)
+
+    assert raised.value.error_code == "MALFORMED_SIGNATURE"
+
+
+def test_contract_grammar_vector_10_ignores_an_unknown_key():
+    """A future scheme version (v2 rollover) must not break v1 consumers."""
+    header = "t=1755700000,v1=" + EXPECTED_V1 + ",v9=deadbeef"
 
     assert verify_webhook(BODY, header, SECRET, now=NOW)["id"]
+
+
+def test_the_raw_t_substring_is_what_gets_signed():
+    """Leading zeros must survive into the MAC input, not be reformatted away."""
+    padded = "0001755700000"
+    header = "t=" + padded + ",v1=" + sign_webhook(SECRET, padded, BODY)
+
+    assert verify_webhook(BODY, header, SECRET, now=NOW)["id"]
+
+
+def test_an_absurdly_long_timestamp_is_out_of_range_not_a_crash():
+    """The grammar caps no digits, and CPython refuses huge int literals."""
+    huge = "9" * 5000
+    header = "t=" + huge + ",v1=" + sign_webhook(SECRET, huge, BODY)
+
+    with pytest.raises(WebhookVerificationError) as raised:
+        verify_webhook(BODY, header, SECRET, now=NOW)
+
+    assert raised.value.error_code == "TIMESTAMP_OUT_OF_RANGE"
 
 
 def test_signed_body_that_is_not_a_json_object_fails():
