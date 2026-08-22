@@ -12,9 +12,12 @@ merchant-facing lesson these tests encode.
 The secret below is the dummy from the public contract. It authenticates nothing.
 """
 
+import hmac
+
 import pytest
 
 from dominaite import WebhookVerificationError, sign_webhook, verify_webhook
+from dominaite import webhooks
 
 SECRET = "whsec_abababababababababababababababababababababababababababababababab"
 TIMESTAMP = "1755700000"
@@ -254,3 +257,51 @@ def test_verification_errors_are_catchable_as_dominaite_errors():
 
     with pytest.raises(DominaiteError):
         verify_webhook(BODY, "garbage", SECRET, now=NOW)
+
+
+# --- the comparison itself stays constant-time -------------------------------
+
+
+def test_verification_compares_the_mac_with_hmac_compare_digest(monkeypatch):
+    """Pins the comparison primitive, not just the yes/no answer.
+
+    `expected == provided` passes every other test in this file: it accepts the genuine
+    signature and rejects forged ones. What it also does is return as soon as it hits
+    the first differing byte, and the time that takes leaks how much of the MAC the
+    caller guessed right - enough, over many deliveries, to walk a forgery byte by byte.
+
+    So this asserts on the call, not the result. Swap compare_digest for == and this is
+    the test that goes red.
+    """
+    calls = []
+    real = hmac.compare_digest
+
+    def spy(left, right):
+        calls.append((left, right))
+        return real(left, right)
+
+    monkeypatch.setattr(webhooks.hmac, "compare_digest", spy)
+
+    event = verify_webhook(BODY, EXPECTED_HEADER, SECRET, now=NOW)
+
+    assert event["type"] == "payment.succeeded"
+    assert calls, "the MAC comparison must go through hmac.compare_digest"
+    assert (EXPECTED_V1, EXPECTED_V1) in calls
+
+
+def test_a_forged_signature_is_also_rejected_through_compare_digest(monkeypatch):
+    """The rejecting path is the one an attacker times, so pin it too."""
+    calls = []
+    real = hmac.compare_digest
+    monkeypatch.setattr(
+        webhooks.hmac,
+        "compare_digest",
+        lambda left, right: (calls.append((left, right)), real(left, right))[1],
+    )
+    forged = "t=" + TIMESTAMP + ",v1=" + ("0" * 64)
+
+    with pytest.raises(WebhookVerificationError) as caught:
+        verify_webhook(BODY, forged, SECRET, now=NOW)
+
+    assert caught.value.error_code == "INVALID_SIGNATURE"
+    assert calls == [(EXPECTED_V1, "0" * 64)]
