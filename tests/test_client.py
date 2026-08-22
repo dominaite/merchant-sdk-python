@@ -12,20 +12,25 @@ import urllib.request
 import pytest
 
 from dominaite import (
+    DEFAULT_BASE_URL,
     PING_PATH,
     SESSIONS_PATH,
     ApiError,
     AuthenticationError,
     CheckoutRefusedError,
     DominaiteClient,
+    RateLimitError,
     TransportError,
     sign_request,
 )
+from dominaite.client import MAX_RESPONSE_BYTES
 
 KEY_ID = "dmk_0123456789abcdef0123456789abcdef"
 SECRET = "dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 BASE_URL = "https://api.example.test/payments"
 TRANSACTION_ID = "11111111-2222-4333-8444-555555555555"
+#: A UUID with hex LETTERS in it, so upper/lower case are actually different strings.
+LETTERED_TRANSACTION_ID = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
 
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
@@ -40,13 +45,24 @@ CHECKOUT = {
 }
 
 
-class _Response:
-    def __init__(self, status, payload):
-        self.status = status
-        self._body = json.dumps(payload).encode("utf-8")
+def _message(headers):
+    """Build response headers the way urllib hands them over: an email.Message."""
+    return email.message_from_string(
+        "".join("{0}: {1}\n".format(name, value) for name, value in (headers or {}).items())
+    )
 
-    def read(self):
-        return self._body
+
+class _Response:
+    def __init__(self, status, payload, headers=None):
+        self.status = status
+        self.headers = _message(headers)
+        raw = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
+        # A real body arrives through a stream that honours read(amount). Mirroring that
+        # is what lets the bounded-read cap be exercised at all.
+        self._body = io.BytesIO(raw)
+
+    def read(self, amount=None):
+        return self._body.read() if amount is None else self._body.read(amount)
 
     def __enter__(self):
         return self
@@ -67,16 +83,19 @@ class _Recorder:
         outcome = self.outcomes.pop(0) if len(self.outcomes) > 1 else self.outcomes[0]
         if isinstance(outcome, Exception):
             raise outcome
-        status, payload = outcome
+        # (status, payload) or (status, payload, response_headers).
+        status, payload = outcome[0], outcome[1]
+        headers = outcome[2] if len(outcome) > 2 else None
+        raw = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
         if status >= 400:
             raise urllib.error.HTTPError(
                 request.full_url,
                 status,
                 "error",
-                {},
-                io.BytesIO(json.dumps(payload).encode("utf-8")),
+                _message(headers),
+                io.BytesIO(raw),
             )
-        return _Response(status, payload)
+        return _Response(status, payload, headers)
 
     @property
     def last(self):
@@ -330,11 +349,16 @@ def test_ping_401_raises_authentication_with_the_error_code(client, urlopen):
 
 
 def test_get_status_normalizes_transaction_id_casing(client, urlopen):
-    recorder = urlopen((200, {"transactionId": TRANSACTION_ID}))
+    # LETTERED_TRANSACTION_ID, not TRANSACTION_ID: the latter is all digits, so .upper()
+    # returns it unchanged and this test would pass with the lowercasing deleted.
+    assert LETTERED_TRANSACTION_ID.upper() != LETTERED_TRANSACTION_ID
+    recorder = urlopen((200, {"transactionId": LETTERED_TRANSACTION_ID}))
 
-    client.get_status("  " + TRANSACTION_ID.upper() + "  ")
+    client.get_status("  " + LETTERED_TRANSACTION_ID.upper() + "  ")
 
-    assert recorder.last.full_url.endswith(SESSIONS_PATH + "/" + TRANSACTION_ID)
+    assert recorder.last.full_url.endswith(
+        SESSIONS_PATH + "/" + LETTERED_TRANSACTION_ID
+    )
 
 
 def test_get_status_rejects_non_uuid(client):
@@ -491,11 +515,10 @@ def test_422_key_reuse_raises_api_error_not_transport(client, urlopen):
 
 
 def test_non_json_response_raises_api_error(client, urlopen, monkeypatch):
-    class _Garbage(_Response):
-        def read(self):
-            return b"<html>502 Bad Gateway</html>"
-
-    _patch_opener(monkeypatch, lambda request, timeout=None: _Garbage(200, {}))
+    _patch_opener(
+        monkeypatch,
+        lambda request, timeout=None: _Response(200, b"<html>502 Bad Gateway</html>"),
+    )
 
     with pytest.raises(ApiError):
         client.create_checkout_session(
@@ -760,3 +783,291 @@ def test_a_redirect_is_not_retried(client, monkeypatch):
         )
 
     assert len(sent) == 1
+
+
+# --- base_url must be https --------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://api.example.test/payments",
+        "http://192.168.1.10:8080/payments",
+        "http://localhost.attacker.test/payments",
+        "http://127.0.0.1.attacker.test/payments",
+        "ftp://api.example.test/payments",
+        "//api.example.test/payments",
+        "api.example.test/payments",
+    ],
+)
+def test_rejects_a_base_url_that_is_not_https(base_url):
+    """Plain http puts the key id and the signature on the wire for anyone to replay.
+
+    The near-miss hosts matter: `localhost.attacker.test` is a real registerable name
+    that a prefix or substring check would wave through.
+    """
+    with pytest.raises(ValueError, match="https"):
+        DominaiteClient(KEY_ID, SECRET, base_url=base_url)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://localhost:8080/payments",
+        "http://localhost/payments",
+        "http://127.0.0.1:9000/payments",
+        "http://[::1]:9000/payments",
+        "https://api.example.test/payments",
+        "https://localhost:8443/payments",
+    ],
+)
+def test_accepts_https_and_plain_http_on_loopback(base_url):
+    """Loopback has no wire to sniff and no certificate to be had - local dev must work."""
+    assert DominaiteClient(KEY_ID, SECRET, base_url=base_url) is not None
+
+
+def test_the_default_base_url_is_https():
+    assert DEFAULT_BASE_URL.startswith("https://")
+    assert DominaiteClient(KEY_ID, SECRET) is not None
+
+
+# --- length limits count characters, not bytes -------------------------------
+
+
+CYRILLIC_100 = "з" * 100
+
+
+def test_a_100_character_cyrillic_order_reference_is_accepted(client, urlopen):
+    """100 Cyrillic characters is 200 UTF-8 bytes. Counting bytes would refuse a
+    reference the API accepts, and the caller would never get to hear the API say yes."""
+    recorder = urlopen(_ok())
+
+    client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference=CYRILLIC_100
+    )
+
+    body = json.loads(recorder.last.data.decode("utf-8"))
+    assert body["orderReference"] == CYRILLIC_100
+    assert len(CYRILLIC_100) == 100
+    assert len(CYRILLIC_100.encode("utf-8")) == 200
+
+
+@pytest.mark.parametrize(
+    "order_reference", ["z" * 101, "з" * 101], ids=["ascii", "cyrillic"]
+)
+def test_rejects_an_order_reference_past_the_character_limit(client, order_reference):
+    with pytest.raises(ValueError, match="order_reference"):
+        client.create_checkout_session(
+            amount=2500, currency="EUR", order_reference=order_reference
+        )
+
+
+def test_a_100_character_cyrillic_idempotency_key_is_accepted(client, urlopen):
+    recorder = urlopen(_ok())
+
+    client.create_checkout_session(
+        amount=2500,
+        currency="EUR",
+        order_reference="order-1042",
+        idempotency_key=CYRILLIC_100,
+    )
+
+    assert _headers(recorder.last)["idempotency-key"] == CYRILLIC_100
+
+
+def test_rejects_an_idempotency_key_past_the_character_limit(client):
+    with pytest.raises(ValueError, match="idempotency_key"):
+        client.create_checkout_session(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key="з" * 101,
+        )
+
+
+# --- rate limiting -----------------------------------------------------------
+
+
+RATE_LIMITED_BODY = {
+    "success": False,
+    "error": {"code": "RATE_LIMIT_EXCEEDED", "message": "Too many requests."},
+}
+
+
+def test_429_raises_rate_limit_error_with_the_retry_after_seconds(client, urlopen):
+    urlopen((429, RATE_LIMITED_BODY, {"Retry-After": "30"}))
+
+    with pytest.raises(RateLimitError) as caught:
+        client.create_checkout_session(
+            amount=2500, currency="EUR", order_reference="order-1042"
+        )
+
+    assert caught.value.retry_after_seconds == 30
+    assert caught.value.http_status == 429
+    assert caught.value.error_code == "RATE_LIMIT_EXCEEDED"
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        None,
+        {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"},
+        {"Retry-After": "soon"},
+        {"Retry-After": "-5"},
+    ],
+    ids=["absent", "http-date", "garbage", "negative"],
+)
+def test_retry_after_seconds_is_none_when_the_api_did_not_give_a_number(
+    client, urlopen, headers
+):
+    """None means "back off on your own schedule". The HTTP-date form is deliberately
+    not translated: a date only means something against the server's clock, and the
+    caller's clock is exactly what may be wrong."""
+    urlopen((429, RATE_LIMITED_BODY, headers))
+
+    with pytest.raises(RateLimitError) as caught:
+        client.create_checkout_session(
+            amount=2500, currency="EUR", order_reference="order-1042"
+        )
+
+    assert caught.value.retry_after_seconds is None
+
+
+def test_a_rate_limit_is_still_catchable_as_an_api_error(client, urlopen):
+    """RateLimitError subclasses ApiError, so handlers written before it existed keep
+    catching 429s instead of letting them escape as something unhandled."""
+    urlopen((429, RATE_LIMITED_BODY, {"Retry-After": "1"}))
+
+    with pytest.raises(ApiError):
+        client.get_status(TRANSACTION_ID)
+
+
+def test_a_rate_limit_is_never_retried_automatically(client, urlopen):
+    """Answering "you are sending too much" with more traffic is how a brief spike
+    becomes a sustained lockout. The caller owns the backoff."""
+    recorder = urlopen((429, RATE_LIMITED_BODY, {"Retry-After": "1"}))
+
+    with pytest.raises(RateLimitError):
+        client.create_checkout_session_with_retry(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            max_attempts=3,
+            backoff_seconds=0,
+        )
+
+    assert len(recorder.requests) == 1
+
+
+# --- response bodies are bounded ---------------------------------------------
+
+
+def _oversized_body():
+    return b'{"success":true,"padding":"' + b"A" * (MAX_RESPONSE_BYTES + 1) + b'"}'
+
+
+def test_an_oversized_success_body_is_refused_as_a_transport_error(client, urlopen):
+    """read() with no argument writes a blank cheque against this process's memory.
+    Whatever is on the other end - a broken proxy, something hostile - must not be able
+    to cash it."""
+    urlopen((200, _oversized_body()))
+
+    with pytest.raises(TransportError, match="limit"):
+        client.create_checkout_session(
+            amount=2500, currency="EUR", order_reference="order-1042"
+        )
+
+
+def test_an_oversized_error_body_is_refused_too(client, urlopen):
+    """The 4xx/5xx path reads a body as well, and it is the likelier one to be huge -
+    an error page from something in front of the API rather than the API itself."""
+    urlopen((503, _oversized_body()))
+
+    with pytest.raises(TransportError, match="limit"):
+        client.get_status(TRANSACTION_ID)
+
+
+class _Endless:
+    """A body that never ends: read(n) always has another n bytes for you.
+
+    Only a bounded read gets out of this. An unbounded read() would sit here consuming
+    memory until the process dies, which is the whole point of the cap - a body that is
+    merely large is the mild version of this.
+    """
+
+    status = 200
+    headers = None
+
+    def read(self, amount=None):
+        if amount is None:
+            raise AssertionError(
+                "read() must be called with a bound - an endless body never returns"
+            )
+        return b"A" * amount
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_the_read_is_bounded_not_merely_checked_afterwards(client, monkeypatch):
+    """Pins the bound on the read itself, not just the size check after it.
+
+    Reading the whole body and then measuring it also raises TransportError for an
+    oversized response, so the oversized-body tests above pass either way. They do not
+    notice that the bad body was buffered in full first.
+    """
+    _patch_opener(monkeypatch, lambda request, timeout=None: _Endless())
+
+    with pytest.raises(TransportError, match="limit"):
+        client.create_checkout_session(
+            amount=2500, currency="EUR", order_reference="order-1042"
+        )
+
+
+def test_a_body_at_the_limit_is_still_read(client, urlopen):
+    """The cap refuses what is over it, not what is near it."""
+    padding = "B" * (MAX_RESPONSE_BYTES - 1000)
+    payload = json.dumps({"success": True, "checkout": CHECKOUT, "padding": padding})
+    assert len(payload.encode("utf-8")) <= MAX_RESPONSE_BYTES
+    urlopen((200, payload.encode("utf-8")))
+
+    session = client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference="order-1042"
+    )
+
+    assert session == CHECKOUT
+
+
+def test_a_short_reading_stream_is_still_read_to_the_end(client, monkeypatch):
+    """A socket-backed stream may hand back fewer bytes than asked for without being at
+    the end. A single read() call would silently truncate the JSON and report a non-JSON
+    response."""
+    payload = json.dumps({"success": True, "checkout": CHECKOUT}).encode("utf-8")
+
+    class _Dribbles:
+        def __init__(self):
+            self._remaining = payload
+
+        def read(self, amount=None):
+            chunk, self._remaining = self._remaining[:7], self._remaining[7:]
+            return chunk
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        status = 200
+        headers = None
+
+    _patch_opener(monkeypatch, lambda request, timeout=None: _Dribbles())
+
+    session = client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference="order-1042"
+    )
+
+    assert session == CHECKOUT
