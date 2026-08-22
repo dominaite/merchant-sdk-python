@@ -42,10 +42,12 @@ BASE_URL = "https://api.example.test/payments"
 class _Response:
     def __init__(self, payload):
         self.status = 200
-        self._body = json.dumps(payload).encode("utf-8")
+        self.headers = None
+        # A stream, because the client reads in bounded chunks rather than all at once.
+        self._body = io.BytesIO(json.dumps(payload).encode("utf-8"))
 
-    def read(self):
-        return self._body
+    def read(self, amount=None):
+        return self._body.read() if amount is None else self._body.read(amount)
 
     def __enter__(self):
         return self

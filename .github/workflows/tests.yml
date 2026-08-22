@@ -1,0 +1,25 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest interpreter pyproject claims support for, and the one the publish
+        # workflow builds with. A break on either end shows up here and not on a tag.
+        python-version: ["3.9", "3.12"]
+    name: pytest (python ${{ matrix.python-version }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install pytest
+        run: python -m pip install pytest
+      - name: Run the suite
+        run: python -m pytest -q

@@ -17,6 +17,10 @@ dev = ["pytest>=7.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dominaite"]
+# PEP 561 marker. Named explicitly rather than left to the default file walk: without it
+# inside the wheel, mypy and pyright ignore every annotation in this package, and the
+# failure is silent - consumers just get `Any` back and never learn why.
+force-include = { "src/dominaite/py.typed" = "dominaite/py.typed" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

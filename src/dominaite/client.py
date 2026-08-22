@@ -7,6 +7,7 @@ import re
 import secrets
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, Mapping, Optional
 
@@ -14,6 +15,7 @@ from .exceptions import (
     ApiError,
     AuthenticationError,
     CheckoutRefusedError,
+    RateLimitError,
     TransportError,
 )
 
@@ -23,6 +25,22 @@ DEFAULT_BASE_URL = "https://api.dominaite.com/payments"
 SESSIONS_PATH = "/merchant-api/checkout/sessions"
 PING_PATH = "/merchant-api/ping"
 DEFAULT_TIMEOUT_SECONDS = 45.0  # serverless cold starts hit 10+s on dev; 15s was a coin flip
+
+#: Hosts allowed to be addressed over plain http. Everything else must be https, so the
+#: signed headers cannot be read off the wire.
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+#: Longest ``order_reference`` the API accepts, counted in Unicode code points.
+MAX_ORDER_REFERENCE_LENGTH = 100
+
+#: Longest ``Idempotency-Key`` the API accepts, counted in Unicode code points.
+MAX_IDEMPOTENCY_KEY_LENGTH = 100
+
+#: Hard cap on how much of a response body we will buffer. A well-behaved API answer is
+#: a few kilobytes; anything past this is a misconfigured proxy or something hostile in
+#: front of the API, and reading it to the end is how one bad response takes the process
+#: down with it.
+MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 
 _TRANSACTION_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -87,6 +105,80 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     http_error_308 = urllib.request.HTTPRedirectHandler.http_error_301
 
 
+def _read_bounded(stream: Any) -> str:
+    """Read a response body, refusing to buffer more than :data:`MAX_RESPONSE_BYTES`.
+
+    ``read()`` with no argument hands whatever is on the other end a blank cheque against
+    this process's memory. We ask for one byte more than the cap instead: if that byte
+    arrives, the body is over the limit and we stop rather than finish reading it.
+
+    An oversized body is reported as a :class:`TransportError`, alongside the other
+    "the answer never really arrived" cases - it is safe to retry with the same
+    idempotency key.
+    """
+    chunks = []
+    remaining = MAX_RESPONSE_BYTES + 1
+    while remaining > 0:
+        # Loop rather than one read(): a socket-backed stream is allowed to hand back
+        # fewer bytes than asked for without being at the end.
+        chunk = stream.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+
+    body = b"".join(chunks)
+    if len(body) > MAX_RESPONSE_BYTES:
+        raise TransportError(
+            "The Dominaite API response exceeded the {0} byte limit and was not read; "
+            "retry with the same idempotency key.".format(MAX_RESPONSE_BYTES)
+        )
+    return body.decode("utf-8", errors="replace")
+
+
+def _retry_after_seconds(headers: Any) -> Optional[int]:
+    """Read ``Retry-After`` as a whole number of seconds, or None.
+
+    The header has a second, HTTP-date form. We do not translate it: a date only means
+    something against the server's clock, and the caller's clock is exactly what might be
+    wrong. None means "the API did not hand us a number of seconds" - back off on your
+    own schedule.
+    """
+    getter = getattr(headers, "get", None)
+    if getter is None:
+        return None
+    value = getter("Retry-After")
+    if value is None:
+        return None
+    try:
+        seconds = int(str(value).strip())
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def _require_secure_base_url(base_url: str) -> None:
+    """Refuse a base_url that would put the signed headers on the wire in the clear.
+
+    Every request carries the key id and a signature minted from the secret. Over plain
+    http anyone on the path reads them, and can replay the request verbatim inside the
+    server's 5 minute timestamp window. The only exception is loopback, where there is no
+    wire and no https certificate to be had, so local development and test doubles work.
+
+    Same failure mode as the other constructor checks: a ValueError at construction, not
+    a surprise at the first call.
+    """
+    parsed = urllib.parse.urlsplit(base_url)
+    if parsed.scheme == "https":
+        return
+    if parsed.scheme == "http" and (parsed.hostname or "") in LOOPBACK_HOSTS:
+        return
+    raise ValueError(
+        "base_url must be https:// (http:// is allowed only for localhost, 127.0.0.1 "
+        "and ::1); got {0!r}".format(base_url)
+    )
+
+
 def sign_request(
     secret: str,
     timestamp: str,
@@ -142,13 +234,15 @@ class DominaiteClient:
         """
         :param key_id: Your API key id (``dmk_...``), from the Dominaite dashboard.
         :param secret: Your API secret (``dms_...``). Server-side only.
-        :param base_url: Override for non-production environments.
+        :param base_url: Override for non-production environments. Must be ``https://``
+            unless the host is localhost, 127.0.0.1 or ::1.
         :param timeout: Per-request socket timeout in seconds.
         """
         if not key_id.startswith("dmk_"):
             raise ValueError("key_id must start with dmk_")
         if not secret.startswith("dms_"):
             raise ValueError("secret must start with dms_")
+        _require_secure_base_url(base_url)
         self._key_id = key_id
         self._secret = _Secret(secret)
         self._base_url = base_url.rstrip("/")
@@ -177,6 +271,7 @@ class DominaiteClient:
 
         :raises AuthenticationError: Wrong/revoked credentials, bad signature, clock
             too far off, or the IP is not allowlisted.
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds`` before retrying.
         :raises ApiError: Unexpected API response.
         :raises TransportError: Network-level failure.
         """
@@ -217,6 +312,8 @@ class DominaiteClient:
             (fix config; do not retry).
         :raises CheckoutRefusedError: The gateway refused the session (inspect
             ``error_code``).
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``, then retry WITH
+            the same ``idempotency_key``.
         :raises ApiError: Unexpected API response.
         :raises TransportError: Network-level failure (safe to retry WITH the same
             ``idempotency_key``).
@@ -231,11 +328,29 @@ class DominaiteClient:
             raise ValueError("currency is required")
         if not order_reference:
             raise ValueError("order_reference is required")
+        # Characters, not bytes. len() on a str counts Unicode code points, which is what
+        # the API's own limit counts - measuring len(s.encode("utf-8")) instead would
+        # refuse a 100-character Cyrillic or Greek reference the platform accepts, and
+        # the caller would never see the API say yes.
+        #
+        # Caveat: the server counts UTF-16 units, so a character outside the Basic
+        # Multilingual Plane (emoji, rarer CJK) counts as one here and two there. Those
+        # are vanishingly rare in an order id; the server stays the final arbiter, and
+        # this check exists to catch the ordinary mistake locally, not to mirror the
+        # server exactly.
+        if len(order_reference) > MAX_ORDER_REFERENCE_LENGTH:
+            raise ValueError(
+                "order_reference must be at most {0} characters".format(
+                    MAX_ORDER_REFERENCE_LENGTH
+                )
+            )
 
         key = idempotency_key if idempotency_key is not None else secrets.token_hex(16)
-        if not isinstance(key, str) or not key or len(key) > 100:
+        # Characters again, for the same reason as order_reference above.
+        if not isinstance(key, str) or not key or len(key) > MAX_IDEMPOTENCY_KEY_LENGTH:
             raise ValueError(
-                "idempotency_key must be a non-empty string of at most 100 characters"
+                "idempotency_key must be a non-empty string of at most {0} "
+                "characters".format(MAX_IDEMPOTENCY_KEY_LENGTH)
             )
 
         body: Dict[str, Any] = {
@@ -292,7 +407,10 @@ class DominaiteClient:
         what the earlier attempt did.
 
         Refusals and authentication failures are raised immediately - retrying them just
-        burns time.
+        burns time. So is a :class:`RateLimitError`: the API has just told us it is
+        already seeing too much from this key, and answering that with more traffic on a
+        half-second backoff is how a spike becomes a lockout. Catch it and wait out
+        ``retry_after_seconds`` yourself.
 
         :param max_attempts: Total attempts including the first one.
         :param backoff_seconds: Base delay; doubles after each failed attempt.
@@ -343,6 +461,8 @@ class DominaiteClient:
             :meth:`create_checkout_session`.
 
         :raises AuthenticationError: Wrong/revoked credentials or bad signature.
+        :raises RateLimitError: HTTP 429; polling too fast. Wait
+            ``retry_after_seconds`` before the next poll.
         :raises ApiError: Unknown transaction id (HTTP 404) or unexpected response.
         :raises TransportError: Network-level failure (safe to retry).
         """
@@ -394,14 +514,17 @@ class DominaiteClient:
             self._base_url + path, data=data, headers=headers, method=method
         )
 
+        headers_received: Any = None
         try:
             with self._opener.open(request, timeout=self._timeout) as response:
                 status = response.status
-                raw = response.read().decode("utf-8", errors="replace")
+                headers_received = getattr(response, "headers", None)
+                raw = _read_bounded(response)
         except urllib.error.HTTPError as error:
             # 4xx/5xx: the body still carries the machine-readable code.
             status = error.code
-            raw = error.read().decode("utf-8", errors="replace")
+            headers_received = getattr(error, "headers", None)
+            raw = _read_bounded(error)
         except (urllib.error.URLError, OSError) as error:
             raise TransportError(
                 "Could not reach the Dominaite API: {0}".format(error)
@@ -426,6 +549,24 @@ class DominaiteClient:
             raise AuthenticationError(
                 str(result.get("errorCode") or envelope_error.get("code") or "UNAUTHORIZED"),
                 "Authentication failed - check your key id, secret, and server clock.",
+            )
+        if status == 429:
+            # Deliberately not retried here, not even by
+            # create_checkout_session_with_retry: the API is telling us it is already
+            # taking more from this key than it wants, and a client that answers that by
+            # sending more is how a brief spike turns into a sustained lockout. The
+            # caller owns the backoff, because only the caller knows what else is queued.
+            retry_after = _retry_after_seconds(headers_received)
+            raise RateLimitError(
+                str(
+                    result.get("errorMessage")
+                    or envelope_error.get("message")
+                    or "Rate limit exceeded; slow down and retry later."
+                ),
+                retry_after_seconds=retry_after,
+                error_code=str(
+                    result.get("errorCode") or envelope_error.get("code") or "RATE_LIMITED"
+                ),
             )
         if status >= 500:
             raise TransportError(

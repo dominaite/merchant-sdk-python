@@ -15,6 +15,7 @@ from .exceptions import (
     AuthenticationError,
     CheckoutRefusedError,
     DominaiteError,
+    RateLimitError,
     TransportError,
     WebhookVerificationError,
 )
@@ -41,6 +42,7 @@ __all__ = [
     "DominaiteClient",
     "DominaiteError",
     "PaymentStatus",
+    "RateLimitError",
     "TransportError",
     "WebhookVerificationError",
     "__version__",

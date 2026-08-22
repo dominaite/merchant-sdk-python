@@ -47,6 +47,11 @@ export DOMINAITE_BASE_URL='https://func-dom-gw-payments-dev-gwc-01.azurewebsites
 That base URL is the dev payments service. Production is
 `https://api.dominaite.com/payments`, which is the SDK's default when you pass no `base_url`.
 
+`base_url` has to be `https://`. Every request carries your key id and a signature, and over
+plain http anyone on the path can read them and replay the request inside the server's 5 minute
+window, so the constructor raises `ValueError` rather than let that happen. The one exception is
+loopback - `localhost`, `127.0.0.1` and `::1` may use `http://`, so a local mock server works.
+
 **2. Check your signing before you call anything.** This runs offline against the published
 test vector and authenticates nothing, so it can never fail for credential reasons:
 
@@ -181,8 +186,8 @@ session = client.create_checkout_session_with_retry(
 ```
 
 It retries only `TransportError` (network failures, 5xx, `MERCHANT_API_UNAVAILABLE`), reuses the
-one key across all attempts, and backs off between them. Refusals and authentication failures
-are raised immediately.
+one key across all attempts, and backs off between them. Refusals, authentication failures and
+rate limits are raised immediately.
 
 ## Sessions expire
 
@@ -368,6 +373,7 @@ The full refusal payload is on `refusal.result`.
 | `AuthenticationError` | Bad credentials, bad signature, clock skew, IP not allowlisted | No - fix config |
 | `CheckoutRefusedError` | The gateway refused to open the session (`error_code`) | Depends on the code |
 | `ApiError` | Unexpected response, or a 4xx like an unknown transaction id (`http_status`, `error_code`) | No |
+| `RateLimitError` | HTTP 429; you are sending faster than the key is allowed (`retry_after_seconds`) | Yes, after you wait |
 | `TransportError` | Network failure or 5xx; you don't know if it landed | Yes, same idempotency key |
 | `WebhookVerificationError` | An incoming webhook is not authentic or not fresh (`error_code`) | No - respond 400 |
 
@@ -382,6 +388,37 @@ with `success: false` and raises `CheckoutRefusedError`; input validation is HTT
 rewrote it), `INVALID_SIGNATURE` (wrong secret, modified body, or you passed a re-serialized
 body instead of the raw one), `TIMESTAMP_OUT_OF_RANGE` (replay, or your clock drifted), and
 `INVALID_PAYLOAD` (signed, but not a JSON object).
+
+## Rate limits
+
+60 requests per minute per API key, and 120 per minute per IP address. Both are sliding
+windows, and the IP limit is shared by every key sending from that address, so a busy host can
+trip it while each key is well inside its own budget.
+
+Going over gets you a `RateLimitError`. The SDK does **not** retry it for you, and neither does
+`create_checkout_session_with_retry` - answering "you are sending too much" with more traffic is
+how a short spike turns into a sustained lockout. Wait, then send again:
+
+```python
+from dominaite import RateLimitError
+
+try:
+    session = client.create_checkout_session(...)
+except RateLimitError as limit:
+    time.sleep(limit.retry_after_seconds or 60)
+```
+
+`retry_after_seconds` is what the API asked you to wait, and honouring it is the shortest wait
+that will work. It is `None` when the API did not give a number of seconds - back off on your
+own schedule then.
+
+The usual cause is polling `get_status` in a tight loop. Poll after the payer returns to you, or
+on your order timeout, and let webhooks do the rest.
+
+## Field lengths
+
+`order_reference` and `idempotency_key` are capped at 100 characters each. Characters, not
+bytes: a 100-character Cyrillic or Greek reference is 200 UTF-8 bytes and the platform takes it.
 
 ## Running the tests
 

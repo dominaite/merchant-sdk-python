@@ -3,6 +3,10 @@
 The split matters when you write your error handling: a CheckoutRefused means the
 gateway understood you and said no, a TransportError means you do not know whether
 the request landed. Only the second one is safe to retry.
+
+A RateLimitError is a third case: the request definitely did not land, and it is safe
+to send again once you have waited out ``retry_after_seconds``. The SDK never retries
+it for you.
 """
 
 from typing import Any, Dict, Optional, Tuple
@@ -48,6 +52,45 @@ class ApiError(DominaiteError):
         super().__init__(message)
         self.http_status = http_status
         self.error_code = error_code
+
+
+class RateLimitError(ApiError):
+    """The API answered HTTP 429: you are sending faster than your key is allowed to.
+
+    Current platform limits: **60 requests per minute per API key**, and **120 requests
+    per minute per IP address**. Both are sliding windows, and the IP limit is shared
+    across every key sending from that address, so a busy host can hit it while each
+    individual key is well inside its own budget.
+
+    The SDK does NOT retry this for you, and neither does
+    :meth:`DominaiteClient.create_checkout_session_with_retry`. Retrying a 429
+    immediately is what turns a short spike into a sustained lockout, and only your code
+    knows what else is queued behind this call. Back off, then retry.
+
+    ``retry_after_seconds`` is the whole number of seconds the API asked you to wait,
+    taken from the ``Retry-After`` header. Honour it - it is the shortest wait that will
+    work. It is None when the API sent no such header, or sent it in the HTTP-date form
+    (which we do not translate, since a date is only meaningful against the server's
+    clock). Fall back to your own backoff in that case::
+
+        try:
+            session = client.create_checkout_session(...)
+        except RateLimitError as limit:
+            time.sleep(limit.retry_after_seconds or 60)
+
+    Subclasses :class:`ApiError`, so existing ``except ApiError`` handlers keep catching
+    429s; catch this first when you want to branch on it.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        retry_after_seconds: Optional[int] = None,
+        error_code: Optional[str] = None,
+    ) -> None:
+        super().__init__(429, message, error_code=error_code)
+        #: Seconds the API asked you to wait, or None when it did not say.
+        self.retry_after_seconds = retry_after_seconds
 
 
 class AuthenticationError(DominaiteError):
