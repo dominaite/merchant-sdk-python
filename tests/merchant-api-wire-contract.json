@@ -1,0 +1,158 @@
+{
+  "$comment": "Machine-relevant projection of GET /merchant-api/integration/contract (gateway PublicMerchantApiContract). Refreshed from the live endpoint by .github/workflows/contract-drift.yml and asserted against this SDK's hardcoded enumerations by the wire-contract test. Never hand-edit: a diff here means the gateway moved and the SDK needs a release. Prose (descriptions, notes) is deliberately excluded.",
+  "errorCodes": {
+    "auth": [
+      {
+        "code": "INVALID_API_KEY",
+        "httpStatus": 401,
+        "retry": false
+      },
+      {
+        "code": "INVALID_SIGNATURE",
+        "httpStatus": 401,
+        "retry": false
+      },
+      {
+        "code": "TIMESTAMP_OUT_OF_RANGE",
+        "httpStatus": 401,
+        "retry": false
+      },
+      {
+        "code": "IP_NOT_ALLOWED",
+        "httpStatus": 401,
+        "retry": false
+      }
+    ],
+    "idempotency": [
+      {
+        "code": "IDEMPOTENCY_KEY_REQUIRED",
+        "httpStatus": 400,
+        "retry": false
+      },
+      {
+        "code": "DUPLICATE_REQUEST",
+        "httpStatus": 200,
+        "retry": true
+      },
+      {
+        "code": "ALREADY_PROCESSED",
+        "httpStatus": 200,
+        "retry": false
+      },
+      {
+        "code": "PRIOR_ATTEMPT_FAILED",
+        "httpStatus": 200,
+        "retry": false
+      },
+      {
+        "code": "IDEMPOTENCY_KEY_REUSED",
+        "httpStatus": 200,
+        "retry": false
+      }
+    ],
+    "transient": [
+      {
+        "code": "MERCHANT_API_UNAVAILABLE",
+        "httpStatus": 503,
+        "retry": true
+      },
+      {
+        "code": "PAYMENT_PROCESSING_UNAVAILABLE",
+        "httpStatus": 200,
+        "retry": true
+      }
+    ],
+    "validation": [
+      {
+        "code": "REQUIRED",
+        "httpStatus": 400,
+        "retry": null
+      },
+      {
+        "code": "MIN_VALUE",
+        "httpStatus": 400,
+        "retry": null
+      },
+      {
+        "code": "MAX_LENGTH",
+        "httpStatus": 400,
+        "retry": null
+      },
+      {
+        "code": "INVALID_FORMAT",
+        "httpStatus": 400,
+        "retry": null
+      },
+      {
+        "code": "INVALID_EMAIL",
+        "httpStatus": 400,
+        "retry": null
+      },
+      {
+        "code": "INVALID_CURRENCY",
+        "httpStatus": 400,
+        "retry": null
+      }
+    ]
+  },
+  "idempotency": {
+    "keyHeader": "Idempotency-Key",
+    "maxKeyLength": 100,
+    "replayWindowSeconds": 7200
+  },
+  "pingPath": "/merchant-api/ping",
+  "requestSigning": {
+    "algorithm": "HMAC-SHA256",
+    "payloadTemplate": "{timestamp}\n{METHOD}\n{path}\n{idempotency_key}\n{sha256_hex_of_body}",
+    "requiredHeaders": [
+      "X-Api-Key-Id",
+      "X-Timestamp",
+      "X-Signature"
+    ],
+    "signatureHeader": "X-Signature",
+    "timestampToleranceSeconds": 300,
+    "writeRequestHeaders": [
+      "Idempotency-Key"
+    ]
+  },
+  "sdks": [
+    "node",
+    "python",
+    "go",
+    "rust",
+    "php"
+  ],
+  "sessionsPath": "/merchant-api/checkout/sessions",
+  "statusPathTemplate": "/merchant-api/checkout/sessions/{transactionId}",
+  "statuses": [
+    "pending",
+    "processing",
+    "succeeded",
+    "failed",
+    "refunded",
+    "partially_refunded",
+    "cancelled",
+    "disputed",
+    "requires_capture",
+    "abandoned"
+  ],
+  "validationHttpStatus": 400,
+  "version": "2026-08-28",
+  "webhookEventCatalog": [
+    "payment.succeeded",
+    "payment.failed",
+    "payment.requires_capture",
+    "payment.cancelled",
+    "payment.abandoned",
+    "payment.refunded",
+    "payment.disputed"
+  ],
+  "webhookSigning": {
+    "algorithm": "HMAC-SHA256",
+    "payloadTemplate": "{timestamp}.{raw_body}",
+    "requiredHeaders": [],
+    "signatureHeader": "X-Webhook-Signature",
+    "timestampToleranceSeconds": 300,
+    "writeRequestHeaders": []
+  }
+}

@@ -1,0 +1,65 @@
+name: contract-drift
+
+# Fetches the live merchant-API integration contract from the gateway, projects the
+# machine-relevant part (statuses, error codes, webhook events, paths, signing and
+# idempotency parameters) and diffs it against the vendored fixture at tests/merchant-api-wire-contract.json.
+#
+# Red means the gateway moved and this SDK has not. The fix is never to edit the
+# fixture by hand: regenerate it with the same jq below, make the SDK's hardcoded
+# enumerations match (the wire-contract test pins them), release, then commit the
+# refreshed fixture.
+#
+# Source is the dev gateway: staging and production do not serve the endpoint yet.
+# Switch CONTRACT_URL to https://api.staging.dominaite.com/payments/... once they do.
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'tests/merchant-api-wire-contract.json'
+      - '.github/workflows/contract-drift.yml'
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    env:
+      CONTRACT_URL: https://func-dom-gw-payments-dev-gwc-01.azurewebsites.net/api/merchant-api/integration/contract
+      FIXTURE: tests/merchant-api-wire-contract.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the live contract
+        run: |
+          curl --fail --silent --show-error --retry 5 --retry-delay 10 --retry-all-errors \
+            "$CONTRACT_URL" -o "$RUNNER_TEMP/live.json"
+
+      - name: Project the machine-relevant part
+        run: |
+          cat > "$RUNNER_TEMP/projection.jq" <<'JQ'
+          {
+            "$comment": "Machine-relevant projection of GET /merchant-api/integration/contract (gateway PublicMerchantApiContract). Refreshed from the live endpoint by .github/workflows/contract-drift.yml and asserted against this SDK's hardcoded enumerations by the wire-contract test. Never hand-edit: a diff here means the gateway moved and the SDK needs a release. Prose (descriptions, notes) is deliberately excluded.",
+            version: .version,
+            pingPath: .pingPath,
+            sessionsPath: .sessionsPath,
+            statusPathTemplate: .statusPathTemplate,
+            statuses: .statuses,
+            webhookEventCatalog: .webhookEventCatalog,
+            errorCodes: (.errorCodes | with_entries(.value |= map({code, httpStatus, retry}))),
+            validationHttpStatus: .validationResponseShape.httpStatus,
+            requestSigning: (.requestSigning | {algorithm, signatureHeader, timestampToleranceSeconds, requiredHeaders, writeRequestHeaders, payloadTemplate}),
+            webhookSigning: (.webhookSigning | {algorithm, signatureHeader, timestampToleranceSeconds, requiredHeaders, writeRequestHeaders, payloadTemplate}),
+            idempotency: (.idempotency | {keyHeader, maxKeyLength, replayWindowSeconds}),
+            sdks: [.sdks[].language]
+          }
+          JQ
+          jq '.data' "$RUNNER_TEMP/live.json" | jq -S -f "$RUNNER_TEMP/projection.jq" > "$RUNNER_TEMP/live-projected.json"
+
+      - name: Diff against the vendored fixture
+        run: |
+          if diff -u "$FIXTURE" "$RUNNER_TEMP/live-projected.json"; then
+            echo "Fixture matches the live contract (version $(jq -r .version "$FIXTURE"))."
+          else
+            echo "::error file=$FIXTURE::The gateway contract drifted from the vendored fixture. See the diff above; regenerate the fixture, update the SDK, release."
+            exit 1
+          fi
