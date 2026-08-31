@@ -166,7 +166,7 @@ pass here is what gets charged; nothing in the browser can change it.
 ## Retries and double-charges
 
 Every `create_checkout_session` call carries an idempotency key (auto-generated, or pass your
-own as `idempotency_key`). Retrying with the same key never opens a second payment - on a
+own as `idempotency_key`). Retrying with the same key never charges twice - on a
 timeout, retry with the same key rather than generating a new one.
 
 If the first attempt did land, the retry comes back as a `CheckoutRefusedError` with a replay
@@ -191,7 +191,10 @@ rate limits are raised immediately.
 
 ## Sessions expire
 
-A session is valid for 2 hours. If the payer comes back later, create a new session.
+A session is valid for 2 hours. If the payer comes back later, re-POST with the same
+idempotency key: once the session is a few minutes past expiry, that returns a fresh session
+for the same order (see
+[Recovering from a replay refusal](#recovering-from-a-replay-refusal)).
 
 ## Webhooks
 
@@ -365,6 +368,16 @@ except CheckoutRefusedError as refusal:
 `refusal.transaction_id` is `None` when the API did not name one (a concurrent-race
 `DUPLICATE_REQUEST` knows the key is taken but not yet by which row), so check it before use.
 The full refusal payload is on `refusal.result`.
+
+`DUPLICATE_REQUEST` means a session for this key is open, or expired within the last few
+minutes. Either way the move is the same: re-POST the same key shortly, never a fresh one.
+
+One replay is not a refusal at all. A session that expired unpaid is superseded: from a few
+minutes past its expiry, re-POSTing the same key returns an ordinary success with a fresh
+session (new transaction id, same key), so a customer who comes back late just pays. Keep the
+order-derived key for the life of the order to keep that path open. The band is not endless -
+once the platform has independently closed the attempt (about an hour past expiry), the replay
+answers `PRIOR_ATTEMPT_FAILED` and the key is spent; reconcile and use a fresh key.
 
 ## Errors
 
