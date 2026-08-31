@@ -119,8 +119,9 @@
     "node",
     "python",
     "go",
-    "rust",
-    "php"
+    "php",
+    "csharp",
+    "rust"
   ],
   "sessionsPath": "/merchant-api/checkout/sessions",
   "statusPathTemplate": "/merchant-api/checkout/sessions/{transactionId}",
