@@ -9,7 +9,12 @@ fix the SDK and release, never the fixture.
 import json
 from pathlib import Path
 
-from dominaite import PAYMENT_STATUSES, SESSION_REFUSAL_ERROR_CODES, VALIDATION_ERROR_CODES
+from dominaite import (
+    PAYMENT_STATUSES,
+    SESSION_REFUSAL_ERROR_CODES,
+    VALIDATION_ERROR_CODES,
+    WALLET_TYPES,
+)
 
 WIRE = json.loads(
     (Path(__file__).resolve().parent / "merchant-api-wire-contract.json").read_text("utf-8")
@@ -39,3 +44,15 @@ def test_validation_codes_are_exactly_the_http_400_idempotency_codes():
 
 def test_the_contract_still_lists_this_sdk():
     assert "python" in WIRE["sdks"]
+
+
+def test_wallet_types_are_exactly_the_gateway_contract_in_order():
+    assert list(WALLET_TYPES) == WIRE["wallets"]["walletTypes"]
+
+
+def test_wallet_reporting_fields_are_payment_method_and_wallet_type_both_optional():
+    assert [field["path"] for field in WIRE["wallets"]["reportingFields"]] == [
+        "paymentMethod",
+        "walletType",
+    ]
+    assert all(field["required"] is False for field in WIRE["wallets"]["reportingFields"])

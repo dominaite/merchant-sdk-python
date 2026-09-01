@@ -37,3 +37,43 @@ class PaymentStatus(str, Enum):
 
 #: Every status value the API can return today, in contract order.
 PAYMENT_STATUSES: Tuple[str, ...] = tuple(member.value for member in PaymentStatus)
+
+
+class PaymentMethodCategory(str, Enum):
+    """How the payer paid, in the order the API contract lists the categories.
+
+    Reporting data, not a money-flow switch: a wallet payment refunds, captures and
+    disputes exactly like a plain card payment. ``get_status()`` reports it as the
+    raw ``paymentMethod`` string (null while the payment is still open and on
+    transactions older than the field), so an unknown value survives the trip to
+    your code instead of blowing up inside the SDK.
+    """
+
+    CARD = "card"
+    WALLET = "wallet"
+    BANK_TRANSFER = "bank_transfer"
+    SEPA = "sepa"
+
+
+#: Every payment method category the API reports today, in contract order.
+PAYMENT_METHOD_CATEGORIES: Tuple[str, ...] = tuple(
+    member.value for member in PaymentMethodCategory
+)
+
+
+class WalletType(str, Enum):
+    """The wallets the gateway currently names in ``walletType``.
+
+    Pinned against the published contract fixture. The field can carry a lower-cased
+    identifier not in this list yet - treat unknown values as a valid wallet, not an
+    error. ``get_status()`` reports it as the raw string, null for non-wallet
+    payments.
+    """
+
+    APPLE_PAY = "apple_pay"
+    GOOGLE_PAY = "google_pay"
+    SAMSUNG_PAY = "samsung_pay"
+
+
+#: Every wallet the gateway names today, in contract order.
+WALLET_TYPES: Tuple[str, ...] = tuple(member.value for member in WalletType)
