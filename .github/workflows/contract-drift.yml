@@ -49,7 +49,7 @@ jobs:
             validationHttpStatus: .validationResponseShape.httpStatus,
             requestSigning: (.requestSigning | {algorithm, signatureHeader, timestampToleranceSeconds, requiredHeaders, writeRequestHeaders, payloadTemplate}),
             webhookSigning: (.webhookSigning | {algorithm, signatureHeader, timestampToleranceSeconds, requiredHeaders, writeRequestHeaders, payloadTemplate}),
-            idempotency: (.idempotency | {keyHeader, maxKeyLength, replayWindowSeconds}),
+            idempotency: (.idempotency | {keyHeader, maxKeyLength, replayWindowSeconds, supersedeAfterSeconds}),
             sdks: [.sdks[].language]
           }
           JQ
