@@ -19,7 +19,8 @@ from .exceptions import (
     TransportError,
 )
 
-__version__ = "0.2.0"
+# Must track pyproject.toml's version - pinned by the version test in test_client.py.
+__version__ = "0.3.0"
 
 DEFAULT_BASE_URL = "https://api.dominaite.com/payments"
 SESSIONS_PATH = "/merchant-api/checkout/sessions"
@@ -456,6 +457,16 @@ class DominaiteClient:
         Treat any status you do not recognise as still-open too: a value added to the
         API later must make you keep polling, never silently close an order that is
         still live.
+
+        The response also reports how the payer paid. ``paymentMethod`` is ``card``,
+        ``wallet``, ``bank_transfer`` or ``sepa``; None while the payment is still
+        open (no method chosen yet) and on transactions older than the field.
+        ``walletType`` names the wallet when ``paymentMethod`` is ``wallet`` -
+        ``apple_pay``, ``google_pay``, ``samsung_pay``, or a lower-cased identifier
+        the gateway learned about later, which is a valid wallet and not an error;
+        None for non-wallet payments. Both are reporting data, never a money-flow
+        switch, and both also arrive inside ``data`` on every ``payment.*`` webhook
+        event.
 
         :param transaction_id: The ``transactionId`` from
             :meth:`create_checkout_session`.

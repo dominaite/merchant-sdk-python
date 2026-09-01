@@ -99,6 +99,8 @@
         "amount",
         "currency",
         "refundedAmount",
+        "paymentMethod",
+        "walletType",
         "createdAt",
         "updatedAt",
         "expiresAt"
@@ -111,6 +113,8 @@
         "amount": 8440,
         "currency": "EUR",
         "refundedAmount": null,
+        "paymentMethod": "wallet",
+        "walletType": "apple_pay",
         "createdAt": "2026-08-21T09:15:30.000Z",
         "updatedAt": "2026-08-21T09:16:05.000Z",
         "expiresAt": null

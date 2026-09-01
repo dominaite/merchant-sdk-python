@@ -139,7 +139,31 @@
     "abandoned"
   ],
   "validationHttpStatus": 400,
-  "version": "2026-08-28",
+  "version": "2026-09-01",
+  "wallets": {
+    "enablementSetups": [
+      "widget",
+      "hosted_page",
+      "merchant_domain_buttons"
+    ],
+    "reportingFields": [
+      {
+        "path": "paymentMethod",
+        "required": false,
+        "type": "string"
+      },
+      {
+        "path": "walletType",
+        "required": false,
+        "type": "string"
+      }
+    ],
+    "walletTypes": [
+      "apple_pay",
+      "google_pay",
+      "samsung_pay"
+    ]
+  },
   "webhookEventCatalog": [
     "payment.succeeded",
     "payment.failed",

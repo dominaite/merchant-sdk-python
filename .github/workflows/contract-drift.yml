@@ -50,6 +50,11 @@ jobs:
             requestSigning: (.requestSigning | {algorithm, signatureHeader, timestampToleranceSeconds, requiredHeaders, writeRequestHeaders, payloadTemplate}),
             webhookSigning: (.webhookSigning | {algorithm, signatureHeader, timestampToleranceSeconds, requiredHeaders, writeRequestHeaders, payloadTemplate}),
             idempotency: (.idempotency | {keyHeader, maxKeyLength, replayWindowSeconds, supersedeAfterSeconds}),
+            wallets: {
+              walletTypes: .wallets.walletTypes,
+              reportingFields: [.wallets.reportingFields[] | {path, type, required}],
+              enablementSetups: [.wallets.enablement[].setup]
+            },
             sdks: [.sdks[].language]
           }
           JQ

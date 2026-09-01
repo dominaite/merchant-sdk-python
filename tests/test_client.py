@@ -6,8 +6,10 @@ import io
 import json
 import pickle
 import pprint
+import re
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 
@@ -1071,3 +1073,27 @@ def test_a_short_reading_stream_is_still_read_to_the_end(client, monkeypatch):
     )
 
     assert session == CHECKOUT
+
+
+# --- the version on the wire --------------------------------------------------
+
+
+def test_the_user_agent_version_tracks_pyproject(client, urlopen):
+    """One version, two homes: pyproject.toml and client.py's __version__ must move
+    together, and the User-Agent header is where a stale one would ship."""
+    from dominaite import __version__
+
+    pyproject = (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text(
+        "utf-8"
+    )
+    match = re.search(r'^version = "([^"]+)"$', pyproject, re.MULTILINE)
+    assert match is not None, "pyproject.toml must declare [project] version"
+    assert __version__ == match.group(
+        1
+    ), "__version__ in client.py must track pyproject.toml's version"
+
+    recorder = urlopen(_ok())
+    client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference="order-1042"
+    )
+    assert _headers(recorder.last)["user-agent"] == "dominaite-python/" + __version__
