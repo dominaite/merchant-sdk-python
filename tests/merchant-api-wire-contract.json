@@ -98,7 +98,8 @@
   "idempotency": {
     "keyHeader": "Idempotency-Key",
     "maxKeyLength": 100,
-    "replayWindowSeconds": 7200
+    "replayWindowSeconds": 7200,
+    "supersedeAfterSeconds": 7800
   },
   "pingPath": "/merchant-api/ping",
   "requestSigning": {
