@@ -39,12 +39,13 @@ class PaymentStatus(str, Enum):
 PAYMENT_STATUSES: Tuple[str, ...] = tuple(member.value for member in PaymentStatus)
 
 
-class PaymentMethodStatus(str, Enum):
+class StoredPaymentMethodStatus(str, Enum):
     """A stored payment method's state, in the order the API contract lists them.
 
-    Only ``ACTIVE`` methods can be charged. ``REVOKED`` is what
-    :meth:`DominaiteClient.revoke_payment_method` leaves behind; ``EXPIRED`` means the
-    card's expiry date has passed. Treat a value you do not recognise as not chargeable.
+    Read off ``get_status()["storedPaymentMethod"]["status"]``. Only ``ACTIVE`` methods
+    can be charged. ``REVOKED`` is what :meth:`DominaiteClient.revoke_payment_method`
+    leaves behind; ``EXPIRED`` means the card's expiry date has passed. Treat a value
+    you do not recognise as not chargeable.
     """
 
     ACTIVE = "active"
@@ -53,21 +54,25 @@ class PaymentMethodStatus(str, Enum):
 
 
 #: Every stored payment method status the API can return today, in contract order.
-PAYMENT_METHOD_STATUSES: Tuple[str, ...] = tuple(
-    member.value for member in PaymentMethodStatus
+STORED_PAYMENT_METHOD_STATUSES: Tuple[str, ...] = tuple(
+    member.value for member in StoredPaymentMethodStatus
 )
 
 
 class ChargeStatus(str, Enum):
     """The outcome of :meth:`DominaiteClient.charge_payment_method`.
 
-    ``PENDING`` is not terminal: poll :meth:`DominaiteClient.get_status` with the
-    charge's ``transactionId``. Treat an unknown value as still open.
+    ``SUCCEEDED``: the money moved. ``FAILED``: it did not; on a 402 the charge's
+    ``declineClass`` says why. ``PENDING`` is not terminal: poll
+    :meth:`DominaiteClient.get_status` with the charge's ``transactionId``.
+    ``CANCELLED``: an authorization voided before capture, no money moved. Treat an
+    unknown value as still open.
     """
 
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     PENDING = "pending"
+    CANCELLED = "cancelled"
 
 
 #: Every charge status the API can return today, in contract order.
@@ -75,7 +80,8 @@ CHARGE_STATUSES: Tuple[str, ...] = tuple(member.value for member in ChargeStatus
 
 
 class DeclineClass(str, Enum):
-    """Why a charge failed, coarse enough to act on without reading the issuer's code.
+    """Why a charge was declined (HTTP 402), coarse enough to act on without reading
+    the issuer's code. None on every other charge, including a 502 ``CHARGE_FAILED`` row.
 
     - ``HARD``: do not retry this card, ask the customer for another one.
     - ``SOFT_FUNDS``: insufficient funds; retry later (after payday, not in a loop).

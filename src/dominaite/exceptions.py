@@ -27,6 +27,24 @@ SESSION_REFUSAL_ERROR_CODES: Tuple[str, ...] = (
 #: ``error_code``. They mean the request was malformed - fix the call, do not retry.
 VALIDATION_ERROR_CODES: Tuple[str, ...] = ("IDEMPOTENCY_KEY_REQUIRED",)
 
+#: The codes :meth:`DominaiteClient.charge_payment_method` raises as
+#: :class:`ChargeError`, in the gateway's own order. ``CHARGE_DECLINED`` (HTTP 402) is
+#: deliberately not here: a decline is a charge result with ``status`` ``failed``, not
+#: an exception.
+CHARGE_ERROR_CODES: Tuple[str, ...] = (
+    "PAYMENT_METHOD_NOT_ACTIVE",
+    "DUPLICATE_REQUEST",
+    "IDEMPOTENCY_KEY_REUSED",
+    "CHARGE_OUTCOME_UNKNOWN",
+    "CHARGE_FAILED",
+    "PAYMENT_METHOD_CHARGES_DISABLED",
+    "PAYMENT_PROCESSING_UNAVAILABLE",
+)
+
+#: The codes :meth:`DominaiteClient.revoke_payment_method` raises as
+#: :class:`RevokeError`, in the gateway's own order.
+REVOKE_ERROR_CODES: Tuple[str, ...] = ("UPSTREAM_CONTRACT_ERROR", "MERCHANT_API_UNAVAILABLE")
+
 
 class DominaiteError(Exception):
     """Base class for every error this SDK raises.
@@ -148,6 +166,78 @@ class CheckoutRefusedError(DominaiteError):
         self.error_code = error_code
         self.transaction_id = transaction_id
         #: The full unwrapped refusal payload, for fields not modelled above.
+        self.result = result if result is not None else {}
+
+
+class ChargeError(DominaiteError):
+    """The gateway answered a charge with an error code instead of a charge result.
+
+    The HTTP status is on ``http_status``, the machine-readable code on ``error_code``
+    and the charge row the gateway attached (when it did) on ``charge``, with
+    ``transaction_id`` as a shortcut to its ``transactionId``. Branch on ``error_code``:
+
+    - ``CHARGE_OUTCOME_UNKNOWN`` (502): the provider gave no verdict and the charge MAY
+      have happened. ``charge`` is set: poll :meth:`DominaiteClient.get_status` with
+      ``transaction_id`` or wait for the webhook. Never retry under a new key.
+    - ``CHARGE_FAILED`` (502): nothing was charged. ``charge`` is set when a row exists
+      (its ``declineClass`` and ``declineCode`` are None), None when the provider
+      refused before one.
+    - ``PAYMENT_METHOD_NOT_ACTIVE`` (409): the method is revoked or expired; bring the
+      customer back for a hosted session with ``save_card=True``.
+    - ``DUPLICATE_REQUEST`` (409): a request with this key is still in flight; retry
+      with the SAME key in a moment.
+    - ``IDEMPOTENCY_KEY_REUSED`` (422): same key, different body or method; a bug on
+      your side.
+    - ``PAYMENT_METHOD_CHARGES_DISABLED``, ``PAYMENT_PROCESSING_UNAVAILABLE`` (503):
+      nothing was charged; retry later with the SAME key.
+
+    ``result`` is the whole envelope the gateway sent, for fields not modelled above.
+    """
+
+    def __init__(
+        self,
+        http_status: int,
+        error_code: str,
+        message: str,
+        charge: Optional[Dict[str, Any]] = None,
+        result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+        self.error_code = error_code
+        #: The charge row the gateway attached to its answer, when it did.
+        self.charge = charge
+        #: ``charge["transactionId"]`` when ``charge`` is set, for polling.
+        self.transaction_id = charge.get("transactionId") if charge else None
+        #: The full envelope, for fields not modelled above.
+        self.result = result if result is not None else {}
+
+
+class RevokeError(DominaiteError):
+    """The gateway refused to revoke a stored payment method. Nothing changed.
+
+    Branch on ``error_code``:
+
+    - ``MERCHANT_API_UNAVAILABLE`` (503): the provider is unavailable or throttling;
+      retry later.
+    - ``UPSTREAM_CONTRACT_ERROR`` (502): the provider refused the deletion for a reason
+      a retry will not fix; contact support with the payment method id.
+
+    An id that is not yours is still the generic :class:`ApiError` with
+    ``http_status`` 404.
+    """
+
+    def __init__(
+        self,
+        http_status: int,
+        error_code: str,
+        message: str,
+        result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+        self.error_code = error_code
+        #: The full envelope, for fields not modelled above.
         self.result = result if result is not None else {}
 
 

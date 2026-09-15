@@ -1,5 +1,5 @@
 {
-  "$comment": "CANONICAL merchant-API response contract (v1). Every Dominaite SDK vendors a byte-identical copy of this file and asserts, in its own suite, that (1) its response types deserialize each example below, (2) it exposes EXACTLY the fields listed per endpoint (no more, no fewer), and (3) its status enum equals statusVocabulary. This pins the response contract so a field or status value cannot silently ship in one SDK and be sibling-mirrored wrong into the others. Do NOT add, rename or drop anything here without the matching platform API change shipping first. NOTE: the ping endpoint is not yet available in the production environment as of 2026-08-21 - READMEs say so too. Stored payment methods (saveCard on create, paymentMethod on status, the payment-methods charge and revoke endpoints) ship with the gateway's recurring-payments release and are part of v1.",
+  "$comment": "CANONICAL merchant-API response contract (v1). Every Dominaite SDK vendors a byte-identical copy of this file and asserts, in its own suite, that (1) its response types deserialize each example below, (2) it exposes EXACTLY the fields listed per endpoint (no more, no fewer), and (3) its status enum equals statusVocabulary. This pins the response contract so a field or status value cannot silently ship in one SDK and be sibling-mirrored wrong into the others. Do NOT add, rename or drop anything here without the matching platform API change shipping first. NOTE: the ping endpoint is not yet available in the production environment as of 2026-08-21 - READMEs say so too. Stored payment methods (saveCard on create, storedPaymentMethod on status, the payment-methods charge and revoke endpoints) ship with the gateway's recurring-payments release and are part of v1; their examples below are copied from the gateway DTOs (MerchantStoredPaymentMethodResponse, MerchantPaymentMethodChargeResponse, MerchantApiChargeFunctions.SerializeChargeResult). The gateway serializes with WhenWritingNull, so every null below is ABSENT on the wire: an SDK must read a missing field and a null field as the same thing.",
   "version": "v1",
   "statusVocabulary": [
     "pending",
@@ -90,7 +90,7 @@
     "getStatus": {
       "method": "GET",
       "path": "/merchant-api/checkout/sessions/{transactionId}",
-      "note": "status carries a statusVocabulary value. expiresAt answers only 'until when can the payer act' - null once the payer's part is over, which is NOT the same as terminal (requires_capture is non-terminal with no window). Branch on status for liveness. paymentMethod is present once a session created with saveCard has succeeded; null otherwise.",
+      "note": "status carries a statusVocabulary value. expiresAt answers only 'until when can the payer act' - null once the payer's part is over, which is NOT the same as terminal (requires_capture is non-terminal with no window). Branch on status for liveness. storedPaymentMethod is the card kept on file by a session created with saveCard: present once the payment is approved, and it stays present after a revoke with status revoked; null (absent on the wire) until then, for sessions without saveCard, and for declined or abandoned ones. It is NOT the gateway's paymentMethod field, which is the string category of how the payer paid (card, wallet, bank_transfer, sepa) and passes through these SDKs untyped.",
       "fields": [
         "transactionId",
         "orderId",
@@ -102,7 +102,7 @@
         "createdAt",
         "updatedAt",
         "expiresAt",
-        "paymentMethod"
+        "storedPaymentMethod"
       ],
       "example": {
         "transactionId": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
@@ -115,16 +115,8 @@
         "createdAt": "2026-08-21T09:15:30.000Z",
         "updatedAt": "2026-08-21T09:16:05.000Z",
         "expiresAt": null,
-        "paymentMethod": null
+        "storedPaymentMethod": null
       },
-      "paymentMethodFields": [
-        "id",
-        "brand",
-        "last4",
-        "expiryMonth",
-        "expiryYear",
-        "status"
-      ],
       "savedCardExample": {
         "transactionId": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
         "orderId": "dom_9a8b7c6d5e4f",
@@ -136,7 +128,7 @@
         "createdAt": "2026-08-21T09:15:30.000Z",
         "updatedAt": "2026-08-21T09:16:05.000Z",
         "expiresAt": null,
-        "paymentMethod": {
+        "storedPaymentMethod": {
           "id": "pm_0123456789abcdef0123456789abcdef",
           "brand": "visa",
           "last4": "4242",
@@ -144,13 +136,23 @@
           "expiryYear": 2029,
           "status": "active"
         }
-      }
+      },
+      "storedPaymentMethodFields": [
+        "id",
+        "brand",
+        "last4",
+        "expiryMonth",
+        "expiryYear",
+        "status"
+      ],
+      "$storedPaymentMethodNote": "id is pm_ followed by 32 hex characters, case-sensitive; store and send it verbatim. brand, last4, expiryMonth and expiryYear are null (absent) when the provider did not report them. Never the card number, never the provider token."
     },
     "chargePaymentMethod": {
       "method": "POST",
       "path": "/merchant-api/payment-methods/{paymentMethodId}/charges",
       "httpStatus": 201,
-      "note": "Off-session charge of a stored card. Idempotency-Key is required and signed, exactly like create. A decline is a 201 with status failed plus declineClass/declineCode, not an error; declineClass/declineCode are null on succeeded and pending. pending is not terminal: poll getStatus(transactionId). Business refusals (replayed key, payments off, method not chargeable) use the create endpoint's HTTP 200 success=false shape.",
+      "declinedHttpStatus": 402,
+      "note": "Off-session charge of a stored card. Idempotency-Key is required and signed, exactly like create; the same key replays the first answer, HTTP status included. Every reply is the standard envelope { success, data?, error?, metadata }. 201 (200 on a durable replay): success=true and data is the charge, status succeeded, pending or cancelled, declineClass and declineCode absent. 402: the provider declined; success=false, error.code CHARGE_DECLINED, and data is the SAME charge body with status failed plus declineClass and declineCode. An SDK returns the 402 as a charge result, never as an exception. 502 CHARGE_OUTCOME_UNKNOWN carries data too (the charge row and its transactionId): the outcome is unknown, poll getStatus(transactionId) or wait for the webhook, never retry under a new key. 502 CHARGE_FAILED means nothing was charged, with data when a row exists (declineClass and declineCode null) and without when the provider refused before one. 503, 409 and 422 carry no data. Every code in chargeErrorCodes reaches the caller as a typed charge error with error.code, error.message, the HTTP status and data intact; only transport failures and 400, 401, 403, 404 and 429 are generic. pending is not terminal: poll getStatus(transactionId). chargeId is ch_ followed by 32 hex characters.",
       "fields": [
         "chargeId",
         "status",
@@ -159,44 +161,338 @@
         "transactionId"
       ],
       "successExample": {
-        "chargeId": "chg_7a8b9c0d1e2f3a4b",
-        "status": "succeeded",
-        "declineClass": null,
-        "declineCode": null,
-        "transactionId": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+        "success": true,
+        "data": {
+          "chargeId": "ch_1a2b3c4d5e6f4a7b8c9d0e1f2a3b4c5d",
+          "status": "succeeded",
+          "declineClass": null,
+          "declineCode": null,
+          "transactionId": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+        },
+        "metadata": {
+          "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+          "timestamp": "2026-09-15T18:02:11.4183920Z",
+          "apiVersion": "1.0",
+          "processingTimeMs": 1187
+        }
       },
       "declinedExample": {
-        "chargeId": "chg_7a8b9c0d1e2f3a4c",
-        "status": "failed",
-        "declineClass": "soft_funds",
-        "declineCode": "51",
-        "transactionId": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5e"
+        "success": false,
+        "data": {
+          "chargeId": "ch_1a2b3c4d5e6f4a7b8c9d0e1f2a3b4c5e",
+          "status": "failed",
+          "declineClass": "soft_funds",
+          "declineCode": "51",
+          "transactionId": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5e"
+        },
+        "error": {
+          "message": "The payment provider declined the charge.",
+          "code": "CHARGE_DECLINED",
+          "statusCode": 402,
+          "timestamp": "2026-09-15T18:02:11.4183920Z"
+        },
+        "metadata": {
+          "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+          "timestamp": "2026-09-15T18:02:11.4183920Z",
+          "apiVersion": "1.0",
+          "processingTimeMs": 1043
+        }
+      },
+      "errorExamples": [
+        {
+          "httpStatus": 502,
+          "code": "CHARGE_OUTCOME_UNKNOWN",
+          "body": {
+            "success": false,
+            "data": {
+              "chargeId": "ch_1a2b3c4d5e6f4a7b8c9d0e1f2a3b4c5f",
+              "status": "pending",
+              "declineClass": null,
+              "declineCode": null,
+              "transactionId": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5f"
+            },
+            "error": {
+              "message": "The payment provider gave no verdict. The charge may have happened: poll the transaction status or wait for the webhook, and do not retry with a new key.",
+              "code": "CHARGE_OUTCOME_UNKNOWN",
+              "statusCode": 502,
+              "timestamp": "2026-09-15T18:02:11.4183920Z"
+            },
+            "metadata": {
+              "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+              "timestamp": "2026-09-15T18:02:11.4183920Z",
+              "apiVersion": "1.0",
+              "processingTimeMs": 45012
+            }
+          }
+        },
+        {
+          "httpStatus": 502,
+          "code": "CHARGE_FAILED",
+          "body": {
+            "success": false,
+            "data": {
+              "chargeId": "ch_1a2b3c4d5e6f4a7b8c9d0e1f2a3b4c60",
+              "status": "failed",
+              "declineClass": null,
+              "declineCode": null,
+              "transactionId": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c60"
+            },
+            "error": {
+              "message": "The charge could not be placed with the payment provider. Nothing was charged.",
+              "code": "CHARGE_FAILED",
+              "statusCode": 502,
+              "timestamp": "2026-09-15T18:02:11.4183920Z"
+            },
+            "metadata": {
+              "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+              "timestamp": "2026-09-15T18:02:11.4183920Z",
+              "apiVersion": "1.0",
+              "processingTimeMs": 902
+            }
+          }
+        },
+        {
+          "httpStatus": 502,
+          "code": "CHARGE_FAILED",
+          "body": {
+            "success": false,
+            "error": {
+              "message": "The charge could not be placed with the payment provider. Nothing was charged.",
+              "code": "CHARGE_FAILED",
+              "statusCode": 502,
+              "timestamp": "2026-09-15T18:02:11.4183920Z"
+            },
+            "metadata": {
+              "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+              "timestamp": "2026-09-15T18:02:11.4183920Z",
+              "apiVersion": "1.0",
+              "processingTimeMs": 611
+            }
+          }
+        },
+        {
+          "httpStatus": 503,
+          "code": "PAYMENT_METHOD_CHARGES_DISABLED",
+          "body": {
+            "success": false,
+            "error": {
+              "message": "Charges of stored payment methods are not enabled.",
+              "code": "PAYMENT_METHOD_CHARGES_DISABLED",
+              "statusCode": 503,
+              "timestamp": "2026-09-15T18:02:11.4183920Z"
+            },
+            "metadata": {
+              "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+              "timestamp": "2026-09-15T18:02:11.4183920Z",
+              "apiVersion": "1.0",
+              "processingTimeMs": 8
+            }
+          }
+        },
+        {
+          "httpStatus": 503,
+          "code": "PAYMENT_PROCESSING_UNAVAILABLE",
+          "body": {
+            "success": false,
+            "error": {
+              "message": "Card payments are unavailable right now. Retry later with the same Idempotency-Key.",
+              "code": "PAYMENT_PROCESSING_UNAVAILABLE",
+              "statusCode": 503,
+              "timestamp": "2026-09-15T18:02:11.4183920Z"
+            },
+            "metadata": {
+              "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+              "timestamp": "2026-09-15T18:02:11.4183920Z",
+              "apiVersion": "1.0",
+              "processingTimeMs": 21
+            }
+          }
+        },
+        {
+          "httpStatus": 409,
+          "code": "PAYMENT_METHOD_NOT_ACTIVE",
+          "body": {
+            "success": false,
+            "error": {
+              "message": "This payment method is no longer active and cannot be charged.",
+              "code": "PAYMENT_METHOD_NOT_ACTIVE",
+              "statusCode": 409,
+              "timestamp": "2026-09-15T18:02:11.4183920Z"
+            },
+            "metadata": {
+              "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+              "timestamp": "2026-09-15T18:02:11.4183920Z",
+              "apiVersion": "1.0",
+              "processingTimeMs": 14
+            }
+          }
+        },
+        {
+          "httpStatus": 409,
+          "code": "DUPLICATE_REQUEST",
+          "body": {
+            "success": false,
+            "error": {
+              "message": "A request with this Idempotency-Key is being processed. Retry with the same key in a moment.",
+              "code": "DUPLICATE_REQUEST",
+              "statusCode": 409,
+              "timestamp": "2026-09-15T18:02:11.4183920Z"
+            },
+            "metadata": {
+              "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+              "timestamp": "2026-09-15T18:02:11.4183920Z",
+              "apiVersion": "1.0",
+              "processingTimeMs": 6
+            }
+          }
+        },
+        {
+          "httpStatus": 422,
+          "code": "IDEMPOTENCY_KEY_REUSED",
+          "body": {
+            "success": false,
+            "error": {
+              "message": "This Idempotency-Key was already used with a different request body or payment method.",
+              "code": "IDEMPOTENCY_KEY_REUSED",
+              "statusCode": 422,
+              "timestamp": "2026-09-15T18:02:11.4183920Z"
+            },
+            "metadata": {
+              "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+              "timestamp": "2026-09-15T18:02:11.4183920Z",
+              "apiVersion": "1.0",
+              "processingTimeMs": 7
+            }
+          }
+        }
+      ],
+      "notFoundExample": {
+        "httpStatus": 404,
+        "code": "PAYMENT_METHOD_NOT_FOUND",
+        "body": {
+          "success": false,
+          "error": {
+            "message": "No stored payment method with this id.",
+            "code": "PAYMENT_METHOD_NOT_FOUND",
+            "statusCode": 404,
+            "timestamp": "2026-09-15T18:02:11.4183920Z"
+          },
+          "metadata": {
+            "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+            "timestamp": "2026-09-15T18:02:11.4183920Z",
+            "apiVersion": "1.0",
+            "processingTimeMs": 5
+          }
+        }
       }
     },
     "revokePaymentMethod": {
       "method": "DELETE",
       "path": "/merchant-api/payment-methods/{paymentMethodId}",
       "httpStatus": 204,
-      "note": "Revokes the token at the payment provider and marks the method revoked. No body, no Idempotency-Key: the signature covers an empty key and an empty body, like GET. A later charge on the method is refused.",
-      "fields": []
+      "note": "Deletes the saved credential at the payment provider and marks the method revoked; a later charge on it is refused and the status read keeps the object with status revoked. Answers 204 with no body, and 204 again for an already revoked method, so retrying a timed-out revoke is safe. No Idempotency-Key: the signature covers an empty key and an empty body, like GET. 503 MERCHANT_API_UNAVAILABLE changed nothing, retry later (that includes the provider throttling us). 502 UPSTREAM_CONTRACT_ERROR means the provider refused the deletion for a reason a retry will not fix; nothing changed, contact support with the id. Both reach the caller as a typed revoke error with error.code and error.message intact. 404 (unknown or foreign id) is the generic 404 error; branch on the HTTP status, its code is the gateway's validation shape.",
+      "fields": [],
+      "errorExamples": [
+        {
+          "httpStatus": 502,
+          "code": "UPSTREAM_CONTRACT_ERROR",
+          "body": {
+            "success": false,
+            "error": {
+              "message": "The payment provider refused to delete the stored credential. Nothing changed; contact support with the payment method id.",
+              "code": "UPSTREAM_CONTRACT_ERROR",
+              "statusCode": 502,
+              "timestamp": "2026-09-15T18:02:11.4183920Z"
+            },
+            "metadata": {
+              "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+              "timestamp": "2026-09-15T18:02:11.4183920Z",
+              "apiVersion": "1.0",
+              "processingTimeMs": 733
+            }
+          }
+        },
+        {
+          "httpStatus": 503,
+          "code": "MERCHANT_API_UNAVAILABLE",
+          "body": {
+            "success": false,
+            "error": {
+              "message": "The payment provider is unavailable. Nothing changed; retry later.",
+              "code": "MERCHANT_API_UNAVAILABLE",
+              "statusCode": 503,
+              "timestamp": "2026-09-15T18:02:11.4183920Z"
+            },
+            "metadata": {
+              "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+              "timestamp": "2026-09-15T18:02:11.4183920Z",
+              "apiVersion": "1.0",
+              "processingTimeMs": 30004
+            }
+          }
+        }
+      ],
+      "notFoundExample": {
+        "httpStatus": 404,
+        "code": "VALIDATION_ERROR",
+        "body": {
+          "success": false,
+          "error": {
+            "message": "Validation failed",
+            "code": "VALIDATION_ERROR",
+            "statusCode": 404,
+            "timestamp": "2026-09-15T18:02:11.4183920Z",
+            "validationErrors": [
+              {
+                "field": "id",
+                "message": "'pm_0123456789abcdef0123456789abcdef' not found",
+                "code": "VALIDATION_FAILED"
+              }
+            ]
+          },
+          "metadata": {
+            "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+            "timestamp": "2026-09-15T18:02:11.4183920Z",
+            "apiVersion": "1.0",
+            "processingTimeMs": 4
+          }
+        }
+      }
     }
   },
-  "paymentMethodStatusVocabulary": [
+  "storedPaymentMethodStatusVocabulary": [
     "active",
     "revoked",
     "expired"
   ],
-  "$paymentMethodStatusNote": "Only active methods can be charged. revoked is what DELETE leaves behind; expired means the card's expiry date has passed. Treat an unknown value as not chargeable.",
+  "$storedPaymentMethodStatusNote": "Only active methods can be charged. revoked is what DELETE leaves behind; expired means the card's expiry date has passed. Treat an unknown value as not chargeable.",
   "chargeStatusVocabulary": [
     "succeeded",
     "failed",
-    "pending"
+    "pending",
+    "cancelled"
   ],
+  "$chargeStatusNote": "succeeded: the money moved. failed: it did not, and on a 402 declineClass says why. pending: the provider has not answered yet, poll getStatus(transactionId). cancelled: an authorization that was voided before capture, no money moved. Treat an unknown value as still open.",
   "declineClassVocabulary": [
     "hard",
     "soft_funds",
     "soft_sca_required",
     "soft_other"
   ],
-  "$declineClassNote": "Present on a failed charge. hard = do not retry this card; soft_funds = insufficient funds, retry later; soft_sca_required = the issuer wants the customer present, send them through a hosted session with saveCard; soft_other = transient, one retry later is reasonable."
+  "$declineClassNote": "Present on a failed charge answered with 402. hard = do not retry this card; soft_funds = insufficient funds, retry later; soft_sca_required = the issuer wants the customer present, send them through a hosted session with saveCard; soft_other = transient, one retry later is reasonable. Null (absent) on every other charge, including a 502 CHARGE_FAILED row.",
+  "chargeErrorCodes": [
+    "PAYMENT_METHOD_NOT_ACTIVE",
+    "DUPLICATE_REQUEST",
+    "IDEMPOTENCY_KEY_REUSED",
+    "CHARGE_OUTCOME_UNKNOWN",
+    "CHARGE_FAILED",
+    "PAYMENT_METHOD_CHARGES_DISABLED",
+    "PAYMENT_PROCESSING_UNAVAILABLE"
+  ],
+  "$chargeErrorNote": "The codes the charge endpoint answers with 409 (PAYMENT_METHOD_NOT_ACTIVE, DUPLICATE_REQUEST), 422 (IDEMPOTENCY_KEY_REUSED), 502 (CHARGE_OUTCOME_UNKNOWN with data, CHARGE_FAILED with or without data) and 503 (PAYMENT_METHOD_CHARGES_DISABLED, PAYMENT_PROCESSING_UNAVAILABLE). CHARGE_DECLINED (402) is deliberately not here: it is a charge result. DUPLICATE_REQUEST, PAYMENT_METHOD_CHARGES_DISABLED and PAYMENT_PROCESSING_UNAVAILABLE are retried with the SAME key; CHARGE_OUTCOME_UNKNOWN is polled, never retried; the rest are terminal for that key.",
+  "revokeErrorCodes": [
+    "UPSTREAM_CONTRACT_ERROR",
+    "MERCHANT_API_UNAVAILABLE"
+  ],
+  "$revokeErrorNote": "502 UPSTREAM_CONTRACT_ERROR: the provider refused, nothing changed, not retryable. 503 MERCHANT_API_UNAVAILABLE: nothing changed, retry later."
 }

@@ -20,19 +20,24 @@ from pathlib import Path
 import pytest
 
 from dominaite import (
+    CHARGE_ERROR_CODES,
     CHARGE_STATUSES,
     DECLINE_CLASSES,
-    PAYMENT_METHOD_STATUSES,
     PAYMENT_STATUSES,
+    REVOKE_ERROR_CODES,
     SESSION_REFUSAL_ERROR_CODES,
+    STORED_PAYMENT_METHOD_STATUSES,
     VALIDATION_ERROR_CODES,
     ApiError,
+    ChargeError,
     ChargeStatus,
     CheckoutRefusedError,
     DeclineClass,
     DominaiteClient,
-    PaymentMethodStatus,
     PaymentStatus,
+    RevokeError,
+    StoredPaymentMethodStatus,
+    TransportError,
 )
 
 CONTRACT = json.loads(
@@ -46,8 +51,8 @@ BASE_URL = "https://api.example.test/payments"
 
 
 class _Response:
-    def __init__(self, payload):
-        self.status = 200
+    def __init__(self, payload, status=200):
+        self.status = status
         self.headers = None
         # A stream, because the client reads in bounded chunks rather than all at once.
         self._body = io.BytesIO(json.dumps(payload).encode("utf-8"))
@@ -79,12 +84,41 @@ def _patch_opener(monkeypatch, handler):
 
 @pytest.fixture
 def answers_with(monkeypatch):
-    """Make the next call return one fixture example verbatim."""
+    """Make the next call return one fixture example verbatim, with the given status."""
 
-    def install(payload):
-        _patch_opener(monkeypatch, lambda request, timeout=None: _Response(payload))
+    def install(payload, status=200):
+        def handler(request, timeout=None):
+            if status >= 400:
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    status,
+                    "error",
+                    None,
+                    io.BytesIO(json.dumps(payload).encode("utf-8")),
+                )
+            return _Response(payload, status)
+
+        _patch_opener(monkeypatch, handler)
 
     return install
+
+
+def _without_nulls(value):
+    """The wire form of an example: the gateway serializes WhenWritingNull, so null keys are absent."""
+    if isinstance(value, list):
+        return [_without_nulls(entry) for entry in value]
+    if isinstance(value, dict):
+        return {key: _without_nulls(entry) for key, entry in value.items() if entry is not None}
+    return value
+
+
+PAYMENT_METHOD_ID = ENDPOINTS["getStatus"]["savedCardExample"]["storedPaymentMethod"]["id"]
+
+
+def _charge(client):
+    return client.charge_payment_method(
+        PAYMENT_METHOD_ID, amount=8440, currency="EUR", order_reference="order-1042"
+    )
 
 
 # --- (1) the status vocabulary -----------------------------------------------
@@ -165,7 +199,7 @@ def test_get_status_returns_exactly_the_contract_fields(client, answers_with):
     assert result["status"] in PAYMENT_STATUSES
 
 
-def test_get_status_returns_the_saved_card_example_payment_method_included(
+def test_get_status_returns_the_saved_card_example_stored_payment_method_included(
     client, answers_with
 ):
     endpoint = ENDPOINTS["getStatus"]
@@ -176,43 +210,190 @@ def test_get_status_returns_the_saved_card_example_payment_method_included(
 
     assert result == example
     assert sorted(result) == sorted(endpoint["fields"])
-    assert sorted(result["paymentMethod"]) == sorted(endpoint["paymentMethodFields"])
-    assert result["paymentMethod"]["status"] in PAYMENT_METHOD_STATUSES
-    # A status without a saved card carries the key as null, not missing.
-    assert "paymentMethod" in endpoint["example"]
-    assert endpoint["example"]["paymentMethod"] is None
+    assert sorted(result["storedPaymentMethod"]) == sorted(endpoint["storedPaymentMethodFields"])
+    assert result["storedPaymentMethod"]["status"] in STORED_PAYMENT_METHOD_STATUSES
+    # A status without a saved card carries the key as null in the fixture.
+    assert "storedPaymentMethod" in endpoint["example"]
+    assert endpoint["example"]["storedPaymentMethod"] is None
+
+
+def test_get_status_reads_absent_card_fields_as_none_like_the_wire(client, answers_with):
+    # The gateway serializes WhenWritingNull: a session without a saved card has no
+    # storedPaymentMethod key at all, and an unreported brand is a missing key.
+    endpoint = ENDPOINTS["getStatus"]
+    wire = _without_nulls(endpoint["example"])
+    assert "storedPaymentMethod" not in wire
+    answers_with(wire)
+    bare = client.get_status(endpoint["example"]["transactionId"])
+    # The status passes through as sent; absent and null both read as "no card on file".
+    assert bare == wire
+    assert bare.get("storedPaymentMethod") is None
+
+    unreported = dict(
+        endpoint["savedCardExample"],
+        storedPaymentMethod={"id": PAYMENT_METHOD_ID, "status": "active"},
+    )
+    answers_with(unreported)
+    result = client.get_status(unreported["transactionId"])
+    assert result["storedPaymentMethod"] == {
+        "id": PAYMENT_METHOD_ID,
+        "brand": None,
+        "last4": None,
+        "expiryMonth": None,
+        "expiryYear": None,
+        "status": "active",
+    }
 
 
 def test_payment_method_vocabularies_equal_the_contract():
-    assert list(PAYMENT_METHOD_STATUSES) == CONTRACT["paymentMethodStatusVocabulary"]
+    assert list(STORED_PAYMENT_METHOD_STATUSES) == CONTRACT["storedPaymentMethodStatusVocabulary"]
     assert list(CHARGE_STATUSES) == CONTRACT["chargeStatusVocabulary"]
     assert list(DECLINE_CLASSES) == CONTRACT["declineClassVocabulary"]
-    assert PaymentMethodStatus.ACTIVE == "active"
-    assert ChargeStatus.PENDING == "pending"
+    assert list(CHARGE_ERROR_CODES) == CONTRACT["chargeErrorCodes"]
+    assert list(REVOKE_ERROR_CODES) == CONTRACT["revokeErrorCodes"]
+    assert StoredPaymentMethodStatus.ACTIVE == "active"
+    assert ChargeStatus.CANCELLED == "cancelled"
     assert DeclineClass.SOFT_SCA_REQUIRED == "soft_sca_required"
+    assert "CHARGE_DECLINED" not in CHARGE_ERROR_CODES
 
 
-@pytest.mark.parametrize("example_key", ["successExample", "declinedExample"])
-def test_charge_payment_method_returns_exactly_the_contract_fields(
-    client, answers_with, example_key
-):
+def test_charge_payment_method_returns_the_201_charge_out_of_the_envelope(client, answers_with):
     endpoint = ENDPOINTS["chargePaymentMethod"]
-    example = endpoint[example_key]
-    answers_with(example)
-    payment_method_id = ENDPOINTS["getStatus"]["savedCardExample"]["paymentMethod"]["id"]
+    example = endpoint["successExample"]
+    answers_with(example, endpoint["httpStatus"])
 
-    charge = client.charge_payment_method(
-        payment_method_id, amount=8440, currency="EUR", order_reference="order-1042"
-    )
+    charge = _charge(client)
 
     assert sorted(charge) == sorted(endpoint["fields"])
-    assert charge == example
+    assert charge == example["data"]
     assert charge["status"] in CHARGE_STATUSES
-    if charge["status"] == ChargeStatus.FAILED:
-        assert charge["declineClass"] in DECLINE_CLASSES
+    assert charge["declineClass"] is None
+    assert charge["declineCode"] is None
+
+
+def test_charge_payment_method_returns_the_402_decline_as_a_charge_never_raises(client, answers_with):
+    endpoint = ENDPOINTS["chargePaymentMethod"]
+    example = endpoint["declinedExample"]
+    answers_with(example, endpoint["declinedHttpStatus"])
+
+    charge = _charge(client)
+
+    assert charge == example["data"]
+    assert charge["status"] == ChargeStatus.FAILED
+    assert charge["declineClass"] in DECLINE_CLASSES
+    assert example["error"]["code"] == "CHARGE_DECLINED"
+
+
+def test_charge_payment_method_reads_absent_decline_fields_as_none_like_the_wire(client, answers_with):
+    endpoint = ENDPOINTS["chargePaymentMethod"]
+    wire = _without_nulls(endpoint["successExample"])
+    assert "declineClass" not in wire["data"]
+    answers_with(wire, endpoint["httpStatus"])
+
+    assert _charge(client) == endpoint["successExample"]["data"]
+
+
+@pytest.mark.parametrize(
+    "example",
+    ENDPOINTS["chargePaymentMethod"]["errorExamples"],
+    ids=[
+        "{0}-{1}-{2}".format(e["httpStatus"], e["code"], "data" if e["body"].get("data") else "nodata")
+        for e in ENDPOINTS["chargePaymentMethod"]["errorExamples"]
+    ],
+)
+@pytest.mark.parametrize("wire_form", ["nulls-spelled-out", "nulls-omitted"])
+def test_every_charge_error_example_is_a_charge_error_with_code_status_and_data(
+    client, answers_with, example, wire_form
+):
+    body = example["body"] if wire_form == "nulls-spelled-out" else _without_nulls(example["body"])
+    answers_with(body, example["httpStatus"])
+
+    with pytest.raises(ChargeError) as raised:
+        _charge(client)
+
+    error = raised.value
+    assert not isinstance(error, TransportError)
+    assert error.http_status == example["httpStatus"]
+    assert error.error_code == example["code"]
+    assert error.error_code in CHARGE_ERROR_CODES
+    assert str(error) == example["body"]["error"]["message"]
+    assert error.result == body
+    if example["body"].get("data"):
+        assert error.charge == example["body"]["data"]
+        assert error.transaction_id == example["body"]["data"]["transactionId"]
     else:
-        assert charge["declineClass"] is None
-        assert charge["declineCode"] is None
+        assert error.charge is None
+        assert error.transaction_id is None
+
+
+def test_the_charge_error_examples_cover_every_code_the_sdk_claims():
+    seen = {e["code"] for e in ENDPOINTS["chargePaymentMethod"]["errorExamples"]}
+    assert seen == set(CHARGE_ERROR_CODES)
+    seen = {e["code"] for e in ENDPOINTS["revokePaymentMethod"]["errorExamples"]}
+    assert seen == set(REVOKE_ERROR_CODES)
+
+
+def test_a_charge_against_an_unknown_id_is_the_generic_api_error_404(client, answers_with):
+    example = ENDPOINTS["chargePaymentMethod"]["notFoundExample"]
+    answers_with(example["body"], example["httpStatus"])
+
+    with pytest.raises(ApiError) as raised:
+        _charge(client)
+
+    assert not isinstance(raised.value, ChargeError)
+    assert raised.value.http_status == 404
+    assert raised.value.error_code == example["code"]
+
+
+@pytest.mark.parametrize(
+    "example",
+    ENDPOINTS["revokePaymentMethod"]["errorExamples"],
+    ids=[e["code"] for e in ENDPOINTS["revokePaymentMethod"]["errorExamples"]],
+)
+def test_every_revoke_error_example_is_a_revoke_error_with_code_and_status(
+    client, answers_with, example
+):
+    answers_with(example["body"], example["httpStatus"])
+
+    with pytest.raises(RevokeError) as raised:
+        client.revoke_payment_method(PAYMENT_METHOD_ID)
+
+    error = raised.value
+    assert not isinstance(error, TransportError)
+    assert error.http_status == example["httpStatus"]
+    assert error.error_code == example["code"]
+    assert error.error_code in REVOKE_ERROR_CODES
+    assert str(error) == example["body"]["error"]["message"]
+    assert error.result == example["body"]
+
+
+def test_a_revoke_of_an_unknown_id_is_the_generic_api_error_404(client, answers_with):
+    example = ENDPOINTS["revokePaymentMethod"]["notFoundExample"]
+    answers_with(example["body"], example["httpStatus"])
+
+    with pytest.raises(ApiError) as raised:
+        client.revoke_payment_method(PAYMENT_METHOD_ID)
+
+    assert not isinstance(raised.value, RevokeError)
+    assert raised.value.http_status == 404
+    assert raised.value.error_code == example["code"]
+
+
+def test_the_contract_examples_carry_exactly_their_declared_fields():
+    charge_endpoint = ENDPOINTS["chargePaymentMethod"]
+    fields = sorted(charge_endpoint["fields"])
+    assert sorted(charge_endpoint["successExample"]["data"]) == fields
+    assert sorted(charge_endpoint["declinedExample"]["data"]) == fields
+    for example in charge_endpoint["errorExamples"]:
+        assert example["body"]["success"] is False
+        assert example["body"]["error"]["code"] == example["code"]
+        assert example["body"]["error"]["statusCode"] == example["httpStatus"]
+        if example["body"].get("data"):
+            assert sorted(example["body"]["data"]) == fields
+    status_endpoint = ENDPOINTS["getStatus"]
+    assert sorted(status_endpoint["savedCardExample"]["storedPaymentMethod"]) == sorted(
+        status_endpoint["storedPaymentMethodFields"]
+    )
 
 
 def test_charge_and_revoke_hit_the_contract_paths_and_methods(client, monkeypatch):
@@ -235,10 +416,10 @@ def test_charge_and_revoke_hit_the_contract_paths_and_methods(client, monkeypatc
         seen.append(request)
         if request.get_method() == "DELETE":
             return _NoContent()
-        return _Response(ENDPOINTS["chargePaymentMethod"]["successExample"])
+        return _Response(ENDPOINTS["chargePaymentMethod"]["successExample"], 201)
 
     _patch_opener(monkeypatch, handler)
-    payment_method_id = ENDPOINTS["getStatus"]["savedCardExample"]["paymentMethod"]["id"]
+    payment_method_id = PAYMENT_METHOD_ID
 
     client.charge_payment_method(
         payment_method_id, amount=8440, currency="EUR", order_reference="order-1042"
