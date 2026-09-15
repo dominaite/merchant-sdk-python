@@ -19,10 +19,11 @@ from .exceptions import (
     TransportError,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 DEFAULT_BASE_URL = "https://api.dominaite.com/payments"
 SESSIONS_PATH = "/merchant-api/checkout/sessions"
+PAYMENT_METHODS_PATH = "/merchant-api/payment-methods"
 PING_PATH = "/merchant-api/ping"
 DEFAULT_TIMEOUT_SECONDS = 45.0  # serverless cold starts hit 10+s on dev; 15s was a coin flip
 
@@ -45,6 +46,12 @@ MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 _TRANSACTION_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
+
+#: A payment method id is opaque (``pm_...``), so this only pins what keeps it a single
+#: path segment: no slash, no query, no whitespace, nothing that needs percent-encoding.
+#: The id goes into the signed canonical path verbatim, so anything else would sign one
+#: path and request another.
+_PAYMENT_METHOD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 
 
 class _Secret:
@@ -179,6 +186,56 @@ def _require_secure_base_url(base_url: str) -> None:
     )
 
 
+def _validate_money_params(amount: Any, currency: Any, order_reference: Any) -> None:
+    """The checks shared by every request that moves money."""
+    # bool is a subclass of int in Python, so True would otherwise sail through
+    # and get serialized as `true`.
+    if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+        raise ValueError(
+            "amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)"
+        )
+    if not currency:
+        raise ValueError("currency is required")
+    if not order_reference:
+        raise ValueError("order_reference is required")
+    # Characters, not bytes. len() on a str counts Unicode code points, which is what
+    # the API's own limit counts - measuring len(s.encode("utf-8")) instead would
+    # refuse a 100-character Cyrillic or Greek reference the platform accepts, and
+    # the caller would never see the API say yes.
+    #
+    # Caveat: the server counts UTF-16 units, so a character outside the Basic
+    # Multilingual Plane (emoji, rarer CJK) counts as one here and two there. Those
+    # are vanishingly rare in an order id; the server stays the final arbiter, and
+    # this check exists to catch the ordinary mistake locally, not to mirror the
+    # server exactly.
+    if len(order_reference) > MAX_ORDER_REFERENCE_LENGTH:
+        raise ValueError(
+            "order_reference must be at most {0} characters".format(
+                MAX_ORDER_REFERENCE_LENGTH
+            )
+        )
+
+
+def _normalize_idempotency_key(idempotency_key: Optional[str]) -> str:
+    key = idempotency_key if idempotency_key is not None else secrets.token_hex(16)
+    # Characters again, for the same reason as order_reference above.
+    if not isinstance(key, str) or not key or len(key) > MAX_IDEMPOTENCY_KEY_LENGTH:
+        raise ValueError(
+            "idempotency_key must be a non-empty string of at most {0} "
+            "characters".format(MAX_IDEMPOTENCY_KEY_LENGTH)
+        )
+    return key
+
+
+def _normalize_payment_method_id(payment_method_id: Any) -> str:
+    normalized = str(payment_method_id or "").strip()
+    if not _PAYMENT_METHOD_ID_RE.match(normalized):
+        raise ValueError(
+            "payment_method_id must be the paymentMethod id from get_status()"
+        )
+    return normalized
+
+
 def sign_request(
     secret: str,
     timestamp: str,
@@ -290,6 +347,7 @@ class DominaiteClient:
         theme: Optional[str] = None,
         description: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        save_card: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Create a hosted checkout session for one payment.
 
@@ -305,6 +363,11 @@ class DominaiteClient:
         :param description: Free-text description shown on the checkout.
         :param idempotency_key: Auto-generated when omitted. Retrying with the same key
             never creates a second payment.
+        :param save_card: Ask the gateway to keep the card on file once this payment is
+            approved, so you can charge it again with :meth:`charge_payment_method`.
+            The stored method shows up as ``paymentMethod`` on :meth:`get_status` after
+            the payment succeeds; a declined first payment stores nothing. The card
+            details never reach you: you get an id, a brand and the last four digits.
         :returns: ``{"transactionId", "orderId", "cashierKey", "cashierToken", "amount",
             "currency", "expiresAt"}``.
 
@@ -318,40 +381,8 @@ class DominaiteClient:
         :raises TransportError: Network-level failure (safe to retry WITH the same
             ``idempotency_key``).
         """
-        # bool is a subclass of int in Python, so True would otherwise sail through
-        # and get serialized as `true`.
-        if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
-            raise ValueError(
-                "amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)"
-            )
-        if not currency:
-            raise ValueError("currency is required")
-        if not order_reference:
-            raise ValueError("order_reference is required")
-        # Characters, not bytes. len() on a str counts Unicode code points, which is what
-        # the API's own limit counts - measuring len(s.encode("utf-8")) instead would
-        # refuse a 100-character Cyrillic or Greek reference the platform accepts, and
-        # the caller would never see the API say yes.
-        #
-        # Caveat: the server counts UTF-16 units, so a character outside the Basic
-        # Multilingual Plane (emoji, rarer CJK) counts as one here and two there. Those
-        # are vanishingly rare in an order id; the server stays the final arbiter, and
-        # this check exists to catch the ordinary mistake locally, not to mirror the
-        # server exactly.
-        if len(order_reference) > MAX_ORDER_REFERENCE_LENGTH:
-            raise ValueError(
-                "order_reference must be at most {0} characters".format(
-                    MAX_ORDER_REFERENCE_LENGTH
-                )
-            )
-
-        key = idempotency_key if idempotency_key is not None else secrets.token_hex(16)
-        # Characters again, for the same reason as order_reference above.
-        if not isinstance(key, str) or not key or len(key) > MAX_IDEMPOTENCY_KEY_LENGTH:
-            raise ValueError(
-                "idempotency_key must be a non-empty string of at most {0} "
-                "characters".format(MAX_IDEMPOTENCY_KEY_LENGTH)
-            )
+        _validate_money_params(amount, currency, order_reference)
+        key = _normalize_idempotency_key(idempotency_key)
 
         body: Dict[str, Any] = {
             "amount": amount,
@@ -368,6 +399,8 @@ class DominaiteClient:
             body["theme"] = theme
         if description is not None:
             body["description"] = description
+        if save_card is not None:
+            body["saveCard"] = bool(save_card)
 
         response = self._request("POST", SESSIONS_PATH, body, key)
 
@@ -474,6 +507,96 @@ class DominaiteClient:
 
         return self._request("GET", SESSIONS_PATH + "/" + normalized, None, "")
 
+    def charge_payment_method(
+        self,
+        payment_method_id: str,
+        amount: int,
+        currency: str,
+        order_reference: str,
+        description: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Charge a card kept on file, off-session: no widget, no payer present.
+
+        The charge is signed like a session and carries an ``Idempotency-Key``
+        (auto-generated unless you pass one), so retrying after a timeout WITH THE SAME
+        KEY never charges the card twice.
+
+        A decline is not an exception: the returned charge has ``status`` ``failed``
+        plus a ``declineClass`` telling you whether to give up on the card (``hard``),
+        wait (``soft_funds``, ``soft_other``) or bring the customer back for a hosted
+        session (``soft_sca_required``). ``pending`` is not terminal - poll
+        :meth:`get_status` with the returned ``transactionId``.
+
+        :param payment_method_id: The ``paymentMethod.id`` from :meth:`get_status` of a
+            session created with ``save_card=True``.
+        :param amount: Integer in MINOR units (2500 = 25.00 EUR). Never a float.
+        :param currency: ISO 4217 code.
+        :param order_reference: Your own order id, 100 chars or fewer.
+        :param description: Free-text description for your dashboard.
+        :param idempotency_key: Auto-generated when omitted. Derive it from the billing
+            period, never mint one per attempt.
+        :returns: ``{"chargeId", "status", "declineClass", "declineCode",
+            "transactionId"}``; ``declineClass`` and ``declineCode`` are None unless
+            ``status`` is ``failed``.
+
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature.
+        :raises CheckoutRefusedError: The gateway refused to attempt the charge at all
+            (replayed key, payments off, method not chargeable); inspect ``error_code``.
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``, then retry WITH
+            the same ``idempotency_key``.
+        :raises ApiError: An id that is not yours (HTTP 404) or unexpected response.
+        :raises TransportError: Network-level failure (safe to retry WITH the same
+            ``idempotency_key``).
+        """
+        method_id = _normalize_payment_method_id(payment_method_id)
+        _validate_money_params(amount, currency, order_reference)
+        if description is not None and not isinstance(description, str):
+            raise ValueError("description must be a string")
+        key = _normalize_idempotency_key(idempotency_key)
+
+        # Built field by field: the body is what gets signed, and the contract for this
+        # route is exactly these fields in this order.
+        body: Dict[str, Any] = {
+            "amount": amount,
+            "currency": currency,
+            "orderReference": order_reference,
+        }
+        if description is not None:
+            body["description"] = description
+
+        response = self._request(
+            "POST", PAYMENT_METHODS_PATH + "/" + method_id + "/charges", body, key
+        )
+
+        if response.get("success") is False or not isinstance(response.get("chargeId"), str):
+            transaction_id = response.get("transactionId")
+            raise CheckoutRefusedError(
+                str(response.get("errorCode") or "UNKNOWN"),
+                str(response.get("errorMessage") or "The charge was refused."),
+                transaction_id=str(transaction_id) if transaction_id else None,
+                result=dict(response),
+            )
+
+        return response
+
+    def revoke_payment_method(self, payment_method_id: str) -> None:
+        """Revoke a card kept on file.
+
+        The token is dropped at the payment provider and the method's status becomes
+        ``revoked``; a later :meth:`charge_payment_method` on it is refused. Returns
+        nothing on success (HTTP 204). Not a payment operation: no idempotency key is
+        signed.
+
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature.
+        :raises RateLimitError: HTTP 429.
+        :raises ApiError: An id that is not yours (HTTP 404) or unexpected response.
+        :raises TransportError: Network-level failure (safe to retry).
+        """
+        method_id = _normalize_payment_method_id(payment_method_id)
+        # DELETE signs an EMPTY idempotency key and an EMPTY body, like GET.
+        self._request("DELETE", PAYMENT_METHODS_PATH + "/" + method_id, None, "")
+
     def _request(
         self,
         method: str,
@@ -483,8 +606,8 @@ class DominaiteClient:
     ) -> Dict[str, Any]:
         """Sign and send one request.
 
-        ``body`` is None for GET: an empty body (and an empty idempotency key) is what
-        gets signed.
+        ``body`` is None for GET and DELETE: an empty body (and an empty idempotency
+        key) is what gets signed.
         """
         if body is None:
             payload = ""
@@ -529,6 +652,10 @@ class DominaiteClient:
             raise TransportError(
                 "Could not reach the Dominaite API: {0}".format(error)
             ) from error
+
+        # 204 carries nothing to parse; the status is the whole answer.
+        if status == 204:
+            return {}
 
         try:
             decoded = json.loads(raw)

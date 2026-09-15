@@ -1,5 +1,5 @@
 {
-  "$comment": "CANONICAL merchant-API response contract (v1). Every Dominaite SDK vendors a byte-identical copy of this file and asserts, in its own suite, that (1) its response types deserialize each example below, (2) it exposes EXACTLY the fields listed per endpoint (no more, no fewer), and (3) its status enum equals statusVocabulary. This pins the response contract so a field or status value cannot silently ship in one SDK and be sibling-mirrored wrong into the others. Do NOT add, rename or drop anything here without the matching platform API change shipping first. NOTE: the ping endpoint is not yet available in the production environment as of 2026-08-21 - READMEs say so too.",
+  "$comment": "CANONICAL merchant-API response contract (v1). Every Dominaite SDK vendors a byte-identical copy of this file and asserts, in its own suite, that (1) its response types deserialize each example below, (2) it exposes EXACTLY the fields listed per endpoint (no more, no fewer), and (3) its status enum equals statusVocabulary. This pins the response contract so a field or status value cannot silently ship in one SDK and be sibling-mirrored wrong into the others. Do NOT add, rename or drop anything here without the matching platform API change shipping first. NOTE: the ping endpoint is not yet available in the production environment as of 2026-08-21 - READMEs say so too. Stored payment methods (saveCard on create, paymentMethod on status, the payment-methods charge and revoke endpoints) ship with the gateway's recurring-payments release and are part of v1.",
   "version": "v1",
   "statusVocabulary": [
     "pending",
@@ -90,7 +90,7 @@
     "getStatus": {
       "method": "GET",
       "path": "/merchant-api/checkout/sessions/{transactionId}",
-      "note": "status carries a statusVocabulary value. expiresAt answers only 'until when can the payer act' - null once the payer's part is over, which is NOT the same as terminal (requires_capture is non-terminal with no window). Branch on status for liveness.",
+      "note": "status carries a statusVocabulary value. expiresAt answers only 'until when can the payer act' - null once the payer's part is over, which is NOT the same as terminal (requires_capture is non-terminal with no window). Branch on status for liveness. paymentMethod is present once a session created with saveCard has succeeded; null otherwise.",
       "fields": [
         "transactionId",
         "orderId",
@@ -101,7 +101,8 @@
         "refundedAmount",
         "createdAt",
         "updatedAt",
-        "expiresAt"
+        "expiresAt",
+        "paymentMethod"
       ],
       "example": {
         "transactionId": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
@@ -113,8 +114,89 @@
         "refundedAmount": null,
         "createdAt": "2026-08-21T09:15:30.000Z",
         "updatedAt": "2026-08-21T09:16:05.000Z",
-        "expiresAt": null
+        "expiresAt": null,
+        "paymentMethod": null
+      },
+      "paymentMethodFields": [
+        "id",
+        "brand",
+        "last4",
+        "expiryMonth",
+        "expiryYear",
+        "status"
+      ],
+      "savedCardExample": {
+        "transactionId": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+        "orderId": "dom_9a8b7c6d5e4f",
+        "orderReference": "order-1042",
+        "status": "succeeded",
+        "amount": 8440,
+        "currency": "EUR",
+        "refundedAmount": null,
+        "createdAt": "2026-08-21T09:15:30.000Z",
+        "updatedAt": "2026-08-21T09:16:05.000Z",
+        "expiresAt": null,
+        "paymentMethod": {
+          "id": "pm_0123456789abcdef0123456789abcdef",
+          "brand": "visa",
+          "last4": "4242",
+          "expiryMonth": 12,
+          "expiryYear": 2029,
+          "status": "active"
+        }
       }
+    },
+    "chargePaymentMethod": {
+      "method": "POST",
+      "path": "/merchant-api/payment-methods/{paymentMethodId}/charges",
+      "httpStatus": 201,
+      "note": "Off-session charge of a stored card. Idempotency-Key is required and signed, exactly like create. A decline is a 201 with status failed plus declineClass/declineCode, not an error; declineClass/declineCode are null on succeeded and pending. pending is not terminal: poll getStatus(transactionId). Business refusals (replayed key, payments off, method not chargeable) use the create endpoint's HTTP 200 success=false shape.",
+      "fields": [
+        "chargeId",
+        "status",
+        "declineClass",
+        "declineCode",
+        "transactionId"
+      ],
+      "successExample": {
+        "chargeId": "chg_7a8b9c0d1e2f3a4b",
+        "status": "succeeded",
+        "declineClass": null,
+        "declineCode": null,
+        "transactionId": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+      },
+      "declinedExample": {
+        "chargeId": "chg_7a8b9c0d1e2f3a4c",
+        "status": "failed",
+        "declineClass": "soft_funds",
+        "declineCode": "51",
+        "transactionId": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5e"
+      }
+    },
+    "revokePaymentMethod": {
+      "method": "DELETE",
+      "path": "/merchant-api/payment-methods/{paymentMethodId}",
+      "httpStatus": 204,
+      "note": "Revokes the token at the payment provider and marks the method revoked. No body, no Idempotency-Key: the signature covers an empty key and an empty body, like GET. A later charge on the method is refused.",
+      "fields": []
     }
-  }
+  },
+  "paymentMethodStatusVocabulary": [
+    "active",
+    "revoked",
+    "expired"
+  ],
+  "$paymentMethodStatusNote": "Only active methods can be charged. revoked is what DELETE leaves behind; expired means the card's expiry date has passed. Treat an unknown value as not chargeable.",
+  "chargeStatusVocabulary": [
+    "succeeded",
+    "failed",
+    "pending"
+  ],
+  "declineClassVocabulary": [
+    "hard",
+    "soft_funds",
+    "soft_sca_required",
+    "soft_other"
+  ],
+  "$declineClassNote": "Present on a failed charge. hard = do not retry this card; soft_funds = insufficient funds, retry later; soft_sca_required = the issuer wants the customer present, send them through a hosted session with saveCard; soft_other = transient, one retry later is reasonable."
 }

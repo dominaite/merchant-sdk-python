@@ -20,12 +20,18 @@ from pathlib import Path
 import pytest
 
 from dominaite import (
+    CHARGE_STATUSES,
+    DECLINE_CLASSES,
+    PAYMENT_METHOD_STATUSES,
     PAYMENT_STATUSES,
     SESSION_REFUSAL_ERROR_CODES,
     VALIDATION_ERROR_CODES,
     ApiError,
+    ChargeStatus,
     CheckoutRefusedError,
+    DeclineClass,
     DominaiteClient,
+    PaymentMethodStatus,
     PaymentStatus,
 )
 
@@ -159,6 +165,102 @@ def test_get_status_returns_exactly_the_contract_fields(client, answers_with):
     assert result["status"] in PAYMENT_STATUSES
 
 
+def test_get_status_returns_the_saved_card_example_payment_method_included(
+    client, answers_with
+):
+    endpoint = ENDPOINTS["getStatus"]
+    example = endpoint["savedCardExample"]
+    answers_with(example)
+
+    result = client.get_status(example["transactionId"])
+
+    assert result == example
+    assert sorted(result) == sorted(endpoint["fields"])
+    assert sorted(result["paymentMethod"]) == sorted(endpoint["paymentMethodFields"])
+    assert result["paymentMethod"]["status"] in PAYMENT_METHOD_STATUSES
+    # A status without a saved card carries the key as null, not missing.
+    assert "paymentMethod" in endpoint["example"]
+    assert endpoint["example"]["paymentMethod"] is None
+
+
+def test_payment_method_vocabularies_equal_the_contract():
+    assert list(PAYMENT_METHOD_STATUSES) == CONTRACT["paymentMethodStatusVocabulary"]
+    assert list(CHARGE_STATUSES) == CONTRACT["chargeStatusVocabulary"]
+    assert list(DECLINE_CLASSES) == CONTRACT["declineClassVocabulary"]
+    assert PaymentMethodStatus.ACTIVE == "active"
+    assert ChargeStatus.PENDING == "pending"
+    assert DeclineClass.SOFT_SCA_REQUIRED == "soft_sca_required"
+
+
+@pytest.mark.parametrize("example_key", ["successExample", "declinedExample"])
+def test_charge_payment_method_returns_exactly_the_contract_fields(
+    client, answers_with, example_key
+):
+    endpoint = ENDPOINTS["chargePaymentMethod"]
+    example = endpoint[example_key]
+    answers_with(example)
+    payment_method_id = ENDPOINTS["getStatus"]["savedCardExample"]["paymentMethod"]["id"]
+
+    charge = client.charge_payment_method(
+        payment_method_id, amount=8440, currency="EUR", order_reference="order-1042"
+    )
+
+    assert sorted(charge) == sorted(endpoint["fields"])
+    assert charge == example
+    assert charge["status"] in CHARGE_STATUSES
+    if charge["status"] == ChargeStatus.FAILED:
+        assert charge["declineClass"] in DECLINE_CLASSES
+    else:
+        assert charge["declineClass"] is None
+        assert charge["declineCode"] is None
+
+
+def test_charge_and_revoke_hit_the_contract_paths_and_methods(client, monkeypatch):
+    seen = []
+
+    class _NoContent:
+        status = 204
+        headers = None
+
+        def read(self, amount=None):
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def handler(request, timeout=None):
+        seen.append(request)
+        if request.get_method() == "DELETE":
+            return _NoContent()
+        return _Response(ENDPOINTS["chargePaymentMethod"]["successExample"])
+
+    _patch_opener(monkeypatch, handler)
+    payment_method_id = ENDPOINTS["getStatus"]["savedCardExample"]["paymentMethod"]["id"]
+
+    client.charge_payment_method(
+        payment_method_id, amount=8440, currency="EUR", order_reference="order-1042"
+    )
+    assert client.revoke_payment_method(payment_method_id) is None
+
+    charge_endpoint = ENDPOINTS["chargePaymentMethod"]
+    revoke_endpoint = ENDPOINTS["revokePaymentMethod"]
+    assert seen[0].get_method() == charge_endpoint["method"]
+    assert seen[0].full_url == BASE_URL + charge_endpoint["path"].replace(
+        "{paymentMethodId}", payment_method_id
+    )
+    assert "Idempotency-key" in seen[0].headers
+    assert seen[1].get_method() == revoke_endpoint["method"]
+    assert seen[1].full_url == BASE_URL + revoke_endpoint["path"].replace(
+        "{paymentMethodId}", payment_method_id
+    )
+    assert "Idempotency-key" not in seen[1].headers
+    assert revoke_endpoint["httpStatus"] == 204
+    assert revoke_endpoint["fields"] == []
+
+
 def test_nullable_contract_fields_survive_as_none(client, answers_with):
     """`refundedAmount: null` and `expiresAt: null` must arrive as keys, not vanish."""
     endpoint = ENDPOINTS["getStatus"]
@@ -289,4 +391,10 @@ def test_a_validation_error_is_not_reported_as_a_refusal(client, monkeypatch):
 def test_the_fixture_is_the_v1_contract():
     """Guards against a half-applied fixture update landing here unnoticed."""
     assert CONTRACT["version"] == "v1"
-    assert sorted(ENDPOINTS) == ["createCheckoutSession", "getStatus", "ping"]
+    assert sorted(ENDPOINTS) == [
+        "chargePaymentMethod",
+        "createCheckoutSession",
+        "getStatus",
+        "ping",
+        "revokePaymentMethod",
+    ]

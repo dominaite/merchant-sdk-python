@@ -196,6 +196,61 @@ idempotency key: once the session is a few minutes past expiry, that returns a f
 for the same order (see
 [Recovering from a replay refusal](#recovering-from-a-replay-refusal)).
 
+## Stored payment methods (recurring)
+
+Pass `save_card=True` when you create a session and, once that payment succeeds, the gateway keeps
+the card on file. You never see the card number or the provider token: `get_status()` returns a
+`paymentMethod` with an opaque `id`, the `brand`, the `last4` and the expiry, and that `id` is what
+you charge and revoke with. Store it against your customer.
+
+```python
+from dominaite import ChargeStatus, DeclineClass, PaymentMethodStatus
+
+session = client.create_checkout_session(
+    amount=2500,
+    currency="EUR",
+    order_reference="sub-8817-first",
+    save_card=True,
+)
+# ... the payer completes the hosted checkout ...
+status = client.get_status(session["transactionId"])
+method = status.get("paymentMethod")
+if status["status"] == "succeeded" and method and method["status"] == PaymentMethodStatus.ACTIVE:
+    db.save_card(customer_id, method["id"])  # pm_...
+
+# Later, off-session, no payer present:
+charge = client.charge_payment_method(
+    payment_method_id,
+    amount=2500,
+    currency="EUR",
+    order_reference="sub-8817-2026-10",
+    description="Monthly plan, October",
+    idempotency_key="sub-8817-2026-10",  # derive it from the billing period, never random per attempt
+)
+
+if charge["status"] == ChargeStatus.SUCCEEDED:
+    ...
+elif charge["status"] == ChargeStatus.PENDING:
+    ...  # not terminal: poll get_status(charge["transactionId"]) or wait for the webhook
+elif charge["status"] == ChargeStatus.FAILED:
+    # Not an exception: branch on the class, log the code.
+    # DeclineClass.HARD              - give up on this card, ask the customer for another one
+    # DeclineClass.SOFT_FUNDS        - insufficient funds, retry later (not in a loop)
+    # DeclineClass.SOFT_SCA_REQUIRED - the issuer wants the customer present: send them
+    #                                  through a hosted session with save_card and charge the new method
+    # DeclineClass.SOFT_OTHER        - transient, one retry later is reasonable
+    handle_decline(charge["declineClass"], charge["declineCode"])
+
+# When the customer removes the card:
+client.revoke_payment_method(payment_method_id)  # 204, returns None
+```
+
+A charge is signed exactly like a session and carries an `Idempotency-Key`, so a retry after a
+timeout with the **same** key never charges the card twice. A charge the gateway refuses to attempt
+at all (replayed key, payments off, method revoked) raises `CheckoutRefusedError` with the usual
+codes; an id that is not yours is an `ApiError` with `http_status` 404. Revoking signs an empty key
+and an empty body, like `get_status()`.
+
 ## Webhooks
 
 Webhooks are how you find out what happened to a payment. Create an endpoint in the Dominaite
