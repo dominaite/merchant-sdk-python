@@ -9,20 +9,24 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, NamedTuple, Optional
 
 from .exceptions import (
     ApiError,
     AuthenticationError,
+    ChargeError,
     CheckoutRefusedError,
+    DominaiteError,
     RateLimitError,
+    RevokeError,
     TransportError,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 DEFAULT_BASE_URL = "https://api.dominaite.com/payments"
 SESSIONS_PATH = "/merchant-api/checkout/sessions"
+PAYMENT_METHODS_PATH = "/merchant-api/payment-methods"
 PING_PATH = "/merchant-api/ping"
 DEFAULT_TIMEOUT_SECONDS = 45.0  # serverless cold starts hit 10+s on dev; 15s was a coin flip
 
@@ -45,6 +49,31 @@ MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 _TRANSACTION_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
+
+#: A payment method id is opaque (``pm_...``), so this only pins what keeps it a single
+#: path segment: no slash, no query, no whitespace, nothing that needs percent-encoding.
+#: The id goes into the signed canonical path verbatim, so anything else would sign one
+#: path and request another.
+_PAYMENT_METHOD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
+
+#: Statuses that stay generic on the payment-method routes even when the envelope
+#: carries a code: validation (400), authentication (401, 403), unknown id (404) and
+#: rate limiting (429) mean the same thing on every route and keep their usual errors.
+#: Everything else with a code is the gateway telling this route something specific (a
+#: decline, an unknown outcome, a refusal) and arrives as ChargeError / RevokeError.
+_GENERIC_FAILURE_STATUSES = frozenset({400, 401, 403, 404, 429})
+
+
+class _Reply(NamedTuple):
+    """A parsed reply, whatever its status. Auth and rate-limit failures never get here."""
+
+    status: int
+    #: The whole JSON body ({} for a 204).
+    envelope: Dict[str, Any]
+    #: ``envelope["data"]`` when the gateway wrapped the answer, the envelope otherwise.
+    payload: Dict[str, Any]
+    #: ``envelope["error"]`` when present, {} otherwise.
+    error: Dict[str, Any]
 
 
 class _Secret:
@@ -179,6 +208,56 @@ def _require_secure_base_url(base_url: str) -> None:
     )
 
 
+def _validate_money_params(amount: Any, currency: Any, order_reference: Any) -> None:
+    """The checks shared by every request that moves money."""
+    # bool is a subclass of int in Python, so True would otherwise sail through
+    # and get serialized as `true`.
+    if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+        raise ValueError(
+            "amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)"
+        )
+    if not currency:
+        raise ValueError("currency is required")
+    if not order_reference:
+        raise ValueError("order_reference is required")
+    # Characters, not bytes. len() on a str counts Unicode code points, which is what
+    # the API's own limit counts - measuring len(s.encode("utf-8")) instead would
+    # refuse a 100-character Cyrillic or Greek reference the platform accepts, and
+    # the caller would never see the API say yes.
+    #
+    # Caveat: the server counts UTF-16 units, so a character outside the Basic
+    # Multilingual Plane (emoji, rarer CJK) counts as one here and two there. Those
+    # are vanishingly rare in an order id; the server stays the final arbiter, and
+    # this check exists to catch the ordinary mistake locally, not to mirror the
+    # server exactly.
+    if len(order_reference) > MAX_ORDER_REFERENCE_LENGTH:
+        raise ValueError(
+            "order_reference must be at most {0} characters".format(
+                MAX_ORDER_REFERENCE_LENGTH
+            )
+        )
+
+
+def _normalize_idempotency_key(idempotency_key: Optional[str]) -> str:
+    key = idempotency_key if idempotency_key is not None else secrets.token_hex(16)
+    # Characters again, for the same reason as order_reference above.
+    if not isinstance(key, str) or not key or len(key) > MAX_IDEMPOTENCY_KEY_LENGTH:
+        raise ValueError(
+            "idempotency_key must be a non-empty string of at most {0} "
+            "characters".format(MAX_IDEMPOTENCY_KEY_LENGTH)
+        )
+    return key
+
+
+def _normalize_payment_method_id(payment_method_id: Any) -> str:
+    normalized = str(payment_method_id or "").strip()
+    if not _PAYMENT_METHOD_ID_RE.match(normalized):
+        raise ValueError(
+            "payment_method_id must be the storedPaymentMethod id from get_status()"
+        )
+    return normalized
+
+
 def sign_request(
     secret: str,
     timestamp: str,
@@ -290,6 +369,7 @@ class DominaiteClient:
         theme: Optional[str] = None,
         description: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        save_card: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Create a hosted checkout session for one payment.
 
@@ -305,6 +385,11 @@ class DominaiteClient:
         :param description: Free-text description shown on the checkout.
         :param idempotency_key: Auto-generated when omitted. Retrying with the same key
             never creates a second payment.
+        :param save_card: Ask the gateway to keep the card on file once this payment is
+            approved, so you can charge it again with :meth:`charge_payment_method`.
+            The stored method shows up as ``storedPaymentMethod`` on :meth:`get_status` after
+            the payment succeeds; a declined first payment stores nothing. The card
+            details never reach you: you get an id, a brand and the last four digits.
         :returns: ``{"transactionId", "orderId", "cashierKey", "cashierToken", "amount",
             "currency", "expiresAt"}``.
 
@@ -318,40 +403,8 @@ class DominaiteClient:
         :raises TransportError: Network-level failure (safe to retry WITH the same
             ``idempotency_key``).
         """
-        # bool is a subclass of int in Python, so True would otherwise sail through
-        # and get serialized as `true`.
-        if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
-            raise ValueError(
-                "amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)"
-            )
-        if not currency:
-            raise ValueError("currency is required")
-        if not order_reference:
-            raise ValueError("order_reference is required")
-        # Characters, not bytes. len() on a str counts Unicode code points, which is what
-        # the API's own limit counts - measuring len(s.encode("utf-8")) instead would
-        # refuse a 100-character Cyrillic or Greek reference the platform accepts, and
-        # the caller would never see the API say yes.
-        #
-        # Caveat: the server counts UTF-16 units, so a character outside the Basic
-        # Multilingual Plane (emoji, rarer CJK) counts as one here and two there. Those
-        # are vanishingly rare in an order id; the server stays the final arbiter, and
-        # this check exists to catch the ordinary mistake locally, not to mirror the
-        # server exactly.
-        if len(order_reference) > MAX_ORDER_REFERENCE_LENGTH:
-            raise ValueError(
-                "order_reference must be at most {0} characters".format(
-                    MAX_ORDER_REFERENCE_LENGTH
-                )
-            )
-
-        key = idempotency_key if idempotency_key is not None else secrets.token_hex(16)
-        # Characters again, for the same reason as order_reference above.
-        if not isinstance(key, str) or not key or len(key) > MAX_IDEMPOTENCY_KEY_LENGTH:
-            raise ValueError(
-                "idempotency_key must be a non-empty string of at most {0} "
-                "characters".format(MAX_IDEMPOTENCY_KEY_LENGTH)
-            )
+        _validate_money_params(amount, currency, order_reference)
+        key = _normalize_idempotency_key(idempotency_key)
 
         body: Dict[str, Any] = {
             "amount": amount,
@@ -368,6 +421,8 @@ class DominaiteClient:
             body["theme"] = theme
         if description is not None:
             body["description"] = description
+        if save_card is not None:
+            body["saveCard"] = bool(save_card)
 
         response = self._request("POST", SESSIONS_PATH, body, key)
 
@@ -457,6 +512,15 @@ class DominaiteClient:
         API later must make you keep polling, never silently close an order that is
         still live.
 
+        ``storedPaymentMethod`` is the card kept on file by a session created with
+        ``save_card=True``: ``{"id", "brand", "last4", "expiryMonth", "expiryYear",
+        "status"}``, present once the payment is approved (and it stays after a revoke,
+        with ``status`` ``revoked``); absent or None until then, for sessions without
+        ``save_card`` and for declined or abandoned ones. ``brand``, ``last4`` and the
+        expiry are None when the provider did not report them. It is not the
+        ``paymentMethod`` field, which is the gateway's string category of how the
+        payer paid (``card``, ``wallet``, ...) and passes through untouched.
+
         :param transaction_id: The ``transactionId`` from
             :meth:`create_checkout_session`.
 
@@ -472,7 +536,149 @@ class DominaiteClient:
                 "transaction_id must be the UUID returned by create_checkout_session()"
             )
 
-        return self._request("GET", SESSIONS_PATH + "/" + normalized, None, "")
+        status = self._request("GET", SESSIONS_PATH + "/" + normalized, None, "")
+        # Passed through as sent, except the card on file: the gateway omits its null
+        # fields on the wire, and the caller gets one shape for it, not two. When the
+        # gateway sent no storedPaymentMethod at all there is no key here either.
+        stored = status.get("storedPaymentMethod")
+        if isinstance(stored, dict):
+            status = dict(status, storedPaymentMethod=_stored_payment_method(stored))
+        return status
+
+    def charge_payment_method(
+        self,
+        payment_method_id: str,
+        amount: int,
+        currency: str,
+        order_reference: str,
+        description: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Charge a card kept on file, off-session: no widget, no payer present.
+
+        The charge is signed like a session and carries an ``Idempotency-Key``
+        (auto-generated unless you pass one), so retrying after a timeout WITH THE SAME
+        KEY never charges the card twice: the gateway replays its first answer.
+
+        A decline is not an exception: the gateway answers HTTP 402 and this returns a
+        charge with ``status`` ``failed`` plus a ``declineClass`` telling you whether
+        to give up on the card (``hard``), wait (``soft_funds``, ``soft_other``) or
+        bring the customer back for a hosted session (``soft_sca_required``).
+        ``pending`` is not terminal - poll :meth:`get_status` with the returned
+        ``transactionId``.
+
+        :param payment_method_id: The ``storedPaymentMethod["id"]`` from
+            :meth:`get_status` of a session created with ``save_card=True``.
+        :param amount: Integer in MINOR units (2500 = 25.00 EUR). Never a float.
+        :param currency: ISO 4217 code.
+        :param order_reference: Your own order id, 100 chars or fewer.
+        :param description: Free-text description for your dashboard.
+        :param idempotency_key: Auto-generated when omitted. Derive it from the billing
+            period, never mint one per attempt.
+        :returns: ``{"chargeId", "status", "declineClass", "declineCode",
+            "transactionId"}``. ``status`` is ``succeeded``, ``pending`` or
+            ``cancelled`` on a 201 (200 on a replay) and ``failed`` on a 402;
+            ``declineClass`` and ``declineCode`` are None unless the charge was
+            declined (the gateway omits them on the wire; absent reads as None).
+
+        :raises ChargeError: The gateway answered with a code instead of a charge:
+            ``CHARGE_OUTCOME_UNKNOWN`` (502, the charge MAY have happened - poll
+            ``error.transaction_id``, never retry under a new key), ``CHARGE_FAILED``
+            (502, nothing charged), ``PAYMENT_METHOD_NOT_ACTIVE`` or
+            ``DUPLICATE_REQUEST`` (409), ``IDEMPOTENCY_KEY_REUSED`` (422),
+            ``PAYMENT_METHOD_CHARGES_DISABLED`` or ``PAYMENT_PROCESSING_UNAVAILABLE``
+            (503, retry later with the same key).
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature.
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``, then retry WITH
+            the same ``idempotency_key``.
+        :raises ApiError: An id that is not yours (HTTP 404), input validation (400)
+            or an unexpected response.
+        :raises TransportError: Network-level failure (safe to retry WITH the same
+            ``idempotency_key``).
+        """
+        method_id = _normalize_payment_method_id(payment_method_id)
+        _validate_money_params(amount, currency, order_reference)
+        if description is not None and not isinstance(description, str):
+            raise ValueError("description must be a string")
+        key = _normalize_idempotency_key(idempotency_key)
+
+        # Built field by field: the body is what gets signed, and the contract for this
+        # route is exactly these fields in this order.
+        body: Dict[str, Any] = {
+            "amount": amount,
+            "currency": currency,
+            "orderReference": order_reference,
+        }
+        if description is not None:
+            body["description"] = description
+
+        reply = self._send(
+            "POST", PAYMENT_METHODS_PATH + "/" + method_id + "/charges", body, key
+        )
+
+        data = reply.envelope.get("data")
+        charge = (
+            _charge(data)
+            if isinstance(data, dict) and isinstance(data.get("chargeId"), str)
+            else None
+        )
+        error_code = reply.error.get("code")
+
+        # 201 (200 on a durable replay): the charge was placed, whatever its status.
+        # 402: the provider declined; the envelope says success=false but the charge is
+        # right there, status failed with its decline class, so it is a result.
+        if charge is not None and (reply.envelope.get("success") is True or reply.status == 402):
+            return charge
+
+        if error_code and reply.status >= 400 and reply.status not in _GENERIC_FAILURE_STATUSES:
+            raise ChargeError(
+                reply.status,
+                str(error_code),
+                str(reply.error.get("message") or "The charge was refused."),
+                charge=charge,
+                result=dict(reply.envelope),
+            )
+        if reply.status >= 400:
+            raise _rejection(reply)
+        raise ApiError(
+            reply.status,
+            "The API answered the charge without a charge body",
+            error_code="UNEXPECTED_RESPONSE",
+        )
+
+    def revoke_payment_method(self, payment_method_id: str) -> None:
+        """Revoke a card kept on file.
+
+        The saved credential is deleted at the payment provider and the method's status
+        becomes ``revoked``; a later :meth:`charge_payment_method` on it is refused with
+        ``PAYMENT_METHOD_NOT_ACTIVE``. Returns nothing on success (HTTP 204), and again
+        for an already revoked method, so retrying a timed-out revoke is safe. Not a
+        payment operation: no idempotency key is signed.
+
+        :raises RevokeError: The gateway refused and nothing changed:
+            ``MERCHANT_API_UNAVAILABLE`` (503, retry later) or
+            ``UPSTREAM_CONTRACT_ERROR`` (502, the provider refused for good - contact
+            support with the id).
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature.
+        :raises RateLimitError: HTTP 429.
+        :raises ApiError: An id that is not yours (HTTP 404) or unexpected response.
+        :raises TransportError: Network-level failure (safe to retry).
+        """
+        method_id = _normalize_payment_method_id(payment_method_id)
+        # DELETE signs an EMPTY idempotency key and an EMPTY body, like GET.
+        reply = self._send("DELETE", PAYMENT_METHODS_PATH + "/" + method_id, None, "")
+        if reply.status < 400:
+            return
+
+        error_code = reply.error.get("code")
+        if error_code and reply.status not in _GENERIC_FAILURE_STATUSES:
+            raise RevokeError(
+                reply.status,
+                str(error_code),
+                str(reply.error.get("message") or "The revoke was refused."),
+                result=dict(reply.envelope),
+            )
+        raise _rejection(reply)
 
     def _request(
         self,
@@ -481,10 +687,41 @@ class DominaiteClient:
         body: Optional[Mapping[str, Any]],
         idempotency_key: str,
     ) -> Dict[str, Any]:
-        """Sign and send one request.
+        """Send and apply the generic failure rules: 5xx is transport, 4xx is ApiError."""
+        reply = self._send(method, path, body, idempotency_key)
+        if reply.status >= 400:
+            raise _rejection(reply)
+        if not 200 <= reply.status < 300:
+            # Everything above tests for a KNOWN failure, so anything left that is not a
+            # 2xx would be decoded into a session on the way out. A 300 or a 305 reaches
+            # here (no redirect handler claims those codes), and so would any status the
+            # API does not send. Not the API talking: refuse it, and do not retry it.
+            raise ApiError(
+                reply.status,
+                "Unexpected HTTP {0} response; the Dominaite API answers 2xx or a "
+                "documented error. Check base_url and anything proxying it.".format(
+                    reply.status
+                ),
+                error_code="UNEXPECTED_STATUS",
+            )
+        return reply.payload
 
-        ``body`` is None for GET: an empty body (and an empty idempotency key) is what
-        gets signed.
+    def _send(
+        self,
+        method: str,
+        path: str,
+        body: Optional[Mapping[str, Any]],
+        idempotency_key: str,
+    ) -> _Reply:
+        """Sign, send and parse one request.
+
+        ``body`` is None for GET and DELETE: an empty body (and an empty idempotency
+        key) is what gets signed.
+
+        Transport failures, redirects, non-JSON bodies, authentication failures (401,
+        403) and rate limiting (429) raise here because they mean the same thing on
+        every route. Any other status comes back parsed, so a route can read the code
+        and the data the gateway attached before deciding what it is.
         """
         if body is None:
             payload = ""
@@ -530,6 +767,10 @@ class DominaiteClient:
                 "Could not reach the Dominaite API: {0}".format(error)
             ) from error
 
+        # 204 carries nothing to parse; the status is the whole answer.
+        if status == 204:
+            return _Reply(204, {}, {}, {})
+
         try:
             decoded = json.loads(raw)
         except ValueError:
@@ -568,35 +809,63 @@ class DominaiteClient:
                     result.get("errorCode") or envelope_error.get("code") or "RATE_LIMITED"
                 ),
             )
-        if status >= 500:
-            raise TransportError(
-                "The Dominaite API is unavailable (HTTP {0}); "
-                "retry with the same idempotency key.".format(status)
-            )
-        if status >= 400:
-            # Input validation (IDEMPOTENCY_KEY_REQUIRED and friends) answers 400 with
-            # the code at error.code, not as a success=false refusal. Carry it through
-            # instead of flattening every 4xx into a bare message.
-            error_code = result.get("errorCode") or envelope_error.get("code")
-            raise ApiError(
-                status,
-                str(
-                    result.get("errorMessage")
-                    or envelope_error.get("message")
-                    or "Request rejected"
-                ),
-                error_code=str(error_code) if error_code else None,
-            )
-        if not 200 <= status < 300:
-            # Everything above tests for a KNOWN failure, so anything left that is not a
-            # 2xx would be decoded into a session on the way out. A 300 or a 305 reaches
-            # here (no redirect handler claims those codes), and so would any status the
-            # API does not send. Not the API talking: refuse it, and do not retry it.
-            raise ApiError(
-                status,
-                "Unexpected HTTP {0} response; the Dominaite API answers 2xx or a "
-                "documented error. Check base_url and anything proxying it.".format(status),
-                error_code="UNEXPECTED_STATUS",
-            )
+        return _Reply(status, decoded, result, envelope_error)
 
-        return result
+
+def _rejection(reply: _Reply) -> DominaiteError:
+    """The generic reading of a failed reply: 5xx is the API being unavailable, 4xx a rejection."""
+    if reply.status >= 500:
+        return TransportError(
+            "The Dominaite API is unavailable (HTTP {0}); "
+            "retry with the same idempotency key.".format(reply.status)
+        )
+    # Input validation (IDEMPOTENCY_KEY_REQUIRED and friends) answers 400 with the code
+    # at error.code, not as a success=false refusal. Carry it through instead of
+    # flattening every 4xx into a bare message.
+    error_code = reply.payload.get("errorCode") or reply.error.get("code")
+    return ApiError(
+        reply.status,
+        str(
+            reply.payload.get("errorMessage")
+            or reply.error.get("message")
+            or "Request rejected"
+        ),
+        error_code=str(error_code) if error_code else None,
+    )
+
+
+def _charge(data: Dict[str, Any]) -> Dict[str, Any]:
+    """The charge body as one shape.
+
+    The gateway omits ``declineClass`` and ``declineCode`` when they are null (every
+    201, and a 502 ``CHARGE_FAILED`` row), so absent reads as None. Anything else the
+    gateway sends is carried through.
+    """
+    charge = dict(data)
+    charge["chargeId"] = str(data.get("chargeId"))
+    charge["status"] = str(data.get("status") or "")
+    charge["declineClass"] = data["declineClass"] if isinstance(data.get("declineClass"), str) else None
+    charge["declineCode"] = data["declineCode"] if isinstance(data.get("declineCode"), str) else None
+    charge["transactionId"] = str(data.get("transactionId") or "")
+    return charge
+
+
+def _stored_payment_method(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Same rule for the card on file: brand, last4 and the expiry are absent when unreported."""
+    stored = dict(data)
+    stored["id"] = str(data.get("id") or "")
+    stored["brand"] = data["brand"] if isinstance(data.get("brand"), str) else None
+    stored["last4"] = data["last4"] if isinstance(data.get("last4"), str) else None
+    # bool is an int in Python; a month of True would be nonsense, keep it out.
+    stored["expiryMonth"] = (
+        data["expiryMonth"]
+        if isinstance(data.get("expiryMonth"), int) and not isinstance(data.get("expiryMonth"), bool)
+        else None
+    )
+    stored["expiryYear"] = (
+        data["expiryYear"]
+        if isinstance(data.get("expiryYear"), int) and not isinstance(data.get("expiryYear"), bool)
+        else None
+    )
+    stored["status"] = str(data.get("status") or "")
+    return stored

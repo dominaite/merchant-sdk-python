@@ -37,3 +37,66 @@ class PaymentStatus(str, Enum):
 
 #: Every status value the API can return today, in contract order.
 PAYMENT_STATUSES: Tuple[str, ...] = tuple(member.value for member in PaymentStatus)
+
+
+class StoredPaymentMethodStatus(str, Enum):
+    """A stored payment method's state, in the order the API contract lists them.
+
+    Read off ``get_status()["storedPaymentMethod"]["status"]``. Only ``ACTIVE`` methods
+    can be charged. ``REVOKED`` is what :meth:`DominaiteClient.revoke_payment_method`
+    leaves behind; ``EXPIRED`` means the card's expiry date has passed. Treat a value
+    you do not recognise as not chargeable.
+    """
+
+    ACTIVE = "active"
+    REVOKED = "revoked"
+    EXPIRED = "expired"
+
+
+#: Every stored payment method status the API can return today, in contract order.
+STORED_PAYMENT_METHOD_STATUSES: Tuple[str, ...] = tuple(
+    member.value for member in StoredPaymentMethodStatus
+)
+
+
+class ChargeStatus(str, Enum):
+    """The outcome of :meth:`DominaiteClient.charge_payment_method`.
+
+    ``SUCCEEDED``: the money moved. ``FAILED``: it did not; on a 402 the charge's
+    ``declineClass`` says why. ``PENDING`` is not terminal: poll
+    :meth:`DominaiteClient.get_status` with the charge's ``transactionId``.
+    ``CANCELLED``: an authorization voided before capture, no money moved. Treat an
+    unknown value as still open.
+    """
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    PENDING = "pending"
+    CANCELLED = "cancelled"
+
+
+#: Every charge status the API can return today, in contract order.
+CHARGE_STATUSES: Tuple[str, ...] = tuple(member.value for member in ChargeStatus)
+
+
+class DeclineClass(str, Enum):
+    """Why a charge was declined (HTTP 402), coarse enough to act on without reading
+    the issuer's code. None on every other charge, including a 502 ``CHARGE_FAILED`` row.
+
+    - ``HARD``: do not retry this card, ask the customer for another one.
+    - ``SOFT_FUNDS``: insufficient funds; retry later (after payday, not in a loop).
+    - ``SOFT_SCA_REQUIRED``: the issuer wants the customer present; send them through
+      a hosted checkout session with ``save_card=True`` instead of charging off-session
+      again.
+    - ``SOFT_OTHER``: a transient issuer or network condition; one retry later is
+      reasonable.
+    """
+
+    HARD = "hard"
+    SOFT_FUNDS = "soft_funds"
+    SOFT_SCA_REQUIRED = "soft_sca_required"
+    SOFT_OTHER = "soft_other"
+
+
+#: Every decline class the API can return today, in contract order.
+DECLINE_CLASSES: Tuple[str, ...] = tuple(member.value for member in DeclineClass)

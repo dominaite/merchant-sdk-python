@@ -196,6 +196,97 @@ idempotency key: once the session is a few minutes past expiry, that returns a f
 for the same order (see
 [Recovering from a replay refusal](#recovering-from-a-replay-refusal)).
 
+## Stored payment methods (recurring)
+
+Pass `save_card=True` when you create a session and, once that payment is approved, the gateway
+keeps the card on file. You never see the card number or the provider token: `get_status()` returns
+a `storedPaymentMethod` with an opaque `id` (`pm_` + 32 hex characters), the `brand`, the `last4`
+and the expiry, and that `id` is what you charge and revoke with. Store it against your customer.
+(`paymentMethod` on the same status is something else: the gateway's string category of how the
+payer paid, `card`, `wallet` and so on.)
+
+```python
+from dominaite import ChargeError, ChargeStatus, DeclineClass, RevokeError, StoredPaymentMethodStatus
+
+session = client.create_checkout_session(
+    amount=2500,
+    currency="EUR",
+    order_reference="sub-8817-first",
+    save_card=True,
+)
+# ... the payer completes the hosted checkout ...
+status = client.get_status(session["transactionId"])
+stored = status.get("storedPaymentMethod")
+if status["status"] == "succeeded" and stored and stored["status"] == StoredPaymentMethodStatus.ACTIVE:
+    db.save_card(customer_id, stored["id"])  # pm_...
+
+# Later, off-session, no payer present:
+try:
+    charge = client.charge_payment_method(
+        payment_method_id,
+        amount=2500,
+        currency="EUR",
+        order_reference="sub-8817-2026-10",
+        description="Monthly plan, October",
+        idempotency_key="sub-8817-2026-10",  # derive it from the billing period, never random per attempt
+    )
+except ChargeError as error:
+    if error.error_code == "CHARGE_OUTCOME_UNKNOWN":
+        # 502: the provider gave no verdict, the charge MAY have happened. Never retry
+        # under a new key: poll the transaction the gateway attached instead.
+        poll_until_settled(error.transaction_id)
+    elif error.error_code in ("DUPLICATE_REQUEST", "PAYMENT_METHOD_CHARGES_DISABLED", "PAYMENT_PROCESSING_UNAVAILABLE"):
+        ...  # nothing was charged; retry later with the SAME idempotency key
+    elif error.error_code == "PAYMENT_METHOD_NOT_ACTIVE":
+        ...  # revoked or expired: bring the customer back for a hosted session with save_card
+    elif error.error_code == "CHARGE_FAILED":
+        ...  # 502, nothing was charged; error.charge is set when a row exists
+    elif error.error_code == "IDEMPOTENCY_KEY_REUSED":
+        ...  # same key, different body or method: a bug on your side
+    raise
+else:
+    if charge["status"] == ChargeStatus.SUCCEEDED:
+        ...
+    elif charge["status"] == ChargeStatus.PENDING:
+        ...  # not terminal: poll get_status(charge["transactionId"]) or wait for the webhook
+    elif charge["status"] == ChargeStatus.FAILED:
+        # HTTP 402 from the gateway, but not an exception: branch on the class, log the code.
+        # DeclineClass.HARD              - give up on this card, ask the customer for another one
+        # DeclineClass.SOFT_FUNDS        - insufficient funds, retry later (not in a loop)
+        # DeclineClass.SOFT_SCA_REQUIRED - the issuer wants the customer present: send them
+        #                                  through a hosted session with save_card and charge the new method
+        # DeclineClass.SOFT_OTHER        - transient, one retry later is reasonable
+        handle_decline(charge["declineClass"], charge["declineCode"])
+    elif charge["status"] == ChargeStatus.CANCELLED:
+        ...  # an authorization voided before capture; no money moved
+
+# When the customer removes the card:
+try:
+    client.revoke_payment_method(payment_method_id)  # 204, returns None; 204 again if already revoked
+except RevokeError as error:
+    if error.error_code == "MERCHANT_API_UNAVAILABLE":
+        ...  # 503: nothing changed, retry later
+    else:
+        ...  # 502 UPSTREAM_CONTRACT_ERROR: the provider refused for good, nothing changed; contact support with the id
+```
+
+A charge is signed exactly like a session and carries an `Idempotency-Key`, so a retry after a
+timeout with the **same** key never charges the card twice: the gateway replays its first answer,
+HTTP status included. The HTTP status is the contract on this route: 201 (or 200 on a replay)
+returns the charge, 402 returns the charge too (`status` `failed` plus `declineClass`), and 409,
+422, 502 and 503 raise `ChargeError` with `error_code`, `http_status`, the gateway's message and,
+when the gateway attached the charge row, `charge` and `transaction_id`. Only authentication
+(401/403), an id that is not yours (404, `ApiError`), validation (400, `ApiError`), rate limiting
+(429) and network failures keep their generic exceptions. `declineClass` and `declineCode` are
+`None` unless the charge was declined; the gateway omits them on the wire and the SDK reads absent
+as `None`.
+
+Revoking signs an empty key and an empty body, like `get_status()`. A revoke that fails with
+`RevokeError` changed nothing: `MERCHANT_API_UNAVAILABLE` (503) is retryable,
+`UPSTREAM_CONTRACT_ERROR` (502) is not. After a revoke the status read keeps the
+`storedPaymentMethod` with `status` `revoked`, and a charge against it is refused with
+`PAYMENT_METHOD_NOT_ACTIVE`.
+
 ## Webhooks
 
 Webhooks are how you find out what happened to a payment. Create an endpoint in the Dominaite
@@ -385,6 +476,8 @@ answers `PRIOR_ATTEMPT_FAILED` and the key is spent; reconcile and use a fresh k
 |---|---|---|
 | `AuthenticationError` | Bad credentials, bad signature, clock skew, IP not allowlisted | No - fix config |
 | `CheckoutRefusedError` | The gateway refused to open the session (`error_code`) | Depends on the code |
+| `ChargeError` | The gateway answered a charge with a code instead of a charge (`error_code`, `http_status`, `charge`, `transaction_id`) | Depends on the code; never with a new key |
+| `RevokeError` | The gateway refused to revoke a stored payment method; nothing changed (`error_code`, `http_status`) | `MERCHANT_API_UNAVAILABLE` only |
 | `ApiError` | Unexpected response, or a 4xx like an unknown transaction id (`http_status`, `error_code`) | No |
 | `RateLimitError` | HTTP 429; you are sending faster than the key is allowed (`retry_after_seconds`) | Yes, after you wait |
 | `TransportError` | Network failure or 5xx; you don't know if it landed | Yes, same idempotency key |

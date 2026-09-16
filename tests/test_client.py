@@ -13,13 +13,16 @@ import pytest
 
 from dominaite import (
     DEFAULT_BASE_URL,
+    PAYMENT_METHODS_PATH,
     PING_PATH,
     SESSIONS_PATH,
     ApiError,
     AuthenticationError,
+    ChargeError,
     CheckoutRefusedError,
     DominaiteClient,
     RateLimitError,
+    RevokeError,
     TransportError,
     sign_request,
 )
@@ -1071,3 +1074,293 @@ def test_a_short_reading_stream_is_still_read_to_the_end(client, monkeypatch):
     )
 
     assert session == CHECKOUT
+
+
+# --- stored payment methods ---------------------------------------------------
+
+PAYMENT_METHOD_ID = "pm_0123456789abcdef0123456789abcdef"
+CHARGE_PATH = PAYMENT_METHODS_PATH + "/" + PAYMENT_METHOD_ID + "/charges"
+CHARGE_IDEMPOTENCY_KEY = "00000000-0000-4000-8000-000000000003"
+CHARGE_BODY = '{"amount":2500,"currency":"EUR","orderReference":"order-1043"}'
+CHARGE_VECTOR_SIGNATURE = "9ce9f54efa2533a46aa4493b97b56aeb657f41d6a18f1c008c7fd412029aebf9"
+REVOKE_VECTOR_SIGNATURE = "9330100343c4b820504890a09829a193d5815ca39e92160fdfc13d320a802a02"
+# The wire form of a placed charge: success=true, the charge under data, and no
+# declineClass/declineCode keys at all (the gateway omits nulls).
+CHARGE = {
+    "chargeId": "ch_33333333333343338333333333333333",
+    "status": "succeeded",
+    "transactionId": "33333333-3333-4333-8333-333333333333",
+}
+CHARGE_RESULT = dict(CHARGE, declineClass=None, declineCode=None)
+
+
+def _placed(charge=None):
+    return (201, {"success": True, "data": charge if charge is not None else CHARGE})
+
+
+def _charge(client, **overrides):
+    params = dict(
+        amount=2500,
+        currency="EUR",
+        order_reference="order-1043",
+        idempotency_key=CHARGE_IDEMPOTENCY_KEY,
+    )
+    params.update(overrides)
+    return client.charge_payment_method(PAYMENT_METHOD_ID, **params)
+
+
+def test_save_card_is_sent_in_the_session_body_and_nowhere_else(client, urlopen):
+    recorder = urlopen(_ok())
+
+    client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference="order-1042", save_card=True
+    )
+
+    request = recorder.last
+    assert json.loads(request.data)["saveCard"] is True
+    headers = _headers(request)
+    assert headers["x-signature"] == sign_request(
+        SECRET, headers["x-timestamp"], "POST", SESSIONS_PATH,
+        headers["idempotency-key"], request.data.decode("utf-8"),
+    )
+
+
+def test_save_card_is_omitted_when_not_passed(client, urlopen):
+    recorder = urlopen(_ok())
+
+    client.create_checkout_session(amount=2500, currency="EUR", order_reference="order-1042")
+
+    assert "saveCard" not in json.loads(recorder.last.data)
+
+
+def test_get_status_passes_the_stored_payment_method_through_and_leaves_payment_method_a_string(client, urlopen):
+    stored = {
+        "id": PAYMENT_METHOD_ID, "brand": "visa", "last4": "4242",
+        "expiryMonth": 12, "expiryYear": 2029, "status": "active",
+    }
+    urlopen((200, {"success": True, "data": {
+        "transactionId": TRANSACTION_ID, "status": "succeeded",
+        "paymentMethod": "card", "storedPaymentMethod": stored,
+    }}))
+
+    status = client.get_status(TRANSACTION_ID)
+    assert status["storedPaymentMethod"] == stored
+    # The gateway's own paymentMethod is a category string, not the card; it is not
+    # typed by this SDK but it must not be mistaken for, or clobbered by, the card on file.
+    assert status["paymentMethod"] == "card"
+
+
+def test_get_status_normalises_an_unreported_brand_and_expiry_and_adds_no_key_without_a_card(client, urlopen):
+    bare = {"transactionId": TRANSACTION_ID, "status": "pending", "amount": 2500, "currency": "EUR"}
+    urlopen((200, {"success": True, "data": bare}))
+    assert client.get_status(TRANSACTION_ID) == bare
+
+    urlopen((200, {"success": True, "data": dict(bare, status="succeeded", storedPaymentMethod={"id": PAYMENT_METHOD_ID, "status": "active"})}))
+    assert client.get_status(TRANSACTION_ID)["storedPaymentMethod"] == {
+        "id": PAYMENT_METHOD_ID, "brand": None, "last4": None, "expiryMonth": None, "expiryYear": None, "status": "active",
+    }
+
+
+def test_charge_reproduces_the_charge_vector_end_to_end(client, urlopen, monkeypatch):
+    recorder = urlopen(_placed())
+    monkeypatch.setattr("dominaite.client.time.time", lambda: 1755302400)
+
+    charge = _charge(client)
+
+    assert charge == CHARGE_RESULT
+    request = recorder.last
+    headers = _headers(request)
+    assert request.full_url == BASE_URL + CHARGE_PATH
+    assert request.get_method() == "POST"
+    assert request.data.decode("utf-8") == CHARGE_BODY
+    assert headers["idempotency-key"] == CHARGE_IDEMPOTENCY_KEY
+    assert headers["x-timestamp"] == "1755302400"
+    assert headers["x-signature"] == CHARGE_VECTOR_SIGNATURE
+    assert b"idempotency" not in request.data.lower()
+
+
+def test_charge_generates_an_idempotency_key_and_sends_description(client, urlopen):
+    recorder = urlopen(_placed())
+
+    _charge(client, idempotency_key=None, description="Monthly plan")
+
+    request = recorder.last
+    headers = _headers(request)
+    assert len(headers["idempotency-key"]) == 32
+    assert json.loads(request.data) == {
+        "amount": 2500, "currency": "EUR", "orderReference": "order-1043",
+        "description": "Monthly plan",
+    }
+
+
+def test_a_402_decline_is_a_result_with_a_decline_class_not_an_exception(client, urlopen):
+    declined = dict(CHARGE, status="failed", declineClass="soft_funds", declineCode="51")
+    urlopen((402, {
+        "success": False, "data": declined,
+        "error": {"code": "CHARGE_DECLINED", "message": "The payment provider declined the charge.", "statusCode": 402},
+    }))
+
+    charge = _charge(client)
+
+    assert charge == declined
+    assert charge["status"] == "failed"
+    assert charge["declineClass"] == "soft_funds"
+    assert charge["declineCode"] == "51"
+
+
+def test_a_200_durable_replay_of_a_placed_charge_is_a_result_too(client, urlopen):
+    urlopen((200, {"success": True, "data": dict(CHARGE, status="pending")}))
+
+    charge = _charge(client)
+
+    assert charge["status"] == "pending"
+    assert charge["chargeId"] == CHARGE["chargeId"]
+
+
+def test_a_charge_answered_with_a_code_is_a_charge_error_keeping_code_status_and_data(client, urlopen):
+    unknown = dict(CHARGE, status="pending")
+    urlopen((502, {
+        "success": False, "data": unknown,
+        "error": {"code": "CHARGE_OUTCOME_UNKNOWN", "message": "The payment provider gave no verdict.", "statusCode": 502},
+    }))
+
+    with pytest.raises(ChargeError) as raised:
+        _charge(client)
+
+    error = raised.value
+    assert not isinstance(error, TransportError), "a 502 with a code must not look retryable"
+    assert error.http_status == 502
+    assert error.error_code == "CHARGE_OUTCOME_UNKNOWN"
+    assert str(error) == "The payment provider gave no verdict."
+    assert error.charge == dict(unknown, declineClass=None, declineCode=None)
+    assert error.transaction_id == CHARGE["transactionId"]
+
+
+@pytest.mark.parametrize(
+    "status, code",
+    [
+        (409, "PAYMENT_METHOD_NOT_ACTIVE"),
+        (409, "DUPLICATE_REQUEST"),
+        (422, "IDEMPOTENCY_KEY_REUSED"),
+        (503, "PAYMENT_METHOD_CHARGES_DISABLED"),
+        (503, "PAYMENT_PROCESSING_UNAVAILABLE"),
+        (502, "CHARGE_FAILED"),
+    ],
+)
+def test_a_charge_refused_without_a_row_is_a_charge_error_with_no_charge_attached(client, urlopen, status, code):
+    urlopen((status, {"success": False, "error": {"code": code, "message": "refused", "statusCode": status}}))
+
+    with pytest.raises(ChargeError) as raised:
+        _charge(client)
+
+    assert raised.value.http_status == status
+    assert raised.value.error_code == code
+    assert raised.value.charge is None
+    assert raised.value.transaction_id is None
+
+
+def test_a_5xx_without_a_code_on_the_charge_route_is_still_a_transport_error(client, urlopen):
+    # A proxy or a crash answering instead of the gateway: nothing to branch on, so the
+    # generic rule stands and the caller retries with the same key.
+    urlopen((503, {"success": False}))
+
+    with pytest.raises(TransportError):
+        _charge(client)
+
+
+def test_a_charge_against_a_method_that_is_not_yours_is_an_api_error_404(client, urlopen):
+    urlopen((404, {"success": False, "error": {"code": "PAYMENT_METHOD_NOT_FOUND", "message": "No stored payment method with this id."}}))
+
+    with pytest.raises(ApiError) as raised:
+        _charge(client)
+
+    assert not isinstance(raised.value, ChargeError)
+    assert raised.value.http_status == 404
+    assert raised.value.error_code == "PAYMENT_METHOD_NOT_FOUND"
+
+
+def test_a_2xx_without_a_charge_body_is_an_api_error_not_a_half_built_charge(client, urlopen):
+    urlopen((201, {"success": True}))
+
+    with pytest.raises(ApiError) as raised:
+        _charge(client)
+
+    assert raised.value.http_status == 201
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"amount": 25.5},
+        {"amount": 0},
+        {"amount": True},
+        {"order_reference": ""},
+        {"description": 7},
+        {"idempotency_key": ""},
+    ],
+)
+def test_charge_validates_money_params_like_a_session_does(client, urlopen, overrides):
+    recorder = urlopen(_placed())
+
+    with pytest.raises(ValueError):
+        _charge(client, **overrides)
+
+    assert recorder.requests == []
+
+
+@pytest.mark.parametrize(
+    "bad", ["", " ", "pm_1/charges", "pm_1?x=1", "pm_1#f", "pm 1", "pm_1%2F", "p" * 101, None]
+)
+def test_a_payment_method_id_that_would_not_stay_one_path_segment_is_refused(client, urlopen, bad):
+    recorder = urlopen(_placed())
+
+    with pytest.raises(ValueError):
+        client.charge_payment_method(bad, amount=2500, currency="EUR", order_reference="o")
+    with pytest.raises(ValueError):
+        client.revoke_payment_method(bad)
+
+    assert recorder.requests == []
+
+
+def test_revoke_reproduces_the_revoke_vector_and_returns_none_on_204(client, urlopen, monkeypatch):
+    recorder = urlopen((204, b""))
+    monkeypatch.setattr("dominaite.client.time.time", lambda: 1755302400)
+
+    assert client.revoke_payment_method(PAYMENT_METHOD_ID) is None
+
+    request = recorder.last
+    headers = _headers(request)
+    assert request.full_url == BASE_URL + PAYMENT_METHODS_PATH + "/" + PAYMENT_METHOD_ID
+    assert request.get_method() == "DELETE"
+    assert request.data is None
+    assert "idempotency-key" not in headers
+    assert headers["x-signature"] == REVOKE_VECTOR_SIGNATURE
+
+
+def test_revoke_surfaces_a_404_as_api_error_and_a_coded_502_503_as_revoke_error(client, urlopen):
+    urlopen((404, {"success": False, "error": {"code": "VALIDATION_ERROR", "message": "Validation failed", "statusCode": 404}}))
+    with pytest.raises(ApiError) as raised:
+        client.revoke_payment_method(PAYMENT_METHOD_ID)
+    assert not isinstance(raised.value, RevokeError)
+    assert raised.value.http_status == 404
+
+    for status, code in [(503, "MERCHANT_API_UNAVAILABLE"), (502, "UPSTREAM_CONTRACT_ERROR")]:
+        urlopen((status, {"success": False, "error": {"code": code, "message": "nothing changed", "statusCode": status}}))
+        with pytest.raises(RevokeError) as refused:
+            client.revoke_payment_method(PAYMENT_METHOD_ID)
+        assert not isinstance(refused.value, TransportError)
+        assert refused.value.http_status == status
+        assert refused.value.error_code == code
+        assert str(refused.value) == "nothing changed"
+
+    # No code to branch on (a proxy answering instead of the gateway): the generic rule stands.
+    urlopen((503, {"success": False}))
+    with pytest.raises(TransportError):
+        client.revoke_payment_method(PAYMENT_METHOD_ID)
+
+
+def test_revoke_returns_none_on_a_204_for_an_already_revoked_method_too(client, urlopen):
+    recorder = urlopen((204, b""))
+    assert client.revoke_payment_method(PAYMENT_METHOD_ID) is None
+    assert client.revoke_payment_method(PAYMENT_METHOD_ID) is None
+    assert len(recorder.requests) == 2
