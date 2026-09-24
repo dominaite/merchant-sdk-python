@@ -65,8 +65,17 @@ def test_refuses_more_decimal_places_than_the_currency_has(amount, currency):
 
 @pytest.mark.parametrize("currency", ["XYZ", "", "EURO", None, 978])
 def test_an_unknown_currency_is_an_error_not_a_default(currency):
-    with pytest.raises(ValueError, match="unknown currency"):
+    with pytest.raises(ValueError, match="Unknown currency"):
         to_minor_units("25.00", currency)
+
+
+@pytest.mark.parametrize("currency", ["XYZ", "NZD", "TRY", "RSD", "MKD", "UAH"])
+def test_the_unknown_currency_error_names_the_currency_and_does_not_cite_iso_4217(currency):
+    # The exponent table is the gateway's, not ISO's, so the message must not claim otherwise.
+    with pytest.raises(ValueError) as caught:
+        to_minor_units("25.00", currency)
+    expected = "Unknown currency {0}: no minor-unit exponent on record".format(currency)
+    assert str(caught.value) == expected
 
 
 @pytest.mark.parametrize(

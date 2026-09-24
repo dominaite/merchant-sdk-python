@@ -86,10 +86,7 @@ def to_minor_units(amount: Union[str, Decimal], currency: str) -> int:
         )
     exponent = CURRENCY_EXPONENTS.get(code)
     if exponent is None:
-        raise ValueError(
-            "unknown currency {0!r}: no ISO 4217 exponent on record, so the amount cannot "
-            "be converted safely".format(currency)
-        )
+        raise ValueError("Unknown currency {0}: no minor-unit exponent on record".format(currency))
 
     if isinstance(amount, Decimal):
         if not amount.is_finite():
