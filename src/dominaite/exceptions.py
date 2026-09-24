@@ -9,7 +9,49 @@ to send again once you have waited out ``retry_after_seconds``. The SDK never re
 it for you.
 """
 
+from enum import Enum
 from typing import Any, Dict, Optional, Tuple
+
+
+class ErrorCode(str, Enum):
+    """Every machine-readable ``error_code`` this SDK documents, as named constants.
+
+    Subclasses ``str``, so ``error.error_code == ErrorCode.STOREFRONT_NOT_WHITELISTED``
+    works against the plain string on any exception. The tuples below say which codes
+    arrive on which exception; this is just the names. Treat a code that is not listed
+    as a failure too rather than crashing on it.
+    """
+
+    # Authentication (AuthenticationError, HTTP 401/403).
+    INVALID_API_KEY = "INVALID_API_KEY"
+    INVALID_SIGNATURE = "INVALID_SIGNATURE"
+    TIMESTAMP_OUT_OF_RANGE = "TIMESTAMP_OUT_OF_RANGE"
+    IP_NOT_ALLOWED = "IP_NOT_ALLOWED"
+
+    # Input validation on create (ApiError, HTTP 400).
+    IDEMPOTENCY_KEY_REQUIRED = "IDEMPOTENCY_KEY_REQUIRED"
+
+    # Session refusals (CheckoutRefusedError, HTTP 200 with success false). Some of these
+    # also come back from a charge, as ChargeError.
+    PAYMENT_PROCESSING_UNAVAILABLE = "PAYMENT_PROCESSING_UNAVAILABLE"
+    DUPLICATE_REQUEST = "DUPLICATE_REQUEST"
+    ALREADY_PROCESSED = "ALREADY_PROCESSED"
+    IDEMPOTENCY_KEY_REUSED = "IDEMPOTENCY_KEY_REUSED"
+    PRIOR_ATTEMPT_FAILED = "PRIOR_ATTEMPT_FAILED"
+
+    # Storefront refusals on create (StorefrontError).
+    STOREFRONT_NOT_WHITELISTED = "STOREFRONT_NOT_WHITELISTED"
+    STOREFRONT_INACTIVE = "STOREFRONT_INACTIVE"
+    STOREFRONT_MISMATCH = "STOREFRONT_MISMATCH"
+
+    # Stored payment method charges and revokes (ChargeError, RevokeError).
+    PAYMENT_METHOD_NOT_ACTIVE = "PAYMENT_METHOD_NOT_ACTIVE"
+    CHARGE_OUTCOME_UNKNOWN = "CHARGE_OUTCOME_UNKNOWN"
+    CHARGE_FAILED = "CHARGE_FAILED"
+    PAYMENT_METHOD_CHARGES_DISABLED = "PAYMENT_METHOD_CHARGES_DISABLED"
+    UPSTREAM_CONTRACT_ERROR = "UPSTREAM_CONTRACT_ERROR"
+    MERCHANT_API_UNAVAILABLE = "MERCHANT_API_UNAVAILABLE"
+
 
 #: Every ``errorCode`` the API can refuse a checkout session with - a business refusal,
 #: sent as HTTP 200 with ``success: false``. Listed so you can assert your own handling
@@ -26,6 +68,16 @@ SESSION_REFUSAL_ERROR_CODES: Tuple[str, ...] = (
 #: ``success: false`` refusal shape, and arrive as :class:`ApiError` with the code on
 #: ``error_code``. They mean the request was malformed - fix the call, do not retry.
 VALIDATION_ERROR_CODES: Tuple[str, ...] = ("IDEMPOTENCY_KEY_REQUIRED",)
+
+#: The storefront codes a create call can be refused with, raised as
+#: :class:`StorefrontError`. ``STOREFRONT_NOT_WHITELISTED`` and ``STOREFRONT_INACTIVE``
+#: are HTTP 409, ``STOREFRONT_MISMATCH`` is HTTP 400. Not in
+#: :data:`SESSION_REFUSAL_ERROR_CODES`: these are not the 200 ``success: false`` shape.
+STOREFRONT_ERROR_CODES: Tuple[str, ...] = (
+    "STOREFRONT_NOT_WHITELISTED",
+    "STOREFRONT_INACTIVE",
+    "STOREFRONT_MISMATCH",
+)
 
 #: The codes :meth:`DominaiteClient.charge_payment_method` raises as
 #: :class:`ChargeError`, in the gateway's own order. ``CHARGE_DECLINED`` (HTTP 402) is
@@ -109,6 +161,30 @@ class RateLimitError(ApiError):
         super().__init__(429, message, error_code=error_code)
         #: Seconds the API asked you to wait, or None when it did not say.
         self.retry_after_seconds = retry_after_seconds
+
+
+class StorefrontError(ApiError):
+    """The gateway would not open a session for this storefront (website). Nothing was
+    created; retrying the same call will get the same answer until the setup changes.
+
+    Branch on ``error_code``:
+
+    - ``STOREFRONT_NOT_WHITELISTED`` (409): the storefront's domain is not yet approved
+      by the payment provider. Nothing to fix in your code: ask Dominaite support to
+      finish the domain whitelisting, then try again.
+    - ``STOREFRONT_INACTIVE`` (409): the storefront was deactivated or deleted. Use an
+      API key for an active storefront, or ask support to reactivate it.
+    - ``STOREFRONT_MISMATCH`` (400): the API key is bound to a different storefront
+      than the request names.
+
+    An idempotency key first used on another storefront is refused with
+    ``STOREFRONT_MISMATCH`` too, but in the HTTP 200 shape, so that one arrives as
+    :class:`CheckoutRefusedError`. Match on ``error_code`` rather than the exception
+    type if you want to handle both.
+
+    Subclasses :class:`ApiError`, so existing ``except ApiError`` handlers keep
+    catching it, with ``http_status`` and ``error_code`` set.
+    """
 
 
 class AuthenticationError(DominaiteError):

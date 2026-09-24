@@ -13,7 +13,7 @@ your code instead of blowing up inside the SDK.
 """
 
 from enum import Enum
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 class PaymentStatus(str, Enum):
@@ -37,6 +37,39 @@ class PaymentStatus(str, Enum):
 
 #: Every status value the API can return today, in contract order.
 PAYMENT_STATUSES: Tuple[str, ...] = tuple(member.value for member in PaymentStatus)
+
+#: The statuses a payment does not leave on its own: stop polling on these. Everything
+#: else, including a value added to the API later, is still open. ``DISPUTED`` is not
+#: here: a dispute is still being decided.
+TERMINAL_PAYMENT_STATUSES: Tuple[str, ...] = (
+    PaymentStatus.SUCCEEDED.value,
+    PaymentStatus.FAILED.value,
+    PaymentStatus.CANCELLED.value,
+    PaymentStatus.ABANDONED.value,
+    PaymentStatus.REFUNDED.value,
+    PaymentStatus.PARTIALLY_REFUNDED.value,
+)
+
+
+def is_paid(status: Optional[str]) -> bool:
+    """True only for ``succeeded``: the one status that means you have been paid.
+
+    ``requires_capture`` is an approved hold, not a payment, and a refunded payment is no
+    longer money in hand, so both are False. Takes the raw string from
+    :meth:`DominaiteClient.get_status` or a :class:`PaymentStatus` member.
+    """
+    return status == PaymentStatus.SUCCEEDED.value
+
+
+def is_terminal(status: Optional[str]) -> bool:
+    """True when the payment has settled and polling can stop.
+
+    Terminal: ``succeeded``, ``failed``, ``cancelled``, ``abandoned``, ``refunded``,
+    ``partially_refunded``. Not terminal: ``pending``, ``processing``,
+    ``requires_capture``, ``disputed``, and any value this SDK does not recognise, so
+    a status added to the API later keeps you polling instead of closing a live order.
+    """
+    return status in TERMINAL_PAYMENT_STATUSES
 
 
 class StoredPaymentMethodStatus(str, Enum):

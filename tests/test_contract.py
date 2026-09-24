@@ -48,6 +48,8 @@ ENDPOINTS = CONTRACT["endpoints"]
 KEY_ID = "dmk_0123456789abcdef0123456789abcdef"
 SECRET = "dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 BASE_URL = "https://api.example.test/payments"
+#: The key a caller builds with order_idempotency_key("checkout", "1042", 2500, "EUR").
+IDEMPOTENCY_KEY = "checkout-1042-2500-EUR"
 
 
 class _Response:
@@ -117,7 +119,11 @@ PAYMENT_METHOD_ID = ENDPOINTS["getStatus"]["savedCardExample"]["storedPaymentMet
 
 def _charge(client):
     return client.charge_payment_method(
-        PAYMENT_METHOD_ID, amount=8440, currency="EUR", order_reference="order-1042"
+        PAYMENT_METHOD_ID,
+        amount=8440,
+        currency="EUR",
+        order_reference="order-1042",
+        idempotency_key=IDEMPOTENCY_KEY,
     )
 
 
@@ -162,7 +168,10 @@ def test_create_checkout_session_returns_exactly_the_checkout_fields(
     answers_with(endpoint["successExample"])
 
     checkout = client.create_checkout_session(
-        amount=8440, currency="EUR", order_reference="order-1042"
+        amount=8440,
+        currency="EUR",
+        order_reference="order-1042",
+        idempotency_key=IDEMPOTENCY_KEY,
     )
 
     # create_checkout_session() hands back the `checkout` object, not the envelope.
@@ -177,7 +186,10 @@ def test_a_refusal_is_raised_with_the_whole_envelope_intact(client, answers_with
 
     with pytest.raises(CheckoutRefusedError) as raised:
         client.create_checkout_session(
-            amount=8440, currency="EUR", order_reference="order-1042"
+            amount=8440,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
     # HTTP 200 with success=false is a refusal, not a success - branching on the
@@ -422,7 +434,11 @@ def test_charge_and_revoke_hit_the_contract_paths_and_methods(client, monkeypatc
     payment_method_id = PAYMENT_METHOD_ID
 
     client.charge_payment_method(
-        payment_method_id, amount=8440, currency="EUR", order_reference="order-1042"
+        payment_method_id,
+        amount=8440,
+        currency="EUR",
+        order_reference="order-1042",
+        idempotency_key=IDEMPOTENCY_KEY,
     )
     assert client.revoke_payment_method(payment_method_id) is None
 
@@ -489,7 +505,10 @@ def test_every_contract_refusal_code_surfaces_on_the_exception(
 
     with pytest.raises(CheckoutRefusedError) as raised:
         client.create_checkout_session(
-            amount=8440, currency="EUR", order_reference="order-1042"
+            amount=8440,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
     assert raised.value.error_code == code
@@ -532,7 +551,10 @@ def test_a_validation_error_surfaces_as_an_api_error_carrying_its_code(
 
     with pytest.raises(ApiError) as raised:
         client.create_checkout_session(
-            amount=8440, currency="EUR", order_reference="order-1042"
+            amount=8440,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
     assert raised.value.error_code == code
@@ -560,7 +582,10 @@ def test_a_validation_error_is_not_reported_as_a_refusal(client, monkeypatch):
 
     with pytest.raises(ApiError) as raised:
         client.create_checkout_session(
-            amount=8440, currency="EUR", order_reference="order-1042"
+            amount=8440,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
     assert not isinstance(raised.value, CheckoutRefusedError)

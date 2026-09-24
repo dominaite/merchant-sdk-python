@@ -85,7 +85,12 @@ is your warning to fix NTP before payments break.
 ```python
 import os
 
-from dominaite import CheckoutRefusedError, DominaiteClient, TransportError
+from dominaite import (
+    CheckoutRefusedError,
+    DominaiteClient,
+    TransportError,
+    order_idempotency_key,
+)
 
 client = DominaiteClient(
     os.environ["DOMINAITE_KEY_ID"],
@@ -107,6 +112,9 @@ try:
         },
         language="bg",                  # widget UI language
         theme="dark",
+        # Required. Same order + same amount = same key, so a reload or a retry gets
+        # the session the customer already has instead of a second one.
+        idempotency_key=order_idempotency_key("checkout", "1042", 2500, "EUR"),
     )
 except CheckoutRefusedError as refusal:
     # Machine-readable: refusal.error_code - see the exception docstring for the codes.
@@ -134,6 +142,7 @@ credentials, your clock, your signing, and the dev gateway.
 | `AuthenticationError` + `TIMESTAMP_OUT_OF_RANGE` | Your machine's clock is more than 5 minutes off. |
 | `AuthenticationError` + `IP_NOT_ALLOWED` | The key has an IP allowlist that does not include you. |
 | `CheckoutRefusedError` | You authenticated fine; the gateway declined to open a session. |
+| `StorefrontError` + `STOREFRONT_NOT_WHITELISTED` | Your website's domain is not approved with the payment provider yet. See [Storefront errors](#storefront-errors). |
 | `TransportError` | Wrong base URL, or the service is down. Retry with the same key. |
 
 **5. Render the widget.** Store `session["transactionId"]` against your order, then hand the
@@ -163,31 +172,98 @@ bound to your checkout by Dominaite during onboarding.
 string raises `ValueError` before anything is sent. The amount is locked server-side - what you
 pass here is what gets charged; nothing in the browser can change it.
 
+Not every currency has two decimals. The minor unit is set by the gateway's currency registry,
+which mostly matches ISO 4217 but not always:
+
+| Decimals | Currencies | `2500` means |
+|---|---|---|
+| 2 | EUR, USD, GBP, CAD, AUD, CHF, BGN, RON, PLN, CZK, SEK, DKK, NOK | 25.00 |
+| 0 | JPY, HUF | 2500 |
+| 3 | BHD, KWD | 2.500 |
+
+**HUF is whole forints.** ISO 4217 gives HUF two decimals, the gateway uses none: `2500` HUF is
+2500 Ft. Sending `250000` for 2500 Ft would charge 100 times too much.
+
+ISK, KRW, OMR, JOD and TND are not supported: ISO and the gateway disagree on their decimals, so
+`to_minor_units` raises for them rather than produce an amount that is off by 10x or 100x.
+
+`to_minor_units` converts a price for you, without float math:
+
+```python
+from decimal import Decimal
+
+from dominaite import to_minor_units
+
+to_minor_units("25.00", "EUR")            # 2500
+to_minor_units("2500", "JPY")             # 2500
+to_minor_units("2500", "HUF")             # 2500, whole forints
+to_minor_units("2.5", "BHD")              # 2500
+to_minor_units(Decimal("0.30"), "EUR")    # 30, where 0.1 + 0.2 as floats is 0.30000000000000004
+```
+
+It takes a decimal string or a `Decimal`, never a float. It rounds nothing: more decimal places
+than the currency has (`"25.001"` EUR, `"100.5"` JPY, and also `"25.000"` EUR) raises
+`ValueError`, so quantize values from a wider column first. A currency it does not know raises
+too, instead of assuming two decimals; the known ones are in `CURRENCY_EXPONENTS` and the
+refused ones in `UNSUPPORTED_CURRENCIES`.
+
 ## Retries and double-charges
 
-Every `create_checkout_session` call carries an idempotency key (auto-generated, or pass your
-own as `idempotency_key`). Retrying with the same key never charges twice - on a
-timeout, retry with the same key rather than generating a new one.
+Every `create_checkout_session` call needs an `idempotency_key`. There is no random default:
+leaving it out raises `ValueError` before anything is sent. Retrying with the same key never
+charges twice - on a timeout, retry with the same key rather than generating a new one.
 
-If the first attempt did land, the retry comes back as a `CheckoutRefusedError` with a replay
-code, not as the original session: there are no cashier fields to hand the embed snippet. Use
-`refusal.transaction_id` with `get_status()` to find out what the first attempt did (see
-[Recovering from a replay refusal](#recovering-from-a-replay-refusal)).
+Build the key from the order with `order_idempotency_key`:
 
-There is a helper that does exactly that:
+```python
+from dominaite import order_idempotency_key
+
+key = order_idempotency_key("checkout", order.id, order.total_minor, order.currency)
+# "checkout-1042-2500-EUR"
+```
+
+The key is `{scope}-{order_id}-{amount_minor}-{CURRENCY}`. That shape is the point:
+
+- **Same order, same amount, same key.** A reload, a back button or a retry after a timeout
+  rebuilds the identical key, so the gateway hands back the session the customer already has
+  (or tells you the order is paid) instead of opening a second one.
+- **Changed amount or currency, new key.** A coupon or an edited basket produces a different
+  key and a fresh session. Reusing the old key with a new amount would be refused with
+  `IDEMPOTENCY_KEY_REUSED`.
+- **Scope** keeps different flows on the same order apart (`"checkout"`, `"deposit"`, a
+  billing period for recurring charges).
+
+The helper applies the same rules as any key (see [Field lengths](#field-lengths)) and raises
+`ValueError` on a bad part rather than building a key the API would refuse.
+
+`charge_payment_method` needs a key the same way; derive it from the billing period.
+
+If the first attempt did land and its session is still open, the retry returns that same
+session: same transaction id, same cashier values. Otherwise it comes back as a
+`CheckoutRefusedError` with a replay code (`ALREADY_PROCESSED` once it is paid,
+`PRIOR_ATTEMPT_FAILED`, `DUPLICATE_REQUEST`, or `IDEMPOTENCY_KEY_REUSED` for a different
+amount). Use `refusal.transaction_id` with `get_status()` to find out what the first attempt did
+(see [Recovering from a replay refusal](#recovering-from-a-replay-refusal)).
+
+There is a helper that retries with the same key for you:
 
 ```python
 session = client.create_checkout_session_with_retry(
     amount=2500,
     currency="EUR",
     order_reference="order-1042",
+    idempotency_key=order_idempotency_key("checkout", "1042", 2500, "EUR"),
     max_attempts=3,
 )
 ```
 
-It retries only `TransportError` (network failures, 5xx, `MERCHANT_API_UNAVAILABLE`), reuses the
-one key across all attempts, and backs off between them. Refusals, authentication failures and
-rate limits are raised immediately.
+It retries `TransportError` (network failures, any 5xx, including a 503 carrying
+`MERCHANT_API_UNAVAILABLE` or `PAYMENT_PROCESSING_UNAVAILABLE`) and the
+`PAYMENT_PROCESSING_UNAVAILABLE` refusal (card payments briefly off, nothing charged). It sends
+your one key on every attempt and backs off between them. Every other refusal, storefront
+errors, authentication failures and rate limits are raised immediately. If processing stays
+unavailable past the last attempt you get the `CheckoutRefusedError`; retry later with the
+same key, and give up after about fifteen minutes.
 
 ## Sessions expire
 
@@ -213,6 +289,7 @@ session = client.create_checkout_session(
     currency="EUR",
     order_reference="sub-8817-first",
     save_card=True,
+    idempotency_key=order_idempotency_key("sub-first", "8817", 2500, "EUR"),
 )
 # ... the payer completes the hosted checkout ...
 status = client.get_status(session["transactionId"])
@@ -439,6 +516,22 @@ awaiting capture. Never treat it as an abandoned order.
 Treat any status you do not recognise as still-open as well: a value the API adds later should
 make you keep polling, never silently close an order that is still live.
 
+Two helpers encode those rules so you do not have to:
+
+```python
+from dominaite import is_paid, is_terminal
+
+status = client.get_status(transaction_id)["status"]
+if is_paid(status):        # succeeded, and nothing else
+    ship(order)
+elif is_terminal(status):  # failed, cancelled, abandoned, refunded, partially_refunded
+    close(order)
+# else: pending, processing, requires_capture, disputed or unknown - keep the order open
+```
+
+`is_terminal` is also True for `succeeded`, so check `is_paid` first. The terminal set is
+exported as `TERMINAL_PAYMENT_STATUSES`.
+
 Poll after the payer returns to you, or on your order timeout - not in a tight loop; the
 endpoint is rate limited per key.
 
@@ -476,6 +569,7 @@ answers `PRIOR_ATTEMPT_FAILED` and the key is spent; reconcile and use a fresh k
 |---|---|---|
 | `AuthenticationError` | Bad credentials, bad signature, clock skew, IP not allowlisted | No - fix config |
 | `CheckoutRefusedError` | The gateway refused to open the session (`error_code`) | Depends on the code |
+| `StorefrontError` | The storefront (website) cannot take payments yet, or the key belongs to another one (`error_code`, `http_status`). Subclass of `ApiError` | No - fix the setup |
 | `ChargeError` | The gateway answered a charge with a code instead of a charge (`error_code`, `http_status`, `charge`, `transaction_id`) | Depends on the code; never with a new key |
 | `RevokeError` | The gateway refused to revoke a stored payment method; nothing changed (`error_code`, `http_status`) | `MERCHANT_API_UNAVAILABLE` only |
 | `ApiError` | Unexpected response, or a 4xx like an unknown transaction id (`http_status`, `error_code`) | No |
@@ -489,6 +583,49 @@ Note the two different failure shapes on the create endpoint. A business refusal
 with `success: false` and raises `CheckoutRefusedError`; input validation is HTTP 400 and raises
 `ApiError` with the code on `error_code` (currently `IDEMPOTENCY_KEY_REQUIRED`, exported as
 `VALIDATION_ERROR_CODES`). Branch on the exception type, never on the HTTP status.
+
+Every code in these tables is also a named constant on `ErrorCode`, a `str` enum, so
+`error.error_code == ErrorCode.ALREADY_PROCESSED` works against the plain string:
+
+```python
+from dominaite import CheckoutRefusedError, ErrorCode
+
+try:
+    session = client.create_checkout_session(...)
+except CheckoutRefusedError as refusal:
+    if refusal.error_code == ErrorCode.ALREADY_PROCESSED:
+        ...  # this order is paid; show the receipt
+```
+
+### Storefront errors
+
+If your merchant account has more than one website (storefront), each session is tied to one of
+them, and the gateway checks that storefront before it opens anything. These refusals are not
+the 200 `success: false` shape: they arrive as `StorefrontError` (a subclass of `ApiError`), with
+the code on `error_code` and the HTTP status on `http_status`. Nothing was created.
+
+| `error_code` | HTTP | Means | What to do |
+|---|---|---|---|
+| `STOREFRONT_NOT_WHITELISTED` | 409 | The storefront's domain is not approved by the payment provider yet. | Nothing in your code. Ask Dominaite support to finish the domain whitelisting, then try again. |
+| `STOREFRONT_INACTIVE` | 409 | The storefront was deactivated or deleted. | Use an API key for an active storefront, or ask support to reactivate it. |
+| `STOREFRONT_MISMATCH` | 400 | The API key is bound to a different storefront than the request names. | Use the key issued for this storefront. |
+
+```python
+from dominaite import ErrorCode, StorefrontError
+
+try:
+    session = client.create_checkout_session(...)
+except StorefrontError as error:
+    if error.error_code == ErrorCode.STOREFRONT_NOT_WHITELISTED:
+        alert_ops("checkout blocked: domain not whitelisted yet")
+    raise
+```
+
+An idempotency key first used on another storefront is also refused with
+`STOREFRONT_MISMATCH`, but in the 200 shape, so that one is a `CheckoutRefusedError`. Match on
+`error_code` if you want to handle both. The codes are exported as `STOREFRONT_ERROR_CODES`.
+
+### Webhook verification codes
 
 `WebhookVerificationError.error_code` is one of `MALFORMED_SIGNATURE` (wrong header, or a proxy
 rewrote it), `INVALID_SIGNATURE` (wrong secret, modified body, or you passed a re-serialized
@@ -523,8 +660,14 @@ on your order timeout, and let webhooks do the rest.
 
 ## Field lengths
 
-`order_reference` and `idempotency_key` are capped at 100 characters each. Characters, not
-bytes: a 100-character Cyrillic or Greek reference is 200 UTF-8 bytes and the platform takes it.
+`order_reference` and `idempotency_key` are capped at 100 characters each. For
+`order_reference` that is characters, not bytes: a 100-character Cyrillic or Greek reference is
+200 UTF-8 bytes and the platform takes it.
+
+`idempotency_key` travels as an HTTP header and is part of the signature, so it is limited to
+visible ASCII: letters, digits and punctuation, no spaces, no accented or non-Latin letters.
+Anything else raises `ValueError` before the request is sent. If your order ids are not ASCII,
+derive the key from something that is (your numeric order id, or a hash of the reference).
 
 ## Running the tests
 

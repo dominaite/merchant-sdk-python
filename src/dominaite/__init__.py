@@ -1,5 +1,6 @@
 """Server-side Python client for the Dominaite merchant API."""
 
+from .amounts import CURRENCY_EXPONENTS, UNSUPPORTED_CURRENCIES, to_minor_units
 from .client import (
     DEFAULT_BASE_URL,
     PAYMENT_METHODS_PATH,
@@ -7,20 +8,24 @@ from .client import (
     SESSIONS_PATH,
     DominaiteClient,
     __version__,
+    order_idempotency_key,
     sign_request,
 )
 from .exceptions import (
     CHARGE_ERROR_CODES,
     REVOKE_ERROR_CODES,
     SESSION_REFUSAL_ERROR_CODES,
+    STOREFRONT_ERROR_CODES,
     VALIDATION_ERROR_CODES,
     ApiError,
     AuthenticationError,
     ChargeError,
     CheckoutRefusedError,
     DominaiteError,
+    ErrorCode,
     RateLimitError,
     RevokeError,
+    StorefrontError,
     TransportError,
     WebhookVerificationError,
 )
@@ -29,10 +34,13 @@ from .statuses import (
     DECLINE_CLASSES,
     PAYMENT_STATUSES,
     STORED_PAYMENT_METHOD_STATUSES,
+    TERMINAL_PAYMENT_STATUSES,
     ChargeStatus,
     DeclineClass,
     PaymentStatus,
     StoredPaymentMethodStatus,
+    is_paid,
+    is_terminal,
 )
 from .webhooks import (
     DEFAULT_WEBHOOK_TOLERANCE_SECONDS,
@@ -44,6 +52,7 @@ from .webhooks import (
 __all__ = [
     "CHARGE_ERROR_CODES",
     "CHARGE_STATUSES",
+    "CURRENCY_EXPONENTS",
     "DECLINE_CLASSES",
     "DEFAULT_BASE_URL",
     "DEFAULT_WEBHOOK_TOLERANCE_SECONDS",
@@ -53,7 +62,10 @@ __all__ = [
     "REVOKE_ERROR_CODES",
     "SESSIONS_PATH",
     "SESSION_REFUSAL_ERROR_CODES",
+    "STOREFRONT_ERROR_CODES",
     "STORED_PAYMENT_METHOD_STATUSES",
+    "TERMINAL_PAYMENT_STATUSES",
+    "UNSUPPORTED_CURRENCIES",
     "VALIDATION_ERROR_CODES",
     "WEBHOOK_SIGNATURE_HEADER",
     "ApiError",
@@ -64,14 +76,20 @@ __all__ = [
     "DeclineClass",
     "DominaiteClient",
     "DominaiteError",
+    "ErrorCode",
     "PaymentStatus",
     "RateLimitError",
     "RevokeError",
+    "StorefrontError",
     "StoredPaymentMethodStatus",
     "TransportError",
     "WebhookVerificationError",
     "__version__",
+    "is_paid",
+    "is_terminal",
+    "order_idempotency_key",
     "sign_request",
     "sign_webhook",
+    "to_minor_units",
     "verify_webhook",
 ]

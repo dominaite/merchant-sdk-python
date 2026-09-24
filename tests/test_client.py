@@ -12,18 +12,26 @@ import urllib.request
 import pytest
 
 from dominaite import (
+    CHARGE_ERROR_CODES,
     DEFAULT_BASE_URL,
     PAYMENT_METHODS_PATH,
     PING_PATH,
+    REVOKE_ERROR_CODES,
+    SESSION_REFUSAL_ERROR_CODES,
     SESSIONS_PATH,
+    STOREFRONT_ERROR_CODES,
+    VALIDATION_ERROR_CODES,
     ApiError,
     AuthenticationError,
     ChargeError,
     CheckoutRefusedError,
     DominaiteClient,
+    ErrorCode,
     RateLimitError,
     RevokeError,
+    StorefrontError,
     TransportError,
+    order_idempotency_key,
     sign_request,
 )
 from dominaite.client import MAX_RESPONSE_BYTES
@@ -31,6 +39,8 @@ from dominaite.client import MAX_RESPONSE_BYTES
 KEY_ID = "dmk_0123456789abcdef0123456789abcdef"
 SECRET = "dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 BASE_URL = "https://api.example.test/payments"
+#: The key a caller builds with order_idempotency_key("checkout", "1042", 2500, "EUR").
+IDEMPOTENCY_KEY = "checkout-1042-2500-EUR"
 TRANSACTION_ID = "11111111-2222-4333-8444-555555555555"
 #: A UUID with hex LETTERS in it, so upper/lower case are actually different strings.
 LETTERED_TRANSACTION_ID = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
@@ -378,6 +388,7 @@ def test_optional_fields_are_omitted_when_not_passed(client, urlopen):
         order_reference="order-1042",
         customer={"firstName": "Ana", "email": "ana@example.com"},
         language="bg",
+        idempotency_key=IDEMPOTENCY_KEY,
     )
 
     body = json.loads(recorder.last.data.decode("utf-8"))
@@ -388,15 +399,109 @@ def test_optional_fields_are_omitted_when_not_passed(client, urlopen):
     assert "description" not in body
 
 
-def test_generates_an_idempotency_key_when_none_is_given(client, urlopen):
+@pytest.mark.parametrize("key", [None, ""], ids=["none", "empty"])
+def test_refuses_a_session_without_an_idempotency_key_before_sending(client, urlopen, key):
+    """No random fallback: a key minted per call gives a reload a second session for
+    the same order. Only the caller can say which payment this is."""
     recorder = urlopen(_ok())
 
-    client.create_checkout_session(amount=2500, currency="EUR", order_reference="o-1")
-    client.create_checkout_session(amount=2500, currency="EUR", order_reference="o-2")
+    with pytest.raises(ValueError, match="idempotency_key is required"):
+        client.create_checkout_session(
+            amount=2500, currency="EUR", order_reference="order-1042", idempotency_key=key
+        )
 
-    first = _headers(recorder.requests[0])["idempotency-key"]
-    second = _headers(recorder.requests[1])["idempotency-key"]
-    assert first and second and first != second
+    assert recorder.requests == []
+
+
+def test_refuses_a_session_when_the_key_is_left_out_entirely(client, urlopen):
+    recorder = urlopen(_ok())
+
+    with pytest.raises(ValueError, match="idempotency_key is required"):
+        client.create_checkout_session(
+            amount=2500, currency="EUR", order_reference="order-1042"
+        )
+
+    assert recorder.requests == []
+
+
+# --- order-derived idempotency keys ------------------------------------------
+
+
+def test_order_key_is_scope_order_amount_and_upper_cased_currency():
+    assert order_idempotency_key("checkout", "1042", 2500, "eur") == "checkout-1042-2500-EUR"
+    assert order_idempotency_key("checkout", 1042, 2500, "EUR") == "checkout-1042-2500-EUR"
+
+
+def test_the_same_order_at_the_same_amount_always_gets_the_same_key():
+    """A reload or back button rebuilds the key from the order, so it has to come out
+    identical, or the replay turns into a second session."""
+    assert order_idempotency_key("checkout", "1042", 2500, "EUR") == order_idempotency_key(
+        "checkout", "1042", 2500, "eur"
+    )
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        ("checkout", "1042", 2400, "EUR"),
+        ("checkout", "1042", 2500, "BGN"),
+        ("checkout", "1043", 2500, "EUR"),
+        ("deposit", "1042", 2500, "EUR"),
+    ],
+    ids=["amount", "currency", "order", "scope"],
+)
+def test_changing_any_part_changes_the_key(changed):
+    assert order_idempotency_key(*changed) != order_idempotency_key("checkout", "1042", 2500, "EUR")
+
+
+def test_the_order_key_is_sent_as_the_idempotency_header(client, urlopen):
+    recorder = urlopen(_ok())
+    key = order_idempotency_key("checkout", "1042", 2500, "EUR")
+
+    client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference="order-1042", idempotency_key=key
+    )
+
+    assert _headers(recorder.last)["idempotency-key"] == "checkout-1042-2500-EUR"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("", "1042", 2500, "EUR"),
+        (None, "1042", 2500, "EUR"),
+        ("checkout", "", 2500, "EUR"),
+        ("checkout", None, 2500, "EUR"),
+        ("checkout", True, 2500, "EUR"),
+        ("checkout", "1042", 25.0, "EUR"),
+        ("checkout", "1042", "2500", "EUR"),
+        ("checkout", "1042", 0, "EUR"),
+        ("checkout", "1042", -2500, "EUR"),
+        ("checkout", "1042", True, "EUR"),
+        ("checkout", "1042", 2500, "EU"),
+        ("checkout", "1042", 2500, "EURO"),
+        ("checkout", "1042", 2500, "E1R"),
+        ("checkout", "1042", 2500, ""),
+        ("checkout", "1042", 2500, None),
+    ],
+    ids=[
+        "empty-scope", "none-scope", "empty-order", "none-order", "bool-order",
+        "float-amount", "string-amount", "zero-amount", "negative-amount", "bool-amount",
+        "short-currency", "long-currency", "digit-currency", "empty-currency", "none-currency",
+    ],
+)
+def test_the_order_key_refuses_bad_parts(args):
+    with pytest.raises(ValueError):
+        order_idempotency_key(*args)
+
+
+@pytest.mark.parametrize(
+    "order_id", ["заказ-1042", "café", "order 1042", "o" * 100], ids=["cyrillic", "latin-1", "space", "too-long"]
+)
+def test_the_order_key_is_held_to_the_same_rules_as_any_key(order_id):
+    """A key the helper builds must be one the client will send."""
+    with pytest.raises(ValueError, match="idempotency_key"):
+        order_idempotency_key("checkout", order_id, 2500, "EUR")
 
 
 # --- amounts -----------------------------------------------------------------
@@ -406,7 +511,10 @@ def test_generates_an_idempotency_key_when_none_is_given(client, urlopen):
 def test_amount_must_be_a_positive_integer_in_minor_units(client, amount):
     with pytest.raises(ValueError, match="MINOR units"):
         client.create_checkout_session(
-            amount=amount, currency="EUR", order_reference="order-1042"
+            amount=amount,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
 
@@ -427,7 +535,10 @@ def test_business_refusal_raises_checkout_refused_with_the_error_code(client, ur
 
     with pytest.raises(CheckoutRefusedError) as caught:
         client.create_checkout_session(
-            amount=2500, currency="EUR", order_reference="order-1042"
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
     assert caught.value.error_code == "PAYMENT_PROCESSING_UNAVAILABLE"
@@ -453,7 +564,10 @@ def test_replay_refusal_carries_the_transaction_id_for_recovery(client, urlopen)
 
     with pytest.raises(CheckoutRefusedError) as caught:
         client.create_checkout_session(
-            amount=2500, currency="EUR", order_reference="order-1042"
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
     assert caught.value.error_code == "DUPLICATE_REQUEST"
@@ -467,7 +581,10 @@ def test_refusal_without_a_transaction_id_leaves_it_none(client, urlopen):
 
     with pytest.raises(CheckoutRefusedError) as caught:
         client.create_checkout_session(
-            amount=2500, currency="EUR", order_reference="order-1042"
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
     assert caught.value.transaction_id is None
@@ -478,7 +595,10 @@ def test_503_raises_transport_not_refusal(client, urlopen):
 
     with pytest.raises(TransportError):
         client.create_checkout_session(
-            amount=2500, currency="EUR", order_reference="order-1042"
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
 
@@ -487,7 +607,10 @@ def test_network_failure_raises_transport(client, urlopen):
 
     with pytest.raises(TransportError):
         client.create_checkout_session(
-            amount=2500, currency="EUR", order_reference="order-1042"
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
 
@@ -500,7 +623,10 @@ def test_401_raises_authentication_with_the_error_code(client, urlopen, code):
 
     with pytest.raises(AuthenticationError) as caught:
         client.create_checkout_session(
-            amount=2500, currency="EUR", order_reference="order-1042"
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
     assert caught.value.error_code == code
@@ -511,7 +637,10 @@ def test_422_key_reuse_raises_api_error_not_transport(client, urlopen):
 
     with pytest.raises(ApiError) as caught:
         client.create_checkout_session(
-            amount=2500, currency="EUR", order_reference="order-1042"
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
     assert caught.value.http_status == 422
@@ -525,7 +654,10 @@ def test_non_json_response_raises_api_error(client, urlopen, monkeypatch):
 
     with pytest.raises(ApiError):
         client.create_checkout_session(
-            amount=2500, currency="EUR", order_reference="order-1042"
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
 
@@ -533,7 +665,10 @@ def test_envelope_wrapped_response_is_unwrapped(client, urlopen):
     urlopen((200, {"success": True, "data": {"success": True, "checkout": CHECKOUT}}))
 
     session = client.create_checkout_session(
-        amount=2500, currency="EUR", order_reference="order-1042"
+        amount=2500,
+        currency="EUR",
+        order_reference="order-1042",
+        idempotency_key=IDEMPOTENCY_KEY,
     )
 
     assert session == CHECKOUT
@@ -551,12 +686,81 @@ def test_retry_helper_reuses_the_same_idempotency_key(client, urlopen):
         order_reference="order-1042",
         max_attempts=2,
         backoff_seconds=0,
+        idempotency_key=IDEMPOTENCY_KEY,
     )
 
     assert session == CHECKOUT
     assert len(recorder.requests) == 2
     keys = {_headers(r)["idempotency-key"] for r in recorder.requests}
     assert len(keys) == 1, "a retry must not mint a new key - that is the double-charge bug"
+
+
+def test_retry_helper_retries_a_503_payment_processing_unavailable_with_the_same_key(
+    client, urlopen
+):
+    """The 503 form of the code (the stored-card route answers this way, and a proxy or
+    a future gateway may do so on create) must be retried, not surfaced on attempt one."""
+    unavailable = {
+        "success": False,
+        "error": {"code": "PAYMENT_PROCESSING_UNAVAILABLE", "message": "Card payments are unavailable right now."},
+    }
+    recorder = urlopen((503, unavailable), (503, unavailable), _ok())
+
+    session = client.create_checkout_session_with_retry(
+        amount=2500,
+        currency="EUR",
+        order_reference="order-1042",
+        idempotency_key=IDEMPOTENCY_KEY,
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+
+    assert session == CHECKOUT
+    assert [_headers(r)["idempotency-key"] for r in recorder.requests] == [IDEMPOTENCY_KEY] * 3
+
+
+def test_retry_helper_retries_a_payment_processing_unavailable_refusal_with_the_same_key(
+    client, urlopen
+):
+    """On create the gateway answers this code as HTTP 200 success=false, and its contract
+    says: retry later with the same key. It is the one refusal the helper retries."""
+    refusal = {
+        "success": False,
+        "errorCode": "PAYMENT_PROCESSING_UNAVAILABLE",
+        "errorMessage": "Card payments are not available right now. Retry later with the same idempotency key.",
+    }
+    recorder = urlopen((200, refusal), _ok())
+
+    session = client.create_checkout_session_with_retry(
+        amount=2500,
+        currency="EUR",
+        order_reference="order-1042",
+        idempotency_key=IDEMPOTENCY_KEY,
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+
+    assert session == CHECKOUT
+    assert [_headers(r)["idempotency-key"] for r in recorder.requests] == [IDEMPOTENCY_KEY] * 2
+
+
+def test_retry_helper_raises_the_payment_processing_refusal_once_attempts_run_out(
+    client, urlopen
+):
+    recorder = urlopen((200, {"success": False, "errorCode": "PAYMENT_PROCESSING_UNAVAILABLE"}))
+
+    with pytest.raises(CheckoutRefusedError) as raised:
+        client.create_checkout_session_with_retry(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
+            max_attempts=3,
+            backoff_seconds=0,
+        )
+
+    assert raised.value.error_code == "PAYMENT_PROCESSING_UNAVAILABLE"
+    assert len(recorder.requests) == 3
 
 
 def test_retry_helper_honours_a_caller_supplied_key(client, urlopen):
@@ -584,6 +788,7 @@ def test_retry_helper_does_not_retry_a_refusal(client, urlopen):
             order_reference="order-1042",
             max_attempts=3,
             backoff_seconds=0,
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
     assert len(recorder.requests) == 1
@@ -599,6 +804,7 @@ def test_retry_helper_does_not_retry_an_auth_failure(client, urlopen):
             order_reference="order-1042",
             max_attempts=3,
             backoff_seconds=0,
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
     assert len(recorder.requests) == 1
@@ -614,12 +820,13 @@ def test_retry_helper_gives_up_and_raises_the_transport_error(client, urlopen):
             order_reference="order-1042",
             max_attempts=3,
             backoff_seconds=0,
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
     assert len(recorder.requests) == 3
 
 
-def test_retry_helper_mints_one_key_for_all_attempts_when_none_is_given(client, urlopen):
+def test_retry_helper_sends_the_one_key_on_every_attempt(client, urlopen):
     recorder = urlopen((503, {}), (503, {}), _ok())
 
     client.create_checkout_session_with_retry(
@@ -628,33 +835,173 @@ def test_retry_helper_mints_one_key_for_all_attempts_when_none_is_given(client, 
         order_reference="order-1042",
         max_attempts=3,
         backoff_seconds=0,
+        idempotency_key=IDEMPOTENCY_KEY,
     )
 
     assert len(recorder.requests) == 3
     keys = {_headers(r)["idempotency-key"] for r in recorder.requests}
-    assert len(keys) == 1
+    assert keys == {IDEMPOTENCY_KEY}
 
 
-def test_retry_helper_treats_an_explicit_none_key_as_omitted(client, urlopen):
-    """An explicit None used to slip past setdefault, so every attempt minted its own key.
+@pytest.mark.parametrize("key", [None, ""], ids=["none", "empty"])
+def test_retry_helper_refuses_to_start_without_a_key(client, urlopen, key):
+    """It used to mint one. Now a missing key fails before the first attempt, like the
+    plain create call, instead of hiding the choice of key from the caller."""
+    recorder = urlopen(_ok())
 
-    That turns one timed-out order into a second real payment, which is the whole thing
-    this helper is for.
-    """
-    recorder = urlopen((503, {}), (503, {}), _ok())
+    with pytest.raises(ValueError, match="idempotency_key is required"):
+        client.create_checkout_session_with_retry(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=key,
+            max_attempts=3,
+            backoff_seconds=0,
+        )
 
-    client.create_checkout_session_with_retry(
-        amount=2500,
-        currency="EUR",
-        order_reference="order-1042",
-        idempotency_key=None,
-        max_attempts=3,
-        backoff_seconds=0,
+    assert recorder.requests == []
+
+
+# --- error codes and storefront refusals --------------------------------------
+
+
+def _storefront_refusal(status, code):
+    # The gateway's error envelope: the code at error.code, like every non-200 failure.
+    return (
+        status,
+        {"success": False, "error": {"code": code, "message": "Storefront refused.", "statusCode": status}},
     )
 
-    assert len(recorder.requests) == 3
-    keys = {_headers(r)["idempotency-key"] for r in recorder.requests}
-    assert len(keys) == 1, "a retry must not mint a new key - that is the double-charge bug"
+
+def test_a_409_storefront_not_whitelisted_is_a_storefront_error_matchable_on_its_code(
+    client, urlopen
+):
+    urlopen(_storefront_refusal(409, "STOREFRONT_NOT_WHITELISTED"))
+
+    with pytest.raises(StorefrontError) as raised:
+        client.create_checkout_session(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
+        )
+
+    assert raised.value.error_code == ErrorCode.STOREFRONT_NOT_WHITELISTED
+    assert raised.value.error_code == "STOREFRONT_NOT_WHITELISTED"
+    assert raised.value.http_status == 409
+    assert str(raised.value) == "Storefront refused."
+
+
+@pytest.mark.parametrize(
+    "status, code",
+    [(409, "STOREFRONT_NOT_WHITELISTED"), (409, "STOREFRONT_INACTIVE"), (400, "STOREFRONT_MISMATCH")],
+)
+def test_every_storefront_code_is_a_storefront_error_and_still_an_api_error(
+    client, urlopen, status, code
+):
+    """Existing ``except ApiError`` handlers must keep catching these."""
+    urlopen(_storefront_refusal(status, code))
+
+    with pytest.raises(ApiError) as raised:
+        client.create_checkout_session(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
+        )
+
+    assert isinstance(raised.value, StorefrontError)
+    assert not isinstance(raised.value, CheckoutRefusedError)
+    assert raised.value.error_code == code
+    assert raised.value.http_status == status
+
+
+def test_other_4xx_codes_stay_a_plain_api_error(client, urlopen):
+    urlopen(_storefront_refusal(400, "IDEMPOTENCY_KEY_REQUIRED"))
+
+    with pytest.raises(ApiError) as raised:
+        client.create_checkout_session(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
+        )
+
+    assert not isinstance(raised.value, StorefrontError)
+
+
+def test_a_storefront_mismatch_on_replay_is_a_refusal_carrying_the_code(client, urlopen):
+    """The replay path answers 200 with success false, not 400."""
+    urlopen(
+        (
+            200,
+            {
+                "success": False,
+                "errorCode": "STOREFRONT_MISMATCH",
+                "errorMessage": "This API key is bound to a different storefront than the request names.",
+            },
+        )
+    )
+
+    with pytest.raises(CheckoutRefusedError) as raised:
+        client.create_checkout_session(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
+        )
+
+    assert raised.value.error_code == ErrorCode.STOREFRONT_MISMATCH
+
+
+def test_the_retry_helper_does_not_retry_a_storefront_refusal(client, urlopen):
+    recorder = urlopen(_storefront_refusal(409, "STOREFRONT_NOT_WHITELISTED"))
+
+    with pytest.raises(StorefrontError):
+        client.create_checkout_session_with_retry(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
+            max_attempts=3,
+            backoff_seconds=0,
+        )
+
+    assert len(recorder.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "STOREFRONT_NOT_WHITELISTED",
+        "STOREFRONT_INACTIVE",
+        "STOREFRONT_MISMATCH",
+        "ALREADY_PROCESSED",
+        "PRIOR_ATTEMPT_FAILED",
+        "DUPLICATE_REQUEST",
+        "PAYMENT_PROCESSING_UNAVAILABLE",
+        "IDEMPOTENCY_KEY_REUSED",
+    ],
+)
+def test_the_checkout_codes_are_named_constants_equal_to_the_wire_string(name):
+    assert getattr(ErrorCode, name) == name
+    assert getattr(ErrorCode, name).value == name
+
+
+def test_every_code_the_sdk_groups_has_a_named_constant():
+    grouped = (
+        SESSION_REFUSAL_ERROR_CODES
+        + VALIDATION_ERROR_CODES
+        + STOREFRONT_ERROR_CODES
+        + CHARGE_ERROR_CODES
+        + REVOKE_ERROR_CODES
+    )
+    assert set(grouped) <= {member.value for member in ErrorCode}
+
+
+def test_storefront_codes_are_not_counted_as_session_refusals():
+    """SESSION_REFUSAL_ERROR_CODES is pinned to the gateway's 200 set; these are 409/400."""
+    assert not set(STOREFRONT_ERROR_CODES) & set(SESSION_REFUSAL_ERROR_CODES)
 
 
 # --- redirects ---------------------------------------------------------------
@@ -716,7 +1063,10 @@ def test_no_3xx_is_ever_accepted_as_a_session(client, monkeypatch, code):
 
     with pytest.raises(ApiError) as caught:
         client.create_checkout_session(
-            amount=2500, currency="EUR", order_reference="order-1042"
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
     assert caught.value.http_status == code
@@ -739,7 +1089,10 @@ def test_followable_redirects_are_refused_by_the_redirect_handler(
 
     with pytest.raises(ApiError) as caught:
         client.create_checkout_session(
-            amount=2500, currency="EUR", order_reference="order-1042"
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
     assert caught.value.error_code == "UNEXPECTED_REDIRECT"
@@ -756,7 +1109,10 @@ def test_undispatched_3xx_is_refused_by_the_success_gate(client, monkeypatch, co
 
     with pytest.raises(ApiError) as caught:
         client.create_checkout_session(
-            amount=2500, currency="EUR", order_reference="order-1042"
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
     assert caught.value.error_code == "UNEXPECTED_STATUS"
@@ -767,7 +1123,10 @@ def test_the_success_gate_does_not_disturb_a_2xx(client, urlopen):
     urlopen((201, {"success": True, "checkout": CHECKOUT}))
 
     session = client.create_checkout_session(
-        amount=2500, currency="EUR", order_reference="order-1042"
+        amount=2500,
+        currency="EUR",
+        order_reference="order-1042",
+        idempotency_key=IDEMPOTENCY_KEY,
     )
 
     assert session == CHECKOUT
@@ -783,6 +1142,7 @@ def test_a_redirect_is_not_retried(client, monkeypatch):
             order_reference="order-1042",
             max_attempts=3,
             backoff_seconds=0,
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
     assert len(sent) == 1
@@ -846,7 +1206,10 @@ def test_a_100_character_cyrillic_order_reference_is_accepted(client, urlopen):
     recorder = urlopen(_ok())
 
     client.create_checkout_session(
-        amount=2500, currency="EUR", order_reference=CYRILLIC_100
+        amount=2500,
+        currency="EUR",
+        order_reference=CYRILLIC_100,
+        idempotency_key=IDEMPOTENCY_KEY,
     )
 
     body = json.loads(recorder.last.data.decode("utf-8"))
@@ -861,21 +1224,25 @@ def test_a_100_character_cyrillic_order_reference_is_accepted(client, urlopen):
 def test_rejects_an_order_reference_past_the_character_limit(client, order_reference):
     with pytest.raises(ValueError, match="order_reference"):
         client.create_checkout_session(
-            amount=2500, currency="EUR", order_reference=order_reference
+            amount=2500,
+            currency="EUR",
+            order_reference=order_reference,
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
 
-def test_a_100_character_cyrillic_idempotency_key_is_accepted(client, urlopen):
+def test_a_100_character_idempotency_key_is_accepted(client, urlopen):
     recorder = urlopen(_ok())
+    key = "k" * 100
 
     client.create_checkout_session(
         amount=2500,
         currency="EUR",
         order_reference="order-1042",
-        idempotency_key=CYRILLIC_100,
+        idempotency_key=key,
     )
 
-    assert _headers(recorder.last)["idempotency-key"] == CYRILLIC_100
+    assert _headers(recorder.last)["idempotency-key"] == key
 
 
 def test_rejects_an_idempotency_key_past_the_character_limit(client):
@@ -884,8 +1251,30 @@ def test_rejects_an_idempotency_key_past_the_character_limit(client):
             amount=2500,
             currency="EUR",
             order_reference="order-1042",
-            idempotency_key="з" * 101,
+            idempotency_key="k" * 101,
         )
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["заказ-1042", "café-1042", "order 1042", " order-1042", "order-1042\n", "order\t1042"],
+    ids=["cyrillic", "latin-1", "inner-space", "leading-space", "newline", "tab"],
+)
+def test_rejects_an_idempotency_key_that_cannot_travel_as_a_header(client, urlopen, key):
+    """The key is an HTTP header and part of the signature. Cyrillic crashes http.client
+    outright, a Latin-1 letter goes out as one byte after being signed as two, and
+    whitespace can be trimmed by anything in between. Refused locally, before sending."""
+    recorder = urlopen(_ok())
+
+    with pytest.raises(ValueError, match="idempotency_key"):
+        client.create_checkout_session(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=key,
+        )
+
+    assert recorder.requests == []
 
 
 # --- rate limiting -----------------------------------------------------------
@@ -902,7 +1291,10 @@ def test_429_raises_rate_limit_error_with_the_retry_after_seconds(client, urlope
 
     with pytest.raises(RateLimitError) as caught:
         client.create_checkout_session(
-            amount=2500, currency="EUR", order_reference="order-1042"
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
     assert caught.value.retry_after_seconds == 30
@@ -930,7 +1322,10 @@ def test_retry_after_seconds_is_none_when_the_api_did_not_give_a_number(
 
     with pytest.raises(RateLimitError) as caught:
         client.create_checkout_session(
-            amount=2500, currency="EUR", order_reference="order-1042"
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
     assert caught.value.retry_after_seconds is None
@@ -957,6 +1352,7 @@ def test_a_rate_limit_is_never_retried_automatically(client, urlopen):
             order_reference="order-1042",
             max_attempts=3,
             backoff_seconds=0,
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
     assert len(recorder.requests) == 1
@@ -977,7 +1373,10 @@ def test_an_oversized_success_body_is_refused_as_a_transport_error(client, urlop
 
     with pytest.raises(TransportError, match="limit"):
         client.create_checkout_session(
-            amount=2500, currency="EUR", order_reference="order-1042"
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
 
@@ -1026,7 +1425,10 @@ def test_the_read_is_bounded_not_merely_checked_afterwards(client, monkeypatch):
 
     with pytest.raises(TransportError, match="limit"):
         client.create_checkout_session(
-            amount=2500, currency="EUR", order_reference="order-1042"
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
         )
 
 
@@ -1038,7 +1440,10 @@ def test_a_body_at_the_limit_is_still_read(client, urlopen):
     urlopen((200, payload.encode("utf-8")))
 
     session = client.create_checkout_session(
-        amount=2500, currency="EUR", order_reference="order-1042"
+        amount=2500,
+        currency="EUR",
+        order_reference="order-1042",
+        idempotency_key=IDEMPOTENCY_KEY,
     )
 
     assert session == CHECKOUT
@@ -1070,7 +1475,10 @@ def test_a_short_reading_stream_is_still_read_to_the_end(client, monkeypatch):
     _patch_opener(monkeypatch, lambda request, timeout=None: _Dribbles())
 
     session = client.create_checkout_session(
-        amount=2500, currency="EUR", order_reference="order-1042"
+        amount=2500,
+        currency="EUR",
+        order_reference="order-1042",
+        idempotency_key=IDEMPOTENCY_KEY,
     )
 
     assert session == CHECKOUT
@@ -1113,7 +1521,8 @@ def test_save_card_is_sent_in_the_session_body_and_nowhere_else(client, urlopen)
     recorder = urlopen(_ok())
 
     client.create_checkout_session(
-        amount=2500, currency="EUR", order_reference="order-1042", save_card=True
+        amount=2500, currency="EUR", order_reference="order-1042", save_card=True,
+        idempotency_key=IDEMPOTENCY_KEY,
     )
 
     request = recorder.last
@@ -1128,7 +1537,7 @@ def test_save_card_is_sent_in_the_session_body_and_nowhere_else(client, urlopen)
 def test_save_card_is_omitted_when_not_passed(client, urlopen):
     recorder = urlopen(_ok())
 
-    client.create_checkout_session(amount=2500, currency="EUR", order_reference="order-1042")
+    client.create_checkout_session(amount=2500, currency="EUR", order_reference="order-1042", idempotency_key=IDEMPOTENCY_KEY)
 
     assert "saveCard" not in json.loads(recorder.last.data)
 
@@ -1179,14 +1588,14 @@ def test_charge_reproduces_the_charge_vector_end_to_end(client, urlopen, monkeyp
     assert b"idempotency" not in request.data.lower()
 
 
-def test_charge_generates_an_idempotency_key_and_sends_description(client, urlopen):
+def test_charge_sends_the_callers_key_and_the_description(client, urlopen):
     recorder = urlopen(_placed())
 
-    _charge(client, idempotency_key=None, description="Monthly plan")
+    _charge(client, description="Monthly plan")
 
     request = recorder.last
     headers = _headers(request)
-    assert len(headers["idempotency-key"]) == 32
+    assert headers["idempotency-key"] == CHARGE_IDEMPOTENCY_KEY
     assert json.loads(request.data) == {
         "amount": 2500, "currency": "EUR", "orderReference": "order-1043",
         "description": "Monthly plan",
@@ -1297,6 +1706,7 @@ def test_a_2xx_without_a_charge_body_is_an_api_error_not_a_half_built_charge(cli
         {"order_reference": ""},
         {"description": 7},
         {"idempotency_key": ""},
+        {"idempotency_key": None},
     ],
 )
 def test_charge_validates_money_params_like_a_session_does(client, urlopen, overrides):
@@ -1315,7 +1725,13 @@ def test_a_payment_method_id_that_would_not_stay_one_path_segment_is_refused(cli
     recorder = urlopen(_placed())
 
     with pytest.raises(ValueError):
-        client.charge_payment_method(bad, amount=2500, currency="EUR", order_reference="o")
+        client.charge_payment_method(
+            bad,
+            amount=2500,
+            currency="EUR",
+            order_reference="o",
+            idempotency_key=CHARGE_IDEMPOTENCY_KEY,
+        )
     with pytest.raises(ValueError):
         client.revoke_payment_method(bad)
 
