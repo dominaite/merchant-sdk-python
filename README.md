@@ -142,6 +142,7 @@ credentials, your clock, your signing, and the dev gateway.
 | `AuthenticationError` + `TIMESTAMP_OUT_OF_RANGE` | Your machine's clock is more than 5 minutes off. |
 | `AuthenticationError` + `IP_NOT_ALLOWED` | The key has an IP allowlist that does not include you. |
 | `CheckoutRefusedError` | You authenticated fine; the gateway declined to open a session. |
+| `StorefrontError` + `STOREFRONT_NOT_WHITELISTED` | Your website's domain is not approved with the payment provider yet. See [Storefront errors](#storefront-errors). |
 | `TransportError` | Wrong base URL, or the service is down. Retry with the same key. |
 
 **5. Render the widget.** Store `session["transactionId"]` against your order, then hand the
@@ -513,6 +514,7 @@ answers `PRIOR_ATTEMPT_FAILED` and the key is spent; reconcile and use a fresh k
 |---|---|---|
 | `AuthenticationError` | Bad credentials, bad signature, clock skew, IP not allowlisted | No - fix config |
 | `CheckoutRefusedError` | The gateway refused to open the session (`error_code`) | Depends on the code |
+| `StorefrontError` | The storefront (website) cannot take payments yet, or the key belongs to another one (`error_code`, `http_status`). Subclass of `ApiError` | No - fix the setup |
 | `ChargeError` | The gateway answered a charge with a code instead of a charge (`error_code`, `http_status`, `charge`, `transaction_id`) | Depends on the code; never with a new key |
 | `RevokeError` | The gateway refused to revoke a stored payment method; nothing changed (`error_code`, `http_status`) | `MERCHANT_API_UNAVAILABLE` only |
 | `ApiError` | Unexpected response, or a 4xx like an unknown transaction id (`http_status`, `error_code`) | No |
@@ -526,6 +528,49 @@ Note the two different failure shapes on the create endpoint. A business refusal
 with `success: false` and raises `CheckoutRefusedError`; input validation is HTTP 400 and raises
 `ApiError` with the code on `error_code` (currently `IDEMPOTENCY_KEY_REQUIRED`, exported as
 `VALIDATION_ERROR_CODES`). Branch on the exception type, never on the HTTP status.
+
+Every code in these tables is also a named constant on `ErrorCode`, a `str` enum, so
+`error.error_code == ErrorCode.ALREADY_PROCESSED` works against the plain string:
+
+```python
+from dominaite import CheckoutRefusedError, ErrorCode
+
+try:
+    session = client.create_checkout_session(...)
+except CheckoutRefusedError as refusal:
+    if refusal.error_code == ErrorCode.ALREADY_PROCESSED:
+        ...  # this order is paid; show the receipt
+```
+
+### Storefront errors
+
+If your merchant account has more than one website (storefront), each session is tied to one of
+them, and the gateway checks that storefront before it opens anything. These refusals are not
+the 200 `success: false` shape: they arrive as `StorefrontError` (a subclass of `ApiError`), with
+the code on `error_code` and the HTTP status on `http_status`. Nothing was created.
+
+| `error_code` | HTTP | Means | What to do |
+|---|---|---|---|
+| `STOREFRONT_NOT_WHITELISTED` | 409 | The storefront's domain is not approved by the payment provider yet. | Nothing in your code. Ask Dominaite support to finish the domain whitelisting, then try again. |
+| `STOREFRONT_INACTIVE` | 409 | The storefront was deactivated or deleted. | Use an API key for an active storefront, or ask support to reactivate it. |
+| `STOREFRONT_MISMATCH` | 400 | The API key is bound to a different storefront than the request names. | Use the key issued for this storefront. |
+
+```python
+from dominaite import ErrorCode, StorefrontError
+
+try:
+    session = client.create_checkout_session(...)
+except StorefrontError as error:
+    if error.error_code == ErrorCode.STOREFRONT_NOT_WHITELISTED:
+        alert_ops("checkout blocked: domain not whitelisted yet")
+    raise
+```
+
+An idempotency key first used on another storefront is also refused with
+`STOREFRONT_MISMATCH`, but in the 200 shape, so that one is a `CheckoutRefusedError`. Match on
+`error_code` if you want to handle both. The codes are exported as `STOREFRONT_ERROR_CODES`.
+
+### Webhook verification codes
 
 `WebhookVerificationError.error_code` is one of `MALFORMED_SIGNATURE` (wrong header, or a proxy
 rewrote it), `INVALID_SIGNATURE` (wrong secret, modified body, or you passed a re-serialized

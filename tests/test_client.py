@@ -12,17 +12,24 @@ import urllib.request
 import pytest
 
 from dominaite import (
+    CHARGE_ERROR_CODES,
     DEFAULT_BASE_URL,
     PAYMENT_METHODS_PATH,
     PING_PATH,
+    REVOKE_ERROR_CODES,
+    SESSION_REFUSAL_ERROR_CODES,
     SESSIONS_PATH,
+    STOREFRONT_ERROR_CODES,
+    VALIDATION_ERROR_CODES,
     ApiError,
     AuthenticationError,
     ChargeError,
     CheckoutRefusedError,
     DominaiteClient,
+    ErrorCode,
     RateLimitError,
     RevokeError,
+    StorefrontError,
     TransportError,
     order_idempotency_key,
     sign_request,
@@ -785,6 +792,148 @@ def test_retry_helper_refuses_to_start_without_a_key(client, urlopen, key):
         )
 
     assert recorder.requests == []
+
+
+# --- error codes and storefront refusals --------------------------------------
+
+
+def _storefront_refusal(status, code):
+    # The gateway's error envelope: the code at error.code, like every non-200 failure.
+    return (
+        status,
+        {"success": False, "error": {"code": code, "message": "Storefront refused.", "statusCode": status}},
+    )
+
+
+def test_a_409_storefront_not_whitelisted_is_a_storefront_error_matchable_on_its_code(
+    client, urlopen
+):
+    urlopen(_storefront_refusal(409, "STOREFRONT_NOT_WHITELISTED"))
+
+    with pytest.raises(StorefrontError) as raised:
+        client.create_checkout_session(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
+        )
+
+    assert raised.value.error_code == ErrorCode.STOREFRONT_NOT_WHITELISTED
+    assert raised.value.error_code == "STOREFRONT_NOT_WHITELISTED"
+    assert raised.value.http_status == 409
+    assert str(raised.value) == "Storefront refused."
+
+
+@pytest.mark.parametrize(
+    "status, code",
+    [(409, "STOREFRONT_NOT_WHITELISTED"), (409, "STOREFRONT_INACTIVE"), (400, "STOREFRONT_MISMATCH")],
+)
+def test_every_storefront_code_is_a_storefront_error_and_still_an_api_error(
+    client, urlopen, status, code
+):
+    """Existing ``except ApiError`` handlers must keep catching these."""
+    urlopen(_storefront_refusal(status, code))
+
+    with pytest.raises(ApiError) as raised:
+        client.create_checkout_session(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
+        )
+
+    assert isinstance(raised.value, StorefrontError)
+    assert not isinstance(raised.value, CheckoutRefusedError)
+    assert raised.value.error_code == code
+    assert raised.value.http_status == status
+
+
+def test_other_4xx_codes_stay_a_plain_api_error(client, urlopen):
+    urlopen(_storefront_refusal(400, "IDEMPOTENCY_KEY_REQUIRED"))
+
+    with pytest.raises(ApiError) as raised:
+        client.create_checkout_session(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
+        )
+
+    assert not isinstance(raised.value, StorefrontError)
+
+
+def test_a_storefront_mismatch_on_replay_is_a_refusal_carrying_the_code(client, urlopen):
+    """The replay path answers 200 with success false, not 400."""
+    urlopen(
+        (
+            200,
+            {
+                "success": False,
+                "errorCode": "STOREFRONT_MISMATCH",
+                "errorMessage": "This API key is bound to a different storefront than the request names.",
+            },
+        )
+    )
+
+    with pytest.raises(CheckoutRefusedError) as raised:
+        client.create_checkout_session(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
+        )
+
+    assert raised.value.error_code == ErrorCode.STOREFRONT_MISMATCH
+
+
+def test_the_retry_helper_does_not_retry_a_storefront_refusal(client, urlopen):
+    recorder = urlopen(_storefront_refusal(409, "STOREFRONT_NOT_WHITELISTED"))
+
+    with pytest.raises(StorefrontError):
+        client.create_checkout_session_with_retry(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
+            max_attempts=3,
+            backoff_seconds=0,
+        )
+
+    assert len(recorder.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "STOREFRONT_NOT_WHITELISTED",
+        "STOREFRONT_INACTIVE",
+        "STOREFRONT_MISMATCH",
+        "ALREADY_PROCESSED",
+        "PRIOR_ATTEMPT_FAILED",
+        "DUPLICATE_REQUEST",
+        "PAYMENT_PROCESSING_UNAVAILABLE",
+        "IDEMPOTENCY_KEY_REUSED",
+    ],
+)
+def test_the_checkout_codes_are_named_constants_equal_to_the_wire_string(name):
+    assert getattr(ErrorCode, name) == name
+    assert getattr(ErrorCode, name).value == name
+
+
+def test_every_code_the_sdk_groups_has_a_named_constant():
+    grouped = (
+        SESSION_REFUSAL_ERROR_CODES
+        + VALIDATION_ERROR_CODES
+        + STOREFRONT_ERROR_CODES
+        + CHARGE_ERROR_CODES
+        + REVOKE_ERROR_CODES
+    )
+    assert set(grouped) <= {member.value for member in ErrorCode}
+
+
+def test_storefront_codes_are_not_counted_as_session_refusals():
+    """SESSION_REFUSAL_ERROR_CODES is pinned to the gateway's 200 set; these are 409/400."""
+    assert not set(STOREFRONT_ERROR_CODES) & set(SESSION_REFUSAL_ERROR_CODES)
 
 
 # --- redirects ---------------------------------------------------------------

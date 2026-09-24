@@ -11,6 +11,7 @@ import urllib.request
 from typing import Any, Dict, Mapping, NamedTuple, Optional, Union
 
 from .exceptions import (
+    STOREFRONT_ERROR_CODES,
     ApiError,
     AuthenticationError,
     ChargeError,
@@ -18,6 +19,7 @@ from .exceptions import (
     DominaiteError,
     RateLimitError,
     RevokeError,
+    StorefrontError,
     TransportError,
 )
 
@@ -887,7 +889,10 @@ def _rejection(reply: _Reply) -> DominaiteError:
     # at error.code, not as a success=false refusal. Carry it through instead of
     # flattening every 4xx into a bare message.
     error_code = reply.payload.get("errorCode") or reply.error.get("code")
-    return ApiError(
+    # Storefront refusals get their own type so a caller can catch them apart from a
+    # malformed request; still an ApiError underneath.
+    error_type = StorefrontError if error_code in STOREFRONT_ERROR_CODES else ApiError
+    return error_type(
         reply.status,
         str(
             reply.payload.get("errorMessage")
