@@ -24,7 +24,7 @@ from .exceptions import (
     TransportError,
 )
 
-__version__ = "1.0.0"
+__version__ = "0.3.0"
 
 DEFAULT_BASE_URL = "https://api.dominaite.com/payments"
 SESSIONS_PATH = "/merchant-api/checkout/sessions"
