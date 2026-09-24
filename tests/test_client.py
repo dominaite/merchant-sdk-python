@@ -695,6 +695,74 @@ def test_retry_helper_reuses_the_same_idempotency_key(client, urlopen):
     assert len(keys) == 1, "a retry must not mint a new key - that is the double-charge bug"
 
 
+def test_retry_helper_retries_a_503_payment_processing_unavailable_with_the_same_key(
+    client, urlopen
+):
+    """The 503 form of the code (the stored-card route answers this way, and a proxy or
+    a future gateway may do so on create) must be retried, not surfaced on attempt one."""
+    unavailable = {
+        "success": False,
+        "error": {"code": "PAYMENT_PROCESSING_UNAVAILABLE", "message": "Card payments are unavailable right now."},
+    }
+    recorder = urlopen((503, unavailable), (503, unavailable), _ok())
+
+    session = client.create_checkout_session_with_retry(
+        amount=2500,
+        currency="EUR",
+        order_reference="order-1042",
+        idempotency_key=IDEMPOTENCY_KEY,
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+
+    assert session == CHECKOUT
+    assert [_headers(r)["idempotency-key"] for r in recorder.requests] == [IDEMPOTENCY_KEY] * 3
+
+
+def test_retry_helper_retries_a_payment_processing_unavailable_refusal_with_the_same_key(
+    client, urlopen
+):
+    """On create the gateway answers this code as HTTP 200 success=false, and its contract
+    says: retry later with the same key. It is the one refusal the helper retries."""
+    refusal = {
+        "success": False,
+        "errorCode": "PAYMENT_PROCESSING_UNAVAILABLE",
+        "errorMessage": "Card payments are not available right now. Retry later with the same idempotency key.",
+    }
+    recorder = urlopen((200, refusal), _ok())
+
+    session = client.create_checkout_session_with_retry(
+        amount=2500,
+        currency="EUR",
+        order_reference="order-1042",
+        idempotency_key=IDEMPOTENCY_KEY,
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+
+    assert session == CHECKOUT
+    assert [_headers(r)["idempotency-key"] for r in recorder.requests] == [IDEMPOTENCY_KEY] * 2
+
+
+def test_retry_helper_raises_the_payment_processing_refusal_once_attempts_run_out(
+    client, urlopen
+):
+    recorder = urlopen((200, {"success": False, "errorCode": "PAYMENT_PROCESSING_UNAVAILABLE"}))
+
+    with pytest.raises(CheckoutRefusedError) as raised:
+        client.create_checkout_session_with_retry(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
+            max_attempts=3,
+            backoff_seconds=0,
+        )
+
+    assert raised.value.error_code == "PAYMENT_PROCESSING_UNAVAILABLE"
+    assert len(recorder.requests) == 3
+
+
 def test_retry_helper_honours_a_caller_supplied_key(client, urlopen):
     recorder = urlopen((503, {}), _ok())
 

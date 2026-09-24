@@ -248,9 +248,13 @@ session = client.create_checkout_session_with_retry(
 )
 ```
 
-It retries only `TransportError` (network failures, 5xx, `MERCHANT_API_UNAVAILABLE`), sends your
-one key on every attempt, and backs off between them. Refusals, authentication failures and
-rate limits are raised immediately.
+It retries `TransportError` (network failures, any 5xx, including a 503 carrying
+`MERCHANT_API_UNAVAILABLE` or `PAYMENT_PROCESSING_UNAVAILABLE`) and the
+`PAYMENT_PROCESSING_UNAVAILABLE` refusal (card payments briefly off, nothing charged). It sends
+your one key on every attempt and backs off between them. Every other refusal, storefront
+errors, authentication failures and rate limits are raised immediately. If processing stays
+unavailable past the last attempt you get the `CheckoutRefusedError`; retry later with the
+same key, and give up after about fifteen minutes.
 
 ## Sessions expire
 

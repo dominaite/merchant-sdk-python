@@ -17,6 +17,7 @@ from .exceptions import (
     ChargeError,
     CheckoutRefusedError,
     DominaiteError,
+    ErrorCode,
     RateLimitError,
     RevokeError,
     StorefrontError,
@@ -514,21 +515,26 @@ class DominaiteClient:
         backoff_seconds: float = 0.5,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Create a session, retrying transport failures with the SAME idempotency key.
+        """Create a session, retrying transient failures with the SAME idempotency key.
 
-        A ``TransportError`` (network blip, 5xx, ``MERCHANT_API_UNAVAILABLE``) leaves you
-        not knowing whether the request landed. Reusing the key is what makes the retry
+        Two things are retried. A ``TransportError`` (network blip, 5xx, including a 503
+        carrying ``MERCHANT_API_UNAVAILABLE`` or ``PAYMENT_PROCESSING_UNAVAILABLE``) leaves
+        you not knowing whether the request landed. A ``PAYMENT_PROCESSING_UNAVAILABLE``
+        refusal means card payments are briefly off and nothing was charged; the API
+        contract marks it retryable with the same key. Reusing the key is what makes the retry
         safe: if the first attempt did land, the server answers the retry from that
         attempt instead of opening a second session. Generating a fresh key here would be
         the double-charge bug this method exists to prevent.
 
         While the first session is still open, the retry returns that same session.
-        Otherwise it arrives as a :class:`CheckoutRefusedError` with a replay code (``DUPLICATE_REQUEST``,
-        ``ALREADY_PROCESSED``, ``PRIOR_ATTEMPT_FAILED``, ``IDEMPOTENCY_KEY_REUSED``) and
-        no cashier fields. When the refusal names a ``transaction_id``, read it with
-        :meth:`get_status` to find out what the earlier attempt did.
+        Otherwise it arrives as a :class:`CheckoutRefusedError` with a replay code
+        (``DUPLICATE_REQUEST``, ``ALREADY_PROCESSED``, ``PRIOR_ATTEMPT_FAILED``,
+        ``IDEMPOTENCY_KEY_REUSED``) and no cashier fields. When the refusal names a
+        ``transaction_id``, read it with :meth:`get_status` to find out what the earlier
+        attempt did.
 
-        Refusals and authentication failures are raised immediately - retrying them just
+        Every other refusal, storefront errors and authentication failures are raised
+        immediately - retrying them just
         burns time. So is a :class:`RateLimitError`: the API has just told us it is
         already seeing too much from this key, and answering that with more traffic on a
         half-second backoff is how a spike becomes a lockout. Catch it and wait out
@@ -552,9 +558,17 @@ class DominaiteClient:
             except TransportError:
                 if attempt == max_attempts:
                     raise
-                if delay > 0:
-                    time.sleep(delay)
-                delay *= 2
+            except CheckoutRefusedError as refusal:
+                # The one refusal that is transient: processing is off for a moment,
+                # nothing was charged, and the gateway asks for the same key again.
+                if (
+                    refusal.error_code != ErrorCode.PAYMENT_PROCESSING_UNAVAILABLE
+                    or attempt == max_attempts
+                ):
+                    raise
+            if delay > 0:
+                time.sleep(delay)
+            delay *= 2
 
         raise AssertionError("unreachable")
 
