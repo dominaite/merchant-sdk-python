@@ -436,7 +436,8 @@ class DominaiteClient:
     ) -> Dict[str, Any]:
         """Create a hosted checkout session for one payment.
 
-        :param amount: Integer in MINOR units (2500 = 25.00 EUR). Never a float.
+        :param amount: Integer in MINOR units (2500 = 25.00 EUR, but 2500 JPY). Never a
+            float; :func:`to_minor_units` converts a decimal price exactly.
         :param currency: ISO 4217 code.
         :param order_reference: Your own order id, 100 chars or fewer.
         :param customer: ``{"firstName", "lastName", "email", "phone"}``. Pass everything
