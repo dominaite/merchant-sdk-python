@@ -1,6 +1,6 @@
 """Server-side Python client for the Dominaite merchant API."""
 
-from .amounts import CURRENCY_EXPONENTS, to_minor_units
+from .amounts import CURRENCY_EXPONENTS, UNSUPPORTED_CURRENCIES, to_minor_units
 from .client import (
     DEFAULT_BASE_URL,
     PAYMENT_METHODS_PATH,
@@ -65,6 +65,7 @@ __all__ = [
     "STOREFRONT_ERROR_CODES",
     "STORED_PAYMENT_METHOD_STATUSES",
     "TERMINAL_PAYMENT_STATUSES",
+    "UNSUPPORTED_CURRENCIES",
     "VALIDATION_ERROR_CODES",
     "WEBHOOK_SIGNATURE_HEADER",
     "ApiError",

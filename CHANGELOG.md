@@ -23,8 +23,9 @@ same amount then replays the same session, and a changed amount gets a new one.
 
 - `order_idempotency_key(scope, order_id, amount_minor, currency)` builds
   `{scope}-{order_id}-{amount_minor}-{CURRENCY}`.
-- `to_minor_units(amount, currency)` converts a decimal string or `Decimal` by ISO 4217 exponent,
-  with `CURRENCY_EXPONENTS`.
+- `to_minor_units(amount, currency)` converts a decimal string or `Decimal` using the gateway's
+  decimals per currency (`CURRENCY_EXPONENTS`). HUF is 0 decimals there, unlike ISO 4217.
+  ISK, KRW, OMR, JOD and TND raise (`UNSUPPORTED_CURRENCIES`).
 - `is_paid`, `is_terminal` and `TERMINAL_PAYMENT_STATUSES`.
 - `ErrorCode` enum, `STOREFRONT_ERROR_CODES` and `StorefrontError` for
   `STOREFRONT_NOT_WHITELISTED` (409), `STOREFRONT_INACTIVE` (409) and `STOREFRONT_MISMATCH` (400).

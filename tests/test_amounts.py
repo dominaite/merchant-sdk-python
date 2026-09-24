@@ -1,10 +1,10 @@
-"""Contract tests for to_minor_units: exact conversion by ISO 4217 exponent, no guessing."""
+"""Contract tests for to_minor_units: exact conversion by the gateway's decimals, no guessing."""
 
 from decimal import Decimal
 
 import pytest
 
-from dominaite import CURRENCY_EXPONENTS, to_minor_units
+from dominaite import CURRENCY_EXPONENTS, UNSUPPORTED_CURRENCIES, to_minor_units
 
 
 @pytest.mark.parametrize(
@@ -16,12 +16,12 @@ from dominaite import CURRENCY_EXPONENTS, to_minor_units
         ("0.01", "USD", 1),
         ("0", "GBP", 0),
         ("1234.56", "BGN", 123456),
+        ("19.99", "CAD", 1999),
+        ("19.99", "AUD", 1999),
         ("2500", "JPY", 2500),
-        ("2500", "KRW", 2500),
-        ("99", "ISK", 99),
+        ("2500", "HUF", 2500),
         ("2.5", "BHD", 2500),
         ("1.234", "KWD", 1234),
-        ("0.001", "TND", 1),
     ],
 )
 def test_converts_by_the_currency_exponent(amount, currency, minor):
@@ -52,6 +52,7 @@ def test_currency_is_case_insensitive():
         ("25.000", "EUR"),
         ("100.5", "JPY"),
         ("100.0", "JPY"),
+        ("25.50", "HUF"),
         ("1.2345", "BHD"),
         (Decimal("25.001"), "EUR"),
     ],
@@ -88,14 +89,30 @@ def test_refuses_malformed_or_negative_amounts(amount):
         to_minor_units(amount, "EUR")
 
 
-def test_the_exponent_table_covers_the_documented_currencies():
-    two = ["EUR", "USD", "GBP", "BGN", "RON", "CHF", "PLN", "CZK", "HUF", "SEK", "DKK", "NOK"]
-    assert {code: CURRENCY_EXPONENTS[code] for code in two} == dict.fromkeys(two, 2)
-    assert {code: CURRENCY_EXPONENTS[code] for code in ["JPY", "KRW", "ISK"]} == dict.fromkeys(
-        ["JPY", "KRW", "ISK"], 0
-    )
-    three = ["BHD", "KWD", "OMR", "JOD", "TND"]
-    assert {code: CURRENCY_EXPONENTS[code] for code in three} == dict.fromkeys(three, 3)
+def test_the_exponent_table_is_the_gateway_registry():
+    """Exact: a currency added, dropped or moved must be a deliberate change here."""
+    two = ["EUR", "USD", "GBP", "CAD", "AUD", "CHF", "BGN", "RON", "PLN", "CZK", "SEK", "DKK", "NOK"]
+    expected = dict.fromkeys(two, 2)
+    expected.update({"JPY": 0, "HUF": 0, "BHD": 3, "KWD": 3})
+    assert dict(CURRENCY_EXPONENTS) == expected
+
+
+def test_huf_is_whole_forints_not_the_iso_two_decimals():
+    """ISO 4217 says 2, the gateway says 0. Following ISO would charge 100x too much."""
+    assert to_minor_units("2500", "HUF") == 2500
+    with pytest.raises(ValueError, match="decimal places"):
+        to_minor_units("2500.00", "HUF")
+
+
+@pytest.mark.parametrize("currency", ["ISK", "KRW", "OMR", "JOD", "TND", "krw"])
+def test_currencies_where_iso_and_the_gateway_disagree_are_refused(currency):
+    with pytest.raises(ValueError, match="not supported"):
+        to_minor_units("100", currency)
+
+
+def test_unsupported_currencies_have_no_exponent_on_record():
+    assert set(UNSUPPORTED_CURRENCIES) == {"ISK", "KRW", "OMR", "JOD", "TND"}
+    assert not set(UNSUPPORTED_CURRENCIES) & set(CURRENCY_EXPONENTS)
 
 
 def test_the_exponent_table_cannot_be_edited_at_runtime():

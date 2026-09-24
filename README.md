@@ -172,13 +172,20 @@ bound to your checkout by Dominaite during onboarding.
 string raises `ValueError` before anything is sent. The amount is locked server-side - what you
 pass here is what gets charged; nothing in the browser can change it.
 
-Not every currency has two decimals. The minor unit is set by the currency's ISO 4217 exponent:
+Not every currency has two decimals. The minor unit is set by the gateway's currency registry,
+which mostly matches ISO 4217 but not always:
 
-| Exponent | Currencies | `2500` means |
+| Decimals | Currencies | `2500` means |
 |---|---|---|
-| 2 | EUR, USD, GBP, BGN, RON, CHF, PLN, CZK, HUF, SEK, DKK, NOK | 25.00 |
-| 0 | JPY, KRW, ISK | 2500 |
-| 3 | BHD, KWD, OMR, JOD, TND | 2.500 |
+| 2 | EUR, USD, GBP, CAD, AUD, CHF, BGN, RON, PLN, CZK, SEK, DKK, NOK | 25.00 |
+| 0 | JPY, HUF | 2500 |
+| 3 | BHD, KWD | 2.500 |
+
+**HUF is whole forints.** ISO 4217 gives HUF two decimals, the gateway uses none: `2500` HUF is
+2500 Ft. Sending `250000` for 2500 Ft would charge 100 times too much.
+
+ISK, KRW, OMR, JOD and TND are not supported: ISO and the gateway disagree on their decimals, so
+`to_minor_units` raises for them rather than produce an amount that is off by 10x or 100x.
 
 `to_minor_units` converts a price for you, without float math:
 
@@ -189,6 +196,7 @@ from dominaite import to_minor_units
 
 to_minor_units("25.00", "EUR")            # 2500
 to_minor_units("2500", "JPY")             # 2500
+to_minor_units("2500", "HUF")             # 2500, whole forints
 to_minor_units("2.5", "BHD")              # 2500
 to_minor_units(Decimal("0.30"), "EUR")    # 30, where 0.1 + 0.2 as floats is 0.30000000000000004
 ```
@@ -196,7 +204,8 @@ to_minor_units(Decimal("0.30"), "EUR")    # 30, where 0.1 + 0.2 as floats is 0.3
 It takes a decimal string or a `Decimal`, never a float. It rounds nothing: more decimal places
 than the currency has (`"25.001"` EUR, `"100.5"` JPY, and also `"25.000"` EUR) raises
 `ValueError`, so quantize values from a wider column first. A currency it does not know raises
-too, instead of assuming two decimals; the known ones are in `CURRENCY_EXPONENTS`.
+too, instead of assuming two decimals; the known ones are in `CURRENCY_EXPONENTS` and the
+refused ones in `UNSUPPORTED_CURRENCIES`.
 
 ## Retries and double-charges
 
