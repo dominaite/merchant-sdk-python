@@ -503,6 +503,22 @@ awaiting capture. Never treat it as an abandoned order.
 Treat any status you do not recognise as still-open as well: a value the API adds later should
 make you keep polling, never silently close an order that is still live.
 
+Two helpers encode those rules so you do not have to:
+
+```python
+from dominaite import is_paid, is_terminal
+
+status = client.get_status(transaction_id)["status"]
+if is_paid(status):        # succeeded, and nothing else
+    ship(order)
+elif is_terminal(status):  # failed, cancelled, abandoned, refunded, partially_refunded
+    close(order)
+# else: pending, processing, requires_capture, disputed or unknown - keep the order open
+```
+
+`is_terminal` is also True for `succeeded`, so check `is_paid` first. The terminal set is
+exported as `TERMINAL_PAYMENT_STATUSES`.
+
 Poll after the payer returns to you, or on your order timeout - not in a tight loop; the
 endpoint is rate limited per key.
 
