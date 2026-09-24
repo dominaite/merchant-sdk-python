@@ -4,12 +4,11 @@ import hashlib
 import hmac
 import json
 import re
-import secrets
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, Mapping, NamedTuple, Optional
+from typing import Any, Dict, Mapping, NamedTuple, Optional, Union
 
 from .exceptions import (
     ApiError,
@@ -246,7 +245,15 @@ def _validate_money_params(amount: Any, currency: Any, order_reference: Any) -> 
 
 
 def _normalize_idempotency_key(idempotency_key: Optional[str]) -> str:
-    key = idempotency_key if idempotency_key is not None else secrets.token_hex(16)
+    # Required, and never minted here. A random key per call is the double-payment bug:
+    # the customer who reloads or presses back gets a second session for the same order.
+    # Only the caller knows what "the same payment" is, so only the caller can name it.
+    if idempotency_key is None or idempotency_key == "":
+        raise ValueError(
+            "idempotency_key is required. Derive it from the order, e.g. "
+            "order_idempotency_key('checkout', order_id, amount, currency)"
+        )
+    key = idempotency_key
     if (
         not isinstance(key, str)
         or len(key) > MAX_IDEMPOTENCY_KEY_LENGTH
@@ -257,6 +264,49 @@ def _normalize_idempotency_key(idempotency_key: Optional[str]) -> str:
             "no accented or non-Latin letters)".format(MAX_IDEMPOTENCY_KEY_LENGTH)
         )
     return key
+
+
+def order_idempotency_key(
+    scope: str, order_id: Union[str, int], amount_minor: int, currency: str
+) -> str:
+    """Build an idempotency key from the order it pays for.
+
+    Returns ``"{scope}-{order_id}-{amount_minor}-{CURRENCY}"``, e.g.
+    ``order_idempotency_key("checkout", "1042", 2500, "eur")`` is
+    ``"checkout-1042-2500-EUR"``.
+
+    Why derive it instead of generating one: the same order at the same amount always
+    yields the same key, so a reload, a back button or a retry after a timeout replays
+    the session the customer already has instead of opening a second one. When the
+    amount or currency changes (a coupon, an edited basket), the key changes with it and
+    the gateway opens a fresh session, rather than refusing the new amount with
+    ``IDEMPOTENCY_KEY_REUSED``.
+
+    :param scope: A fixed label for the kind of payment, so keys for different flows on
+        the same order cannot collide (``"checkout"``, ``"deposit"``, ``"sub-2026-10"``).
+    :param order_id: Your order id. ASCII only: the key is an HTTP header.
+    :param amount_minor: The amount in MINOR units, the same integer you send as
+        ``amount``.
+    :param currency: ISO 4217 code; upper-cased for you.
+    :raises ValueError: An empty part, a non-integer amount, a currency that is not
+        three letters, or a result the API would refuse as a key (over 100 characters,
+        or anything outside visible ASCII).
+    """
+    if not isinstance(scope, str) or not scope:
+        raise ValueError("scope must be a non-empty string")
+    # bool is an int; str(True) would put "True" in the key.
+    if isinstance(order_id, bool) or not isinstance(order_id, (str, int)) or order_id == "":
+        raise ValueError("order_id must be a non-empty string or an integer")
+    if isinstance(amount_minor, bool) or not isinstance(amount_minor, int) or amount_minor <= 0:
+        raise ValueError(
+            "amount_minor must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)"
+        )
+    code = currency.upper() if isinstance(currency, str) else ""
+    if not re.fullmatch(r"[A-Z]{3}", code):
+        raise ValueError("currency must be a three-letter ISO 4217 code")
+    return _normalize_idempotency_key(
+        "{0}-{1}-{2}-{3}".format(scope, order_id, amount_minor, code)
+    )
 
 
 def _normalize_payment_method_id(payment_method_id: Any) -> str:
@@ -309,6 +359,7 @@ class DominaiteClient:
             currency="EUR",
             order_reference="order-1042",
             customer={"firstName": "Ana", "lastName": "K", "email": "ana@example.com"},
+            idempotency_key=order_idempotency_key("checkout", "1042", 2500, "EUR"),
         )
         # Hand session["cashierKey"] + session["cashierToken"] to the embed snippet.
     """
@@ -393,8 +444,10 @@ class DominaiteClient:
         :param language: ISO 639-1, the widget UI language.
         :param theme: ``light``, ``dark``, or ``bright``.
         :param description: Free-text description shown on the checkout.
-        :param idempotency_key: Auto-generated when omitted. Retrying with the same key
-            never creates a second payment.
+        :param idempotency_key: Required. Build it with :func:`order_idempotency_key` so
+            a reload or retry of the same order replays the same session; retrying with
+            the same key never creates a second payment. Omitting it raises
+            ``ValueError`` before anything is sent.
         :param save_card: Ask the gateway to keep the card on file once this payment is
             approved, so you can charge it again with :meth:`charge_payment_method`.
             The stored method shows up as ``storedPaymentMethod`` on :meth:`get_status` after
@@ -403,6 +456,8 @@ class DominaiteClient:
         :returns: ``{"transactionId", "orderId", "cashierKey", "cashierToken", "amount",
             "currency", "expiresAt"}``.
 
+        :raises ValueError: A missing ``idempotency_key`` or another invalid argument,
+            before any request is made.
         :raises AuthenticationError: Wrong/revoked credentials or bad signature
             (fix config; do not retry).
         :raises CheckoutRefusedError: The gateway refused the session (inspect
@@ -460,16 +515,15 @@ class DominaiteClient:
 
         A ``TransportError`` (network blip, 5xx, ``MERCHANT_API_UNAVAILABLE``) leaves you
         not knowing whether the request landed. Reusing the key is what makes the retry
-        safe: if the first attempt did land, the server refuses the retry instead of
-        opening a second session. Generating a fresh key here would be the double-charge
-        bug this method exists to prevent.
+        safe: if the first attempt did land, the server answers the retry from that
+        attempt instead of opening a second session. Generating a fresh key here would be
+        the double-charge bug this method exists to prevent.
 
-        The refusal does NOT hand back the original session. It arrives as a
-        :class:`CheckoutRefusedError` with a replay code (``DUPLICATE_REQUEST``,
+        While the first session is still open, the retry returns that same session.
+        Otherwise it arrives as a :class:`CheckoutRefusedError` with a replay code (``DUPLICATE_REQUEST``,
         ``ALREADY_PROCESSED``, ``PRIOR_ATTEMPT_FAILED``, ``IDEMPOTENCY_KEY_REUSED``) and
-        no cashier fields, so there is nothing to hand the embed snippet. When the
-        refusal names a ``transaction_id``, read it with :meth:`get_status` to find out
-        what the earlier attempt did.
+        no cashier fields. When the refusal names a ``transaction_id``, read it with
+        :meth:`get_status` to find out what the earlier attempt did.
 
         Refusals and authentication failures are raised immediately - retrying them just
         burns time. So is a :class:`RateLimitError`: the API has just told us it is
@@ -479,16 +533,14 @@ class DominaiteClient:
 
         :param max_attempts: Total attempts including the first one.
         :param backoff_seconds: Base delay; doubles after each failed attempt.
-        :param kwargs: Passed straight to :meth:`create_checkout_session`.
+        :param kwargs: Passed straight to :meth:`create_checkout_session`, including the
+            required ``idempotency_key``, which every attempt reuses.
         """
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
-
-        # Minted once, here, for every attempt. setdefault() would leave an explicit
-        # None in place and let each attempt generate its own key downstream, which is
-        # exactly the second payment this method exists to prevent.
-        if kwargs.get("idempotency_key") is None:
-            kwargs["idempotency_key"] = secrets.token_hex(16)
+        # Checked up front so a missing key fails before the first attempt, never after
+        # a retry has already been spent.
+        kwargs["idempotency_key"] = _normalize_idempotency_key(kwargs.get("idempotency_key"))
 
         delay = backoff_seconds
         for attempt in range(1, max_attempts + 1):
@@ -566,9 +618,9 @@ class DominaiteClient:
     ) -> Dict[str, Any]:
         """Charge a card kept on file, off-session: no widget, no payer present.
 
-        The charge is signed like a session and carries an ``Idempotency-Key``
-        (auto-generated unless you pass one), so retrying after a timeout WITH THE SAME
-        KEY never charges the card twice: the gateway replays its first answer.
+        The charge is signed like a session and carries the ``Idempotency-Key`` you
+        pass, so retrying after a timeout WITH THE SAME KEY never charges the card twice:
+        the gateway replays its first answer.
 
         A decline is not an exception: the gateway answers HTTP 402 and this returns a
         charge with ``status`` ``failed`` plus a ``declineClass`` telling you whether
@@ -583,8 +635,10 @@ class DominaiteClient:
         :param currency: ISO 4217 code.
         :param order_reference: Your own order id, 100 chars or fewer.
         :param description: Free-text description for your dashboard.
-        :param idempotency_key: Auto-generated when omitted. Derive it from the billing
-            period, never mint one per attempt.
+        :param idempotency_key: Required. Derive it from the billing period, e.g.
+            ``order_idempotency_key("sub-2026-10", "8817", 2500, "EUR")``, never
+            mint one per attempt. Omitting it raises ``ValueError`` before anything is
+            sent.
         :returns: ``{"chargeId", "status", "declineClass", "declineCode",
             "transactionId"}``. ``status`` is ``succeeded``, ``pending`` or
             ``cancelled`` on a 201 (200 on a replay) and ``failed`` on a 402;

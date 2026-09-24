@@ -85,7 +85,12 @@ is your warning to fix NTP before payments break.
 ```python
 import os
 
-from dominaite import CheckoutRefusedError, DominaiteClient, TransportError
+from dominaite import (
+    CheckoutRefusedError,
+    DominaiteClient,
+    TransportError,
+    order_idempotency_key,
+)
 
 client = DominaiteClient(
     os.environ["DOMINAITE_KEY_ID"],
@@ -107,6 +112,9 @@ try:
         },
         language="bg",                  # widget UI language
         theme="dark",
+        # Required. Same order + same amount = same key, so a reload or a retry gets
+        # the session the customer already has instead of a second one.
+        idempotency_key=order_idempotency_key("checkout", "1042", 2500, "EUR"),
     )
 except CheckoutRefusedError as refusal:
     # Machine-readable: refusal.error_code - see the exception docstring for the codes.
@@ -165,28 +173,56 @@ pass here is what gets charged; nothing in the browser can change it.
 
 ## Retries and double-charges
 
-Every `create_checkout_session` call carries an idempotency key (auto-generated, or pass your
-own as `idempotency_key`). Retrying with the same key never charges twice - on a
-timeout, retry with the same key rather than generating a new one.
+Every `create_checkout_session` call needs an `idempotency_key`. There is no random default:
+leaving it out raises `ValueError` before anything is sent. Retrying with the same key never
+charges twice - on a timeout, retry with the same key rather than generating a new one.
 
-If the first attempt did land, the retry comes back as a `CheckoutRefusedError` with a replay
-code, not as the original session: there are no cashier fields to hand the embed snippet. Use
-`refusal.transaction_id` with `get_status()` to find out what the first attempt did (see
-[Recovering from a replay refusal](#recovering-from-a-replay-refusal)).
+Build the key from the order with `order_idempotency_key`:
 
-There is a helper that does exactly that:
+```python
+from dominaite import order_idempotency_key
+
+key = order_idempotency_key("checkout", order.id, order.total_minor, order.currency)
+# "checkout-1042-2500-EUR"
+```
+
+The key is `{scope}-{order_id}-{amount_minor}-{CURRENCY}`. That shape is the point:
+
+- **Same order, same amount, same key.** A reload, a back button or a retry after a timeout
+  rebuilds the identical key, so the gateway hands back the session the customer already has
+  (or tells you the order is paid) instead of opening a second one.
+- **Changed amount or currency, new key.** A coupon or an edited basket produces a different
+  key and a fresh session. Reusing the old key with a new amount would be refused with
+  `IDEMPOTENCY_KEY_REUSED`.
+- **Scope** keeps different flows on the same order apart (`"checkout"`, `"deposit"`, a
+  billing period for recurring charges).
+
+The helper applies the same rules as any key (see [Field lengths](#field-lengths)) and raises
+`ValueError` on a bad part rather than building a key the API would refuse.
+
+`charge_payment_method` needs a key the same way; derive it from the billing period.
+
+If the first attempt did land and its session is still open, the retry returns that same
+session: same transaction id, same cashier values. Otherwise it comes back as a
+`CheckoutRefusedError` with a replay code (`ALREADY_PROCESSED` once it is paid,
+`PRIOR_ATTEMPT_FAILED`, `DUPLICATE_REQUEST`, or `IDEMPOTENCY_KEY_REUSED` for a different
+amount). Use `refusal.transaction_id` with `get_status()` to find out what the first attempt did
+(see [Recovering from a replay refusal](#recovering-from-a-replay-refusal)).
+
+There is a helper that retries with the same key for you:
 
 ```python
 session = client.create_checkout_session_with_retry(
     amount=2500,
     currency="EUR",
     order_reference="order-1042",
+    idempotency_key=order_idempotency_key("checkout", "1042", 2500, "EUR"),
     max_attempts=3,
 )
 ```
 
-It retries only `TransportError` (network failures, 5xx, `MERCHANT_API_UNAVAILABLE`), reuses the
-one key across all attempts, and backs off between them. Refusals, authentication failures and
+It retries only `TransportError` (network failures, 5xx, `MERCHANT_API_UNAVAILABLE`), sends your
+one key on every attempt, and backs off between them. Refusals, authentication failures and
 rate limits are raised immediately.
 
 ## Sessions expire
@@ -213,6 +249,7 @@ session = client.create_checkout_session(
     currency="EUR",
     order_reference="sub-8817-first",
     save_card=True,
+    idempotency_key=order_idempotency_key("sub-first", "8817", 2500, "EUR"),
 )
 # ... the payer completes the hosted checkout ...
 status = client.get_status(session["transactionId"])

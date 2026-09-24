@@ -7,6 +7,7 @@ from .client import (
     SESSIONS_PATH,
     DominaiteClient,
     __version__,
+    order_idempotency_key,
     sign_request,
 )
 from .exceptions import (
@@ -71,6 +72,7 @@ __all__ = [
     "TransportError",
     "WebhookVerificationError",
     "__version__",
+    "order_idempotency_key",
     "sign_request",
     "sign_webhook",
     "verify_webhook",
