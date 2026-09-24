@@ -315,7 +315,7 @@ except ChargeError as error:
     elif error.error_code in ("DUPLICATE_REQUEST", "PAYMENT_METHOD_CHARGES_DISABLED", "PAYMENT_PROCESSING_UNAVAILABLE"):
         ...  # nothing was charged; retry later with the SAME idempotency key
     elif error.error_code == "PAYMENT_METHOD_NOT_ACTIVE":
-        ...  # revoked or expired: bring the customer back for a hosted session with save_card
+        ...  # revoked, expired or retired: bring the customer back for a hosted session with save_card
     elif error.error_code == "CHARGE_FAILED":
         ...  # 502, nothing was charged; error.charge is set when a row exists
     elif error.error_code == "IDEMPOTENCY_KEY_REUSED":

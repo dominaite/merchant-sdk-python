@@ -26,6 +26,8 @@ from dominaite import (
     PAYMENT_STATUSES,
     REVOKE_ERROR_CODES,
     SESSION_REFUSAL_ERROR_CODES,
+    STOREFRONT_ERROR_CODES,
+    STORED_PAYMENT_METHOD_RETIRED_REASONS,
     STORED_PAYMENT_METHOD_STATUSES,
     VALIDATION_ERROR_CODES,
     ApiError,
@@ -36,6 +38,7 @@ from dominaite import (
     DominaiteClient,
     PaymentStatus,
     RevokeError,
+    StoredPaymentMethodRetiredReason,
     StoredPaymentMethodStatus,
     TransportError,
 )
@@ -254,11 +257,36 @@ def test_get_status_reads_absent_card_fields_as_none_like_the_wire(client, answe
         "expiryMonth": None,
         "expiryYear": None,
         "status": "active",
+        "retiredReason": None,
     }
+
+
+def test_get_status_reads_the_retired_card_example(client, answers_with):
+    endpoint = ENDPOINTS["getStatus"]
+    example = endpoint["retiredCardExample"]
+    answers_with(example)
+
+    result = client.get_status(example["transactionId"])
+
+    assert result == example
+    assert sorted(result) == sorted(endpoint["fields"])
+    stored = result["storedPaymentMethod"]
+    assert sorted(stored) == sorted(endpoint["storedPaymentMethodFields"])
+    assert stored["status"] == StoredPaymentMethodStatus.RETIRED
+    assert stored["retiredReason"] == StoredPaymentMethodRetiredReason.SOURCE_SALE_REVERSED
+
+
+def test_storefront_codes_equal_the_contract_and_are_not_session_refusals():
+    assert list(STOREFRONT_ERROR_CODES) == CONTRACT["storefrontErrorCodes"]
+    assert not set(STOREFRONT_ERROR_CODES) & set(CONTRACT["sessionRefusalErrorCodes"])
 
 
 def test_payment_method_vocabularies_equal_the_contract():
     assert list(STORED_PAYMENT_METHOD_STATUSES) == CONTRACT["storedPaymentMethodStatusVocabulary"]
+    assert (
+        list(STORED_PAYMENT_METHOD_RETIRED_REASONS)
+        == CONTRACT["storedPaymentMethodRetiredReasonVocabulary"]
+    )
     assert list(CHARGE_STATUSES) == CONTRACT["chargeStatusVocabulary"]
     assert list(DECLINE_CLASSES) == CONTRACT["declineClassVocabulary"]
     assert list(CHARGE_ERROR_CODES) == CONTRACT["chargeErrorCodes"]

@@ -71,12 +71,13 @@ VALIDATION_ERROR_CODES: Tuple[str, ...] = ("IDEMPOTENCY_KEY_REQUIRED",)
 
 #: The storefront codes a create call can be refused with, raised as
 #: :class:`StorefrontError`. ``STOREFRONT_NOT_WHITELISTED`` and ``STOREFRONT_INACTIVE``
-#: are HTTP 409, ``STOREFRONT_MISMATCH`` is HTTP 400. Not in
-#: :data:`SESSION_REFUSAL_ERROR_CODES`: these are not the 200 ``success: false`` shape.
+#: are HTTP 409, ``STOREFRONT_MISMATCH`` is HTTP 400; none is retryable. In contract
+#: order. Not in :data:`SESSION_REFUSAL_ERROR_CODES`: these are not the 200
+#: ``success: false`` shape.
 STOREFRONT_ERROR_CODES: Tuple[str, ...] = (
-    "STOREFRONT_NOT_WHITELISTED",
-    "STOREFRONT_INACTIVE",
     "STOREFRONT_MISMATCH",
+    "STOREFRONT_INACTIVE",
+    "STOREFRONT_NOT_WHITELISTED",
 )
 
 #: The codes :meth:`DominaiteClient.charge_payment_method` raises as
@@ -258,8 +259,8 @@ class ChargeError(DominaiteError):
     - ``CHARGE_FAILED`` (502): nothing was charged. ``charge`` is set when a row exists
       (its ``declineClass`` and ``declineCode`` are None), None when the provider
       refused before one.
-    - ``PAYMENT_METHOD_NOT_ACTIVE`` (409): the method is revoked or expired; bring the
-      customer back for a hosted session with ``save_card=True``.
+    - ``PAYMENT_METHOD_NOT_ACTIVE`` (409): the method is revoked, expired or retired;
+      bring the customer back for a hosted session with ``save_card=True``.
     - ``DUPLICATE_REQUEST`` (409): a request with this key is still in flight; retry
       with the SAME key in a moment.
     - ``IDEMPOTENCY_KEY_REUSED`` (422): same key, different body or method; a bug on

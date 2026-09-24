@@ -29,6 +29,12 @@ same amount then replays the same session, and a changed amount gets a new one.
 - `is_paid`, `is_terminal` and `TERMINAL_PAYMENT_STATUSES`.
 - `ErrorCode` enum, `STOREFRONT_ERROR_CODES` and `StorefrontError` for
   `STOREFRONT_NOT_WHITELISTED` (409), `STOREFRONT_INACTIVE` (409) and `STOREFRONT_MISMATCH` (400).
+  `STOREFRONT_ERROR_CODES` is now in the contract's order.
+- Saved cards can be `retired`: the platform stopped the card on its own and it never becomes
+  active again. `StoredPaymentMethodStatus.RETIRED`, plus `StoredPaymentMethodRetiredReason` and
+  `STORED_PAYMENT_METHOD_RETIRED_REASONS` (`hard_decline`, `chargeback`, `source_sale_reversed`).
+  `get_status()["storedPaymentMethod"]["retiredReason"]` is always present, None unless retired.
+- Contract fixtures refreshed from the gateway (contract version 2026-09-16).
 
 ### Fixed
 

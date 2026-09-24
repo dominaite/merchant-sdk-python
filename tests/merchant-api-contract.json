@@ -25,6 +25,12 @@
     "IDEMPOTENCY_KEY_REQUIRED"
   ],
   "$validationNote": "Input validation on the create endpoint: HTTP 400 (not the success=false shape). IDEMPOTENCY_KEY_REQUIRED = missing/empty Idempotency-Key header (1-100 chars, part of the signature).",
+  "storefrontErrorCodes": [
+    "STOREFRONT_MISMATCH",
+    "STOREFRONT_INACTIVE",
+    "STOREFRONT_NOT_WHITELISTED"
+  ],
+  "$storefrontErrorNote": "Create-session refusals from the storefront (online location) the payment is attributed to: 400 STOREFRONT_MISMATCH (the API key is bound to one storefront and the request named a different locationId), 409 STOREFRONT_INACTIVE, 409 STOREFRONT_NOT_WHITELISTED. They arrive as HTTP errors, not the success=false shape, so they are deliberately not in sessionRefusalErrorCodes. One exception: when the Idempotency-Key already opened a session, STOREFRONT_MISMATCH comes back as HTTP 200 with success=false. Nothing was created in any case, and resending the same request gets the same answer.",
   "endpoints": {
     "ping": {
       "method": "GET",
@@ -134,7 +140,29 @@
           "last4": "4242",
           "expiryMonth": 12,
           "expiryYear": 2029,
-          "status": "active"
+          "status": "active",
+          "retiredReason": null
+        }
+      },
+      "retiredCardExample": {
+        "transactionId": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+        "orderId": "dom_9a8b7c6d5e4f",
+        "orderReference": "order-1042",
+        "status": "refunded",
+        "amount": 8440,
+        "currency": "EUR",
+        "refundedAmount": 8440,
+        "createdAt": "2026-08-21T09:15:30.000Z",
+        "updatedAt": "2026-08-23T14:02:40.000Z",
+        "expiresAt": null,
+        "storedPaymentMethod": {
+          "id": "pm_0123456789abcdef0123456789abcdef",
+          "brand": "visa",
+          "last4": "4242",
+          "expiryMonth": 12,
+          "expiryYear": 2029,
+          "status": "retired",
+          "retiredReason": "source_sale_reversed"
         }
       },
       "storedPaymentMethodFields": [
@@ -143,9 +171,10 @@
         "last4",
         "expiryMonth",
         "expiryYear",
-        "status"
+        "status",
+        "retiredReason"
       ],
-      "$storedPaymentMethodNote": "id is pm_ followed by 32 hex characters, case-sensitive; store and send it verbatim. brand, last4, expiryMonth and expiryYear are null (absent) when the provider did not report them. Never the card number, never the provider token."
+      "$storedPaymentMethodNote": "id is pm_ followed by 32 hex characters, case-sensitive; store and send it verbatim. brand, last4, expiryMonth and expiryYear are null (absent) when the provider did not report them. Never the card number, never the provider token. retiredReason is null (absent) unless the platform retired the card, see storedPaymentMethodRetiredReasonVocabulary; retiredCardExample is a card retired because the payment that saved it was refunded. The payment.succeeded webhook (payment.requires_capture for an authorization) carries the same object as data.storedPaymentMethod when the card was stored with the approval, and null on every other event; the status read stays the source of truth."
     },
     "chargePaymentMethod": {
       "method": "POST",
@@ -463,9 +492,16 @@
   "storedPaymentMethodStatusVocabulary": [
     "active",
     "revoked",
-    "expired"
+    "expired",
+    "retired"
   ],
-  "$storedPaymentMethodStatusNote": "Only active methods can be charged. revoked is what DELETE leaves behind; expired means the card's expiry date has passed. Treat an unknown value as not chargeable.",
+  "$storedPaymentMethodStatusNote": "Only active methods can be charged. revoked is what DELETE leaves behind; expired means the card's expiry date has passed; retired means the platform stopped the card on its own (retiredReason says why) and it never becomes active again, so ask the customer to save a card again. Treat an unknown value as not chargeable.",
+  "storedPaymentMethodRetiredReasonVocabulary": [
+    "hard_decline",
+    "chargeback",
+    "source_sale_reversed"
+  ],
+  "$storedPaymentMethodRetiredReasonNote": "retiredReason is set when the platform retired the card and kept if you revoke it afterwards; null (absent) on every other card. hard_decline = a charge on it was declined as final; chargeback = a charge on it was disputed; source_sale_reversed = the payment that saved it was fully refunded or disputed. A charge or a new agreement on a retired card answers 409 PAYMENT_METHOD_NOT_ACTIVE; revoking it still works and reads revoked. Treat an unknown value as retired for an unknown reason.",
   "chargeStatusVocabulary": [
     "succeeded",
     "failed",

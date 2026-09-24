@@ -50,6 +50,23 @@
         "retry": false
       }
     ],
+    "storefront": [
+      {
+        "code": "STOREFRONT_MISMATCH",
+        "httpStatus": 400,
+        "retry": false
+      },
+      {
+        "code": "STOREFRONT_INACTIVE",
+        "httpStatus": 409,
+        "retry": false
+      },
+      {
+        "code": "STOREFRONT_NOT_WHITELISTED",
+        "httpStatus": 409,
+        "retry": false
+      }
+    ],
     "transient": [
       {
         "code": "MERCHANT_API_UNAVAILABLE",
@@ -80,6 +97,16 @@
       },
       {
         "code": "INVALID_FORMAT",
+        "httpStatus": 400,
+        "retry": null
+      },
+      {
+        "code": "INVALID_SELECTION",
+        "httpStatus": 400,
+        "retry": null
+      },
+      {
+        "code": "DATE_IN_FUTURE",
         "httpStatus": 400,
         "retry": null
       },
@@ -139,7 +166,7 @@
     "abandoned"
   ],
   "validationHttpStatus": 400,
-  "version": "2026-08-28",
+  "version": "2026-09-16",
   "webhookEventCatalog": [
     "payment.succeeded",
     "payment.failed",
