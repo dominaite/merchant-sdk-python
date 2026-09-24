@@ -865,17 +865,18 @@ def test_rejects_an_order_reference_past_the_character_limit(client, order_refer
         )
 
 
-def test_a_100_character_cyrillic_idempotency_key_is_accepted(client, urlopen):
+def test_a_100_character_idempotency_key_is_accepted(client, urlopen):
     recorder = urlopen(_ok())
+    key = "k" * 100
 
     client.create_checkout_session(
         amount=2500,
         currency="EUR",
         order_reference="order-1042",
-        idempotency_key=CYRILLIC_100,
+        idempotency_key=key,
     )
 
-    assert _headers(recorder.last)["idempotency-key"] == CYRILLIC_100
+    assert _headers(recorder.last)["idempotency-key"] == key
 
 
 def test_rejects_an_idempotency_key_past_the_character_limit(client):
@@ -884,8 +885,30 @@ def test_rejects_an_idempotency_key_past_the_character_limit(client):
             amount=2500,
             currency="EUR",
             order_reference="order-1042",
-            idempotency_key="з" * 101,
+            idempotency_key="k" * 101,
         )
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["заказ-1042", "café-1042", "order 1042", " order-1042", "order-1042\n", "order\t1042"],
+    ids=["cyrillic", "latin-1", "inner-space", "leading-space", "newline", "tab"],
+)
+def test_rejects_an_idempotency_key_that_cannot_travel_as_a_header(client, urlopen, key):
+    """The key is an HTTP header and part of the signature. Cyrillic crashes http.client
+    outright, a Latin-1 letter goes out as one byte after being signed as two, and
+    whitespace can be trimmed by anything in between. Refused locally, before sending."""
+    recorder = urlopen(_ok())
+
+    with pytest.raises(ValueError, match="idempotency_key"):
+        client.create_checkout_session(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=key,
+        )
+
+    assert recorder.requests == []
 
 
 # --- rate limiting -----------------------------------------------------------

@@ -523,8 +523,14 @@ on your order timeout, and let webhooks do the rest.
 
 ## Field lengths
 
-`order_reference` and `idempotency_key` are capped at 100 characters each. Characters, not
-bytes: a 100-character Cyrillic or Greek reference is 200 UTF-8 bytes and the platform takes it.
+`order_reference` and `idempotency_key` are capped at 100 characters each. For
+`order_reference` that is characters, not bytes: a 100-character Cyrillic or Greek reference is
+200 UTF-8 bytes and the platform takes it.
+
+`idempotency_key` travels as an HTTP header and is part of the signature, so it is limited to
+visible ASCII: letters, digits and punctuation, no spaces, no accented or non-Latin letters.
+Anything else raises `ValueError` before the request is sent. If your order ids are not ASCII,
+derive the key from something that is (your numeric order id, or a hash of the reference).
 
 ## Running the tests
 

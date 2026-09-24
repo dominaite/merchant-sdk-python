@@ -37,8 +37,15 @@ LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 #: Longest ``order_reference`` the API accepts, counted in Unicode code points.
 MAX_ORDER_REFERENCE_LENGTH = 100
 
-#: Longest ``Idempotency-Key`` the API accepts, counted in Unicode code points.
+#: Longest ``Idempotency-Key`` the API accepts. The key is ASCII (see below), so
+#: characters and bytes are the same count here.
 MAX_IDEMPOTENCY_KEY_LENGTH = 100
+
+#: The key travels as an HTTP header and is signed as UTF-8, so it is held to visible
+#: ASCII. Outside that the request cannot be made to match on both ends: http.client
+#: refuses anything past Latin-1 with a UnicodeEncodeError, sends Latin-1 letters as one
+#: byte while the signature hashed two, and a proxy may trim surrounding whitespace.
+_IDEMPOTENCY_KEY_RE = re.compile(r"[\x21-\x7e]+")
 
 #: Hard cap on how much of a response body we will buffer. A well-behaved API answer is
 #: a few kilobytes; anything past this is a misconfigured proxy or something hostile in
@@ -240,11 +247,14 @@ def _validate_money_params(amount: Any, currency: Any, order_reference: Any) -> 
 
 def _normalize_idempotency_key(idempotency_key: Optional[str]) -> str:
     key = idempotency_key if idempotency_key is not None else secrets.token_hex(16)
-    # Characters again, for the same reason as order_reference above.
-    if not isinstance(key, str) or not key or len(key) > MAX_IDEMPOTENCY_KEY_LENGTH:
+    if (
+        not isinstance(key, str)
+        or len(key) > MAX_IDEMPOTENCY_KEY_LENGTH
+        or not _IDEMPOTENCY_KEY_RE.fullmatch(key)
+    ):
         raise ValueError(
-            "idempotency_key must be a non-empty string of at most {0} "
-            "characters".format(MAX_IDEMPOTENCY_KEY_LENGTH)
+            "idempotency_key must be 1 to {0} visible ASCII characters (no spaces, "
+            "no accented or non-Latin letters)".format(MAX_IDEMPOTENCY_KEY_LENGTH)
         )
     return key
 
