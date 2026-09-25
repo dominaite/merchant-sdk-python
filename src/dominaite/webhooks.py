@@ -10,7 +10,7 @@ import hmac
 import json
 import re
 import time
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, TypedDict, Union
 
 from .exceptions import WebhookVerificationError
 
@@ -20,6 +20,98 @@ WEBHOOK_SIGNATURE_HEADER = "X-Webhook-Signature"
 
 #: How far the delivery timestamp may sit from your clock before it is rejected.
 DEFAULT_WEBHOOK_TOLERANCE_SECONDS = 300
+
+
+class _WebhookEventRequired(TypedDict):
+    id: str
+    type: str
+    createdAt: str
+    data: Dict[str, Any]
+
+
+class WebhookEvent(_WebhookEventRequired, total=False):
+    """The envelope of every delivery, as :func:`verify_webhook` decodes it.
+
+    ``id`` is the dedupe key (delivery is at-least-once). ``createdAt`` is when the
+    reported change happened, not when it was sent, and can repeat across events.
+    ``apiVersion`` is the dated version of the payload shape (``"2026-09-25"`` today). It
+    only changes for a breaking change; fields are added under the same version, so ignore
+    keys you do not recognise. A retry resends the bytes of the first attempt, so an event
+    rendered before the gateway sent ``apiVersion`` arrives without it.
+
+    :func:`verify_webhook` is annotated as returning a plain dict so existing code keeps
+    type-checking; ``cast`` to this type (and ``data`` to one of the ``*EventData`` types
+    below, by ``type``) when you want the keys checked.
+    """
+
+    apiVersion: str
+
+
+class _AgreementEventDataRequired(TypedDict):
+    id: str
+    planId: str
+    customerReference: str
+    storedPaymentMethodId: Optional[str]
+    status: str
+    previousStatus: Optional[str]
+    amount: int
+    currency: str
+    intervalUnit: str
+    intervalCount: int
+    periodCount: Optional[int]
+    trialDays: int
+    nextChargeAt: Optional[str]
+    activatedAt: Optional[str]
+    cancelledAt: Optional[str]
+    version: int
+
+
+class AgreementEventData(_AgreementEventDataRequired, total=False):
+    """``data`` of an ``agreement.*`` event (activated, past_due, cancelled).
+
+    ``sequence`` orders the events of one agreement (``id``); see "Ordering" in the
+    README. Absent on events rendered before the gateway sent it.
+    """
+
+    sequence: int
+
+
+class ChargeEventPaymentMethod(TypedDict):
+    brand: Optional[str]
+    last4: Optional[str]
+
+
+class _ChargeEventDataRequired(TypedDict):
+    chargeId: str
+    transactionId: str
+    storedPaymentMethodId: str
+    agreementId: Optional[str]
+    customerReference: Optional[str]
+    outcome: str
+    periodNumber: Optional[int]
+    attemptNumber: int
+    amount: int
+    currency: str
+    paymentMethod: ChargeEventPaymentMethod
+    orderReference: Optional[str]
+    description: Optional[str]
+    declineClass: Optional[str]
+    declineCode: Optional[str]
+    nextAttemptAt: Optional[str]
+    nextChargeAt: Optional[str]
+
+
+class ChargeEventData(_ChargeEventDataRequired, total=False):
+    """``data`` of a ``charge.*`` event (succeeded, failed, retrying).
+
+    ``sequence`` orders the events of one object: the agreement period
+    (``agreementId`` plus ``periodNumber``) for a charge the platform placed for an
+    agreement, the ``chargeId`` for a one-off charge. See "Ordering" in the README.
+    Absent on events rendered before the gateway sent it.
+    """
+
+    sequence: int
+
 
 _TIMESTAMP_RE = re.compile(r"^[0-9]+$")
 _V1_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -60,8 +152,10 @@ def verify_webhook(
     :param tolerance_seconds: How far the delivery timestamp may sit from ``now``.
     :param now: Unix seconds to check the timestamp against. Defaults to the system
         clock; pass it to keep your own tests deterministic.
-    :returns: The decoded event: ``{"id", "type", "createdAt", "data"}``. Dedupe on
-        ``id`` - delivery is at-least-once.
+    :returns: The decoded event: ``{"id", "type", "apiVersion", "createdAt", "data"}``
+        (see :class:`WebhookEvent`; ``apiVersion`` can be absent on older events).
+        Dedupe on ``id`` - delivery is at-least-once. Order ``agreement.*`` and
+        ``charge.*`` events by ``data["sequence"]``, never by ``createdAt``.
 
     :raises WebhookVerificationError: The delivery is not authentic, or not fresh.
         Branch on ``error_code``; respond 400 and do no work.

@@ -13,10 +13,18 @@ The secret below is the dummy from the public contract. It authenticates nothing
 """
 
 import hmac
+import json
 
 import pytest
 
-from dominaite import WebhookVerificationError, sign_webhook, verify_webhook
+from dominaite import (
+    AgreementEventData,
+    ChargeEventData,
+    WebhookEvent,
+    WebhookVerificationError,
+    sign_webhook,
+    verify_webhook,
+)
 from dominaite import webhooks
 
 SECRET = "whsec_abababababababababababababababababababababababababababababababab"
@@ -305,3 +313,114 @@ def test_a_forged_signature_is_also_rejected_through_compare_digest(monkeypatch)
 
     assert caught.value.error_code == "INVALID_SIGNATURE"
     assert calls == [(EXPECTED_V1, "0" * 64)]
+
+
+# --- apiVersion on the envelope, sequence on agreement.* and charge.* ----------
+# Bodies are compact, in the gateway's key order, the way deliveries arrive. The
+# canonical vector above is an event from before apiVersion existed and stays that way:
+# a retry resends the bytes of its first attempt, so old shapes keep arriving.
+
+AGREEMENT_BODY = (
+    '{"id":"3c1d6f0a-8e2b-4b7c-9a1e-5d4f3b2a1c0e","type":"agreement.past_due",'
+    '"apiVersion":"2026-09-25","createdAt":"2026-10-01T06:00:00Z","data":{'
+    '"id":"agr_7Hq2","planId":"plan_monthly","customerReference":"cust-88",'
+    '"storedPaymentMethodId":"pm_91","status":"past_due","previousStatus":"active",'
+    '"amount":2500,"currency":"EUR","intervalUnit":"month","intervalCount":1,'
+    '"periodCount":null,"trialDays":0,"nextChargeAt":"2026-10-02T06:00:00Z",'
+    '"activatedAt":"2026-09-01T06:00:00Z","cancelledAt":null,"version":1,"sequence":3}}'
+)
+
+CHARGE_BODY = (
+    '{"id":"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d","type":"charge.retrying",'
+    '"apiVersion":"2026-09-25","createdAt":"2026-10-01T06:00:00Z","data":{'
+    '"chargeId":"chg_41","transactionId":"0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",'
+    '"storedPaymentMethodId":"pm_91","agreementId":"agr_7Hq2",'
+    '"customerReference":"cust-88","outcome":"retrying","periodNumber":2,'
+    '"attemptNumber":1,"amount":2500,"currency":"EUR",'
+    '"paymentMethod":{"brand":"visa","last4":"4242"},"orderReference":"sub-2026-10",'
+    '"description":null,"declineClass":"soft_funds","declineCode":"51",'
+    '"nextAttemptAt":"2026-10-02T06:00:00Z","nextChargeAt":null,"sequence":2}}'
+)
+
+# The same agreement event as rendered before the sequence counter and apiVersion.
+OLD_AGREEMENT_BODY = (
+    '{"id":"3c1d6f0a-8e2b-4b7c-9a1e-5d4f3b2a1c0e","type":"agreement.activated",'
+    '"createdAt":"2026-09-01T06:00:00Z","data":{'
+    '"id":"agr_7Hq2","planId":"plan_monthly","customerReference":"cust-88",'
+    '"storedPaymentMethodId":"pm_91","status":"active","previousStatus":"pending",'
+    '"amount":2500,"currency":"EUR","intervalUnit":"month","intervalCount":1,'
+    '"periodCount":null,"trialDays":0,"nextChargeAt":"2026-10-01T06:00:00Z",'
+    '"activatedAt":"2026-09-01T06:00:00Z","cancelledAt":null,"version":1}}'
+)
+
+
+def _signed(body):
+    return "t=" + TIMESTAMP + ",v1=" + sign_webhook(SECRET, TIMESTAMP, body)
+
+
+def test_the_envelope_carries_api_version():
+    event = verify_webhook(AGREEMENT_BODY, _signed(AGREEMENT_BODY), SECRET, now=NOW)
+
+    assert event["apiVersion"] == "2026-09-25"
+    assert set(event) == {"id", "type", "apiVersion", "createdAt", "data"}
+
+
+def test_an_agreement_event_carries_sequence_and_created_at():
+    event = verify_webhook(AGREEMENT_BODY, _signed(AGREEMENT_BODY), SECRET, now=NOW)
+
+    assert event["type"] == "agreement.past_due"
+    assert event["createdAt"] == "2026-10-01T06:00:00Z"
+    assert event["data"]["id"] == "agr_7Hq2"
+    assert event["data"]["sequence"] == 3
+
+
+def test_a_charge_event_carries_sequence_and_created_at():
+    event = verify_webhook(CHARGE_BODY, _signed(CHARGE_BODY), SECRET, now=NOW)
+
+    assert event["type"] == "charge.retrying"
+    assert event["createdAt"] == "2026-10-01T06:00:00Z"
+    assert event["data"]["agreementId"] == "agr_7Hq2"
+    assert event["data"]["periodNumber"] == 2
+    assert event["data"]["sequence"] == 2
+
+
+def test_an_event_from_before_api_version_and_sequence_still_verifies():
+    event = verify_webhook(
+        OLD_AGREEMENT_BODY, _signed(OLD_AGREEMENT_BODY), SECRET, now=NOW
+    )
+
+    assert event["type"] == "agreement.activated"
+    assert "apiVersion" not in event
+    assert "sequence" not in event["data"]
+    # And the canonical payment vector, which predates both, still verifies unchanged.
+    assert "apiVersion" not in verify_webhook(BODY, EXPECTED_HEADER, SECRET, now=NOW)
+
+
+@pytest.mark.parametrize(
+    "event_type, body",
+    [
+        (WebhookEvent, AGREEMENT_BODY),
+        (AgreementEventData, AGREEMENT_BODY),
+        (ChargeEventData, CHARGE_BODY),
+    ],
+    ids=["envelope", "agreement-data", "charge-data"],
+)
+def test_the_exported_types_describe_the_wire_shape(event_type, body):
+    """The TypedDicts name exactly the keys a delivery carries, no more, no fewer."""
+    decoded = json.loads(body)
+    shape = decoded if event_type is WebhookEvent else decoded["data"]
+
+    assert event_type.__required_keys__ | event_type.__optional_keys__ == set(shape)
+
+
+@pytest.mark.parametrize(
+    "event_type, key",
+    [
+        (WebhookEvent, "apiVersion"),
+        (AgreementEventData, "sequence"),
+        (ChargeEventData, "sequence"),
+    ],
+)
+def test_the_new_fields_are_optional_so_old_payloads_still_fit(event_type, key):
+    assert key in event_type.__optional_keys__
+    assert key not in event_type.__required_keys__
