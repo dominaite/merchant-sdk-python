@@ -420,6 +420,9 @@ payload.
 `payment.succeeded`, `payment.failed`, `payment.requires_capture`, `payment.cancelled`,
 `payment.abandoned`, `payment.refunded`, `payment.disputed`.
 
+Recurring agreements add `agreement.activated`, `agreement.past_due`, `agreement.cancelled`,
+`charge.succeeded`, `charge.failed` and `charge.retrying`. They ride the same signed envelope.
+
 `payment.succeeded` is the only one that means money in hand. `requires_capture` is an approved
 hold, not a payment. `pending` and `processing` are never webhooked - if you want to show an
 in-flight state to a customer, poll the session.
@@ -430,6 +433,7 @@ Each delivery is a flat JSON object - there is no `success` wrapper, so do not b
 {
   "id": "7f9c24e5-1d1f-4c0a-9b6c-2f3a4d5e6f70",
   "type": "payment.succeeded",
+  "apiVersion": "2026-09-25",
   "createdAt": "2026-08-20T14:00:00Z",
   "data": {
     "transactionId": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
@@ -446,6 +450,10 @@ Each delivery is a flat JSON object - there is no `success` wrapper, so do not b
 }
 ```
 
+`apiVersion` is the dated version of the payload shape. Fields are only ever added under a
+version, never renamed or removed, so ignore keys you do not recognise. A retry resends the
+bytes of its first attempt, so an event rendered before `apiVersion` existed arrives without it.
+
 Amounts are minor units. On `payment.*` events `amount` is what you get paid and `grossAmount`
 is what moved on the card; on `payment.refunded` `amount` is what went back to the customer.
 
@@ -460,6 +468,46 @@ is what moved on the card; on `payment.refunded` `amount` is what went back to t
 - **Circuit breaker.** An endpoint whose first attempt and every retry fail, over and over, is
   disabled automatically. Any later successful delivery re-enables it. A disable you did
   yourself in the dashboard is never undone for you.
+
+### Ordering agreement and charge events
+
+`agreement.*` and `charge.*` events carry `data["sequence"]`, an integer that only ever rises
+per object, and a redelivery carries the same number:
+
+> Deliveries can arrive out of order. Keep the highest sequence you have processed per object
+> and discard any event whose sequence is not higher; when you need current state, read the
+> object by id. createdAt can repeat across events, so order by sequence, not createdAt. A
+> sequence of 0 only comes from events recorded before the counter existed; treat it as older
+> than any positive number.
+
+The object is:
+
+- `agreement.*`: the agreement, `data["id"]`.
+- `charge.*` for a charge the platform placed for an agreement (it has a `periodNumber`): the
+  agreement period, `data["agreementId"]` plus `data["periodNumber"]`, so the retrying and
+  failed events of one period compare across attempts.
+- `charge.*` for a one-off charge you initiated: `data["chargeId"]`.
+
+```python
+data = event["data"]
+if event["type"].startswith("agreement."):
+    key = ("agreement", data["id"])
+elif data.get("periodNumber") is not None:
+    key = ("period", data["agreementId"], data["periodNumber"])
+else:
+    key = ("charge", data["chargeId"])
+
+sequence = data.get("sequence", 0)       # absent on events from before the counter
+last = last_sequence_processed(key)      # None when you have seen nothing for this object
+if last is not None and sequence <= last:
+    return "", 200                       # stale or duplicate: acknowledge, skip
+```
+
+A delivery from before the counter carries no `sequence` or `0`. Nothing orders two of those
+against each other, so read the object by id when that matters.
+
+`WebhookEvent`, `AgreementEventData` and `ChargeEventData` are `TypedDict`s of these shapes.
+`verify_webhook` still returns a plain dict, so `cast` to them when you want the keys checked.
 
 ### Reconcile anyway
 
