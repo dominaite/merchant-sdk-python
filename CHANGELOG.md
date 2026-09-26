@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1 (unreleased)
+
+### Added
+
+- `WebhookEvent`, `AgreementEventData`, `ChargeEventData` and `ChargeEventPaymentMethod`
+  `TypedDict`s for webhook payloads. `WebhookEvent` has the optional `apiVersion` (the dated
+  payload version, `2026-09-25` today); the agreement and charge data types have the optional
+  `sequence` that orders deliveries per object. `verify_webhook` still returns a plain dict,
+  and payloads without these fields verify and parse as before.
+
 ## 0.3.0
 
 ### Breaking
