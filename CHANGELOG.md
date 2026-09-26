@@ -9,6 +9,23 @@
   payload version, `2026-09-25` today); the agreement and charge data types have the optional
   `sequence` that orders deliveries per object. `verify_webhook` still returns a plain dict,
   and payloads without these fields verify and parse as before.
+- `create_refund(transaction_id, amount=None, reason=None, idempotency_key=...)` and
+  `get_refund(transaction_id, refund_id)` for `POST` and `GET`
+  `/merchant-api/payments/{transactionId}/refunds`. The idempotency key is required and signed,
+  like a charge's; leaving `amount` out refunds everything still refundable and sends no
+  `amount` key. Both return a `Refund` with every field present (absent reads as None).
+  `RefundStatus`, `REFUND_STATUSES`, `REFUND_ERROR_CODES`, `REFUND_FAILURE_CODES` and
+  `PAYMENTS_PATH`.
+- `RefundError` (a subclass of `ApiError`) for the codes the refund routes answer with, with
+  `retryable` and `retry_stop_after_seconds` (`REFUND_NOT_FOUND` 60 seconds,
+  `DUPLICATE_REQUEST` 120 seconds, both with the same key; also `REFUND_RETRY_WINDOWS_SECONDS`).
+  A 5xx stays a `TransportError`.
+- `PaymentEventData` for `payment.*` webhook data, including `storedPaymentMethod`: the card a
+  `save_card` payment kept on file, on `payment.succeeded` and `payment.requires_capture`. It
+  can be None even when a card was saved; `get_status()` stays the source of truth.
+- `StoredPaymentMethod`, the one type for the card on file on `get_status()` and on payment
+  webhooks.
+- Contract fixture refreshed with the refund endpoints and vocabularies.
 
 ## 0.3.0
 
