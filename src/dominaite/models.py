@@ -41,8 +41,9 @@ class Refund(TypedDict):
     refunded. ``status`` is a :class:`RefundStatus` value. The gateway omits null fields on
     the wire; the SDK fills them in as None, so every key is always present.
 
-    - ``amount``: minor units. Before success, the amount you asked for (None for a full
-      refund); on ``succeeded``, the amount actually refunded; always None on ``failed``.
+    - ``amount``: minor units. On ``pending``, the amount you asked for (None for a full
+      refund); on ``processing``, the amount being refunded (None until a full refund has
+      been sized); on ``succeeded``, the amount actually refunded; always None on ``failed``.
     - ``failureCode`` and ``failureMessage``: set on ``failed`` only. A code outside
       :data:`REFUND_FAILURE_CODES` means the same as ``REFUND_FAILED``.
     - ``completedAt``: ISO 8601 UTC, when the refund reached ``succeeded`` or ``failed``.
