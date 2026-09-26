@@ -24,6 +24,9 @@ from dominaite import (
     CHARGE_STATUSES,
     DECLINE_CLASSES,
     PAYMENT_STATUSES,
+    REFUND_ERROR_CODES,
+    REFUND_FAILURE_CODES,
+    REFUND_STATUSES,
     REVOKE_ERROR_CODES,
     SESSION_REFUSAL_ERROR_CODES,
     STOREFRONT_ERROR_CODES,
@@ -37,7 +40,10 @@ from dominaite import (
     DeclineClass,
     DominaiteClient,
     PaymentStatus,
+    RefundError,
+    RefundStatus,
     RevokeError,
+    StoredPaymentMethod,
     StoredPaymentMethodRetiredReason,
     StoredPaymentMethodStatus,
     TransportError,
@@ -230,6 +236,13 @@ def test_get_status_returns_the_saved_card_example_stored_payment_method_include
     # A status without a saved card carries the key as null in the fixture.
     assert "storedPaymentMethod" in endpoint["example"]
     assert endpoint["example"]["storedPaymentMethod"] is None
+
+
+def test_the_stored_payment_method_type_has_exactly_the_contract_fields():
+    """The same type is reused for data.storedPaymentMethod on payment.* webhooks."""
+    fields = set(ENDPOINTS["getStatus"]["storedPaymentMethodFields"])
+    assert set(StoredPaymentMethod.__required_keys__) == fields
+    assert not StoredPaymentMethod.__optional_keys__
 
 
 def test_get_status_reads_absent_card_fields_as_none_like_the_wire(client, answers_with):
@@ -509,6 +522,128 @@ def test_the_envelope_form_of_each_example_unwraps_the_same(client, answers_with
     assert result == endpoint["example"]
 
 
+# --- refunds --------------------------------------------------------------------
+
+
+REFUND_KEY = "refund-cn-5521"
+
+
+def _with_nulls(data, fields):
+    """What the SDK hands back for a wire example: every declared field, absent read as None."""
+    return dict({field: None for field in fields}, **data)
+
+
+def test_refund_vocabularies_equal_the_contract():
+    assert list(REFUND_STATUSES) == CONTRACT["refundStatusVocabulary"]
+    assert [member.value for member in RefundStatus] == CONTRACT["refundStatusVocabulary"]
+    assert list(REFUND_ERROR_CODES) == CONTRACT["refundErrorCodes"]
+    assert list(REFUND_FAILURE_CODES) == CONTRACT["refundFailureCodes"]
+    # A failed refund is a result carrying REFUND_FAILED, never an exception.
+    assert "REFUND_FAILED" not in REFUND_ERROR_CODES
+
+
+@pytest.mark.parametrize("example_name, amount", [("partialExample", 2500), ("fullExample", None)])
+def test_create_refund_returns_exactly_the_contract_fields(client, monkeypatch, example_name, amount):
+    endpoint = ENDPOINTS["createRefund"]
+    example = endpoint[example_name]
+    seen = []
+
+    def handler(request, timeout=None):
+        seen.append(request)
+        return _Response(example, endpoint["httpStatus"])
+
+    _patch_opener(monkeypatch, handler)
+    transaction_id = example["data"]["transactionId"]
+
+    refund = client.create_refund(transaction_id, amount=amount, idempotency_key=REFUND_KEY)
+
+    assert sorted(refund) == sorted(endpoint["fields"])
+    assert refund == _with_nulls(example["data"], endpoint["fields"])
+    assert refund["status"] in REFUND_STATUSES
+    request = seen[0]
+    assert request.get_method() == endpoint["method"]
+    assert request.full_url == BASE_URL + endpoint["path"].replace("{transactionId}", transaction_id)
+    assert "Idempotency-key" in request.headers
+    body = json.loads(request.data)
+    if amount is None:
+        assert "amount" not in body
+        assert refund["amount"] is None
+    else:
+        assert body["amount"] == amount
+
+
+@pytest.mark.parametrize("example_name", ["succeededExample", "failedExample"])
+def test_get_refund_returns_exactly_the_contract_fields(client, monkeypatch, example_name):
+    endpoint = ENDPOINTS["getRefund"]
+    example = endpoint[example_name]
+    seen = []
+
+    def handler(request, timeout=None):
+        seen.append(request)
+        return _Response(example, endpoint["httpStatus"])
+
+    _patch_opener(monkeypatch, handler)
+    data = example["data"]
+
+    refund = client.get_refund(data["transactionId"], data["refundId"])
+
+    assert sorted(refund) == sorted(endpoint["fields"])
+    assert refund == _with_nulls(data, endpoint["fields"])
+    assert refund["status"] in REFUND_STATUSES
+    assert seen[0].get_method() == endpoint["method"]
+    assert seen[0].full_url == BASE_URL + endpoint["path"].replace(
+        "{transactionId}", data["transactionId"]
+    ).replace("{refundId}", data["refundId"])
+    assert "Idempotency-key" not in seen[0].headers
+    if refund["status"] == RefundStatus.FAILED:
+        # A failed refund never carries an amount.
+        assert refund["amount"] is None
+        assert refund["failureCode"] in REFUND_FAILURE_CODES
+
+
+@pytest.mark.parametrize(
+    "call, example",
+    [("create", e) for e in ENDPOINTS["createRefund"]["errorExamples"]]
+    + [("get", e) for e in ENDPOINTS["getRefund"]["errorExamples"]],
+    ids=lambda value: value if isinstance(value, str) else value["code"],
+)
+def test_every_refund_error_example_is_a_refund_error_with_code_and_status(
+    client, answers_with, call, example
+):
+    answers_with(example["body"], example["httpStatus"])
+    transaction_id = ENDPOINTS["getRefund"]["succeededExample"]["data"]["transactionId"]
+    refund_id = ENDPOINTS["getRefund"]["succeededExample"]["data"]["refundId"]
+
+    with pytest.raises(RefundError) as raised:
+        if call == "create":
+            client.create_refund(transaction_id, amount=2500, idempotency_key=REFUND_KEY)
+        else:
+            client.get_refund(transaction_id, refund_id)
+
+    error = raised.value
+    assert not isinstance(error, TransportError)
+    assert error.http_status == example["httpStatus"]
+    assert error.error_code == example["code"]
+    assert error.error_code in REFUND_ERROR_CODES
+    assert str(error) == example["body"]["error"]["message"]
+    assert error.result == example["body"]
+
+
+def test_the_refund_examples_carry_only_their_declared_fields():
+    for name in ("createRefund", "getRefund"):
+        endpoint = ENDPOINTS[name]
+        fields = set(endpoint["fields"])
+        for key, example in endpoint.items():
+            if key.endswith("Example"):
+                assert set(example["data"]) <= fields
+                assert example["data"]["status"] in CONTRACT["refundStatusVocabulary"]
+        for example in endpoint["errorExamples"]:
+            assert example["body"]["success"] is False
+            assert example["body"]["error"]["code"] == example["code"]
+            assert example["body"]["error"]["statusCode"] == example["httpStatus"]
+    assert ENDPOINTS["createRefund"]["fields"] == ENDPOINTS["getRefund"]["fields"]
+
+
 # --- (3) refusal error codes --------------------------------------------------
 
 
@@ -628,6 +763,8 @@ def test_the_fixture_is_the_v1_contract():
     assert sorted(ENDPOINTS) == [
         "chargePaymentMethod",
         "createCheckoutSession",
+        "createRefund",
+        "getRefund",
         "getStatus",
         "ping",
         "revokePaymentMethod",

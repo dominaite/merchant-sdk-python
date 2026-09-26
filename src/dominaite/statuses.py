@@ -157,3 +157,24 @@ class DeclineClass(str, Enum):
 
 #: Every decline class the API can return today, in contract order.
 DECLINE_CLASSES: Tuple[str, ...] = tuple(member.value for member in DeclineClass)
+
+
+class RefundStatus(str, Enum):
+    """The state of a refund from :meth:`DominaiteClient.create_refund` or
+    :meth:`DominaiteClient.get_refund`, in the order the API contract lists them.
+
+    ``PENDING``: accepted and queued. ``PROCESSING``: with the payment provider now.
+    ``SUCCEEDED``: the money went back to the payer. ``FAILED``: the refund did not happen,
+    read ``failureCode``. Only ``SUCCEEDED`` and ``FAILED`` are final, and ``FAILED`` is final
+    for that idempotency key: a new attempt needs a new key. Treat an unknown value as still
+    open.
+    """
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+#: Every refund status the API can return today, in contract order.
+REFUND_STATUSES: Tuple[str, ...] = tuple(member.value for member in RefundStatus)

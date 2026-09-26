@@ -364,6 +364,78 @@ Revoking signs an empty key and an empty body, like `get_status()`. A revoke tha
 `storedPaymentMethod` with `status` `revoked`, and a charge against it is refused with
 `PAYMENT_METHOD_NOT_ACTIVE`.
 
+## Refunds
+
+Refund a paid payment in full or in part with `create_refund`. The amount is minor units of the
+payment's currency, so use `to_minor_units` rather than multiplying by 100: HUF has no decimals
+at the gateway.
+
+```python
+from dominaite import RefundError, RefundStatus, to_minor_units
+
+refund = client.create_refund(
+    transaction_id,                               # the payment's transactionId
+    amount=to_minor_units("1500", "HUF"),         # 1500, whole forints; leave out for a full refund
+    reason="Returned item 2 of 3",                # optional, at most 500 characters
+    idempotency_key="refund-" + credit_note.id,   # derive it from YOUR refund, never random
+)
+# {"refundId": "re_...", "transactionId": ..., "status": "pending", "amount": 1500,
+#  "currency": "HUF", "failureCode": None, "failureMessage": None, "completedAt": None}
+```
+
+Leave `amount` out to refund everything still refundable; the SDK then sends no `amount` at all.
+Partial refunds add up, and the gateway refuses an amount above what is left (counting refunds
+still in progress) with `REFUND_AMOUNT_EXCEEDED`.
+
+**202 means queued, not done.** The refund comes back `pending`, then goes `processing` and ends
+`succeeded` or `failed`. Learn the outcome from the `payment.refunded` webhook, which fires once
+the money has moved, or read it back:
+
+```python
+refund = client.get_refund(transaction_id, refund["refundId"])
+if refund["status"] == RefundStatus.SUCCEEDED:
+    ...  # refund["amount"] is what went back to the payer
+elif refund["status"] == RefundStatus.FAILED:
+    ...  # refund["failureCode"]; a new attempt needs a NEW idempotency key
+```
+
+A failed refund sends no webhook, so poll `get_refund` if you need to know about failures. On
+`failed`, `amount` is always None and `failureCode` is `REFUND_AMOUNT_EXCEEDED`,
+`PAYMENT_NOT_REFUNDABLE` or `REFUND_FAILED` (`REFUND_FAILURE_CODES`); treat any other value as
+`REFUND_FAILED`. Nulls are absent on the wire and the SDK fills them in as None, so every key of
+the `Refund` is always there.
+
+The idempotency key works like a charge's: it is required, signed, and the same key answers the
+same refund and never refunds twice. Retry a timeout with the **same** key; a replay answers
+with the refund as it stands now. The same key with a different amount, reason or payment is
+refused as `IDEMPOTENCY_KEY_REUSED`.
+
+When the gateway answers with a code instead of a refund you get a `RefundError` (a subclass of
+`ApiError`) with `error_code`, `http_status`, and `retryable` plus `retry_stop_after_seconds`
+for the two codes worth retrying with the same key:
+
+| `error_code` | HTTP | Retry with the same key? |
+|---|---|---|
+| `PAYMENT_NOT_FOUND` | 404 | No: not a card-not-present payment of your account |
+| `REFUND_NOT_FOUND` | 404 | `get_refund` right after the 202: yes, for up to 60 seconds |
+| `PAYMENT_NOT_REFUNDABLE` | 422 | No: not paid, or already fully refunded. Nothing queued, key not burnt |
+| `REFUND_AMOUNT_EXCEEDED` | 422 | No: the message names the amount left. Nothing queued, key not burnt |
+| `IDEMPOTENCY_KEY_REUSED` | 422 | No: use a fresh key for a genuinely new refund |
+| `DUPLICATE_REQUEST` | 409 | Yes, after a second, for up to 120 seconds |
+| `IDEMPOTENCY_KEY_REQUIRED` | 400 | No: fix the call |
+
+A 5xx is a `TransportError`: nothing was queued, retry with the same key.
+
+```python
+try:
+    refund = client.create_refund(transaction_id, idempotency_key=key)
+except RefundError as error:
+    if error.retryable:
+        ...  # retry with the SAME key within error.retry_stop_after_seconds
+    else:
+        ...  # error.error_code says why; nothing was refunded
+```
+
 ## Webhooks
 
 Webhooks are how you find out what happened to a payment. Create an endpoint in the Dominaite
@@ -456,6 +528,40 @@ bytes of its first attempt, so an event rendered before `apiVersion` existed arr
 
 Amounts are minor units. On `payment.*` events `amount` is what you get paid and `grossAmount`
 is what moved on the card; on `payment.refunded` `amount` is what went back to the customer.
+`payment.refunded` fires once per completed refund, partial or full: its `transactionId` is the
+refund's own id and `originalTransactionId` the payment it refunds.
+
+Unlike the API responses, webhooks write null fields out as `null`. Read a missing key and a
+`null` the same way.
+
+### The saved card on payment events
+
+On a session created with `save_card=True`, `payment.succeeded` (and `payment.requires_capture`
+for an authorization) carries the card in `data["storedPaymentMethod"]`: the same object, with
+the same keys, as `storedPaymentMethod` on `get_status()`.
+
+```json
+"storedPaymentMethod": {
+  "id": "pm_0123456789abcdef0123456789abcdef",
+  "brand": "visa",
+  "last4": "4242",
+  "expiryMonth": 12,
+  "expiryYear": 2030,
+  "status": "active",
+  "retiredReason": null
+}
+```
+
+It is None (or missing) on every other event and when no card was saved. **It can also be None
+when a card was saved**: the card can be stored after the approval was already announced, for
+example on a payment approved on the spot server to server, or one settled later. The status
+read is the source of truth, so on a `save_card` session whose webhook has no card, read it:
+
+```python
+card = event["data"].get("storedPaymentMethod")
+if card is None and session_saved_a_card:
+    card = client.get_status(event["data"]["transactionId"]).get("storedPaymentMethod")
+```
 
 ### Delivery, retries, and staying enabled
 
@@ -506,7 +612,8 @@ if last is not None and sequence <= last:
 A delivery from before the counter carries no `sequence` or `0`. Nothing orders two of those
 against each other, so read the object by id when that matters.
 
-`WebhookEvent`, `AgreementEventData` and `ChargeEventData` are `TypedDict`s of these shapes.
+`WebhookEvent`, `PaymentEventData`, `AgreementEventData` and `ChargeEventData` are `TypedDict`s
+of these shapes, and `StoredPaymentMethod` is the card on both `get_status()` and payment events.
 `verify_webhook` still returns a plain dict, so `cast` to them when you want the keys checked.
 
 ### Reconcile anyway
@@ -619,6 +726,7 @@ answers `PRIOR_ATTEMPT_FAILED` and the key is spent; reconcile and use a fresh k
 | `CheckoutRefusedError` | The gateway refused to open the session (`error_code`) | Depends on the code |
 | `StorefrontError` | The storefront (website) cannot take payments yet, or the key belongs to another one (`error_code`, `http_status`). Subclass of `ApiError` | No - fix the setup |
 | `ChargeError` | The gateway answered a charge with a code instead of a charge (`error_code`, `http_status`, `charge`, `transaction_id`) | Depends on the code; never with a new key |
+| `RefundError` | The gateway answered a refund call with a code (`error_code`, `http_status`, `retryable`, `retry_stop_after_seconds`). Subclass of `ApiError` | Only when `retryable`, same key |
 | `RevokeError` | The gateway refused to revoke a stored payment method; nothing changed (`error_code`, `http_status`) | `MERCHANT_API_UNAVAILABLE` only |
 | `ApiError` | Unexpected response, or a 4xx like an unknown transaction id (`http_status`, `error_code`) | No |
 | `RateLimitError` | HTTP 429; you are sending faster than the key is allowed (`retry_after_seconds`) | Yes, after you wait |
