@@ -1,5 +1,5 @@
 {
-  "$comment": "CANONICAL merchant-API response contract (v1). Every Dominaite SDK vendors a byte-identical copy of this file and asserts, in its own suite, that (1) its response types deserialize each example below, (2) it exposes EXACTLY the fields listed per endpoint (no more, no fewer), and (3) its status enum equals statusVocabulary. This pins the response contract so a field or status value cannot silently ship in one SDK and be sibling-mirrored wrong into the others. Do NOT add, rename or drop anything here without the matching platform API change shipping first. NOTE: the ping endpoint is not yet available in the production environment as of 2026-08-21 - READMEs say so too. Stored payment methods (saveCard on create, storedPaymentMethod on status, the payment-methods charge and revoke endpoints) ship with the gateway's recurring-payments release and are part of v1; their examples below are copied from the gateway DTOs (MerchantStoredPaymentMethodResponse, MerchantPaymentMethodChargeResponse, MerchantApiChargeFunctions.SerializeChargeResult). The gateway serializes with WhenWritingNull, so every null below is ABSENT on the wire: an SDK must read a missing field and a null field as the same thing.",
+  "$comment": "CANONICAL merchant-API response contract (v1). Every Dominaite SDK vendors a byte-identical copy of this file and asserts, in its own suite, that (1) its response types deserialize each example below, (2) it exposes EXACTLY the fields listed per endpoint (no more, no fewer), and (3) its status enum equals statusVocabulary. This pins the response contract so a field or status value cannot silently ship in one SDK and be sibling-mirrored wrong into the others. Do NOT add, rename or drop anything here without the matching platform API change shipping first. NOTE: the ping endpoint is not yet available in the production environment as of 2026-08-21 - READMEs say so too. Stored payment methods (saveCard on create, storedPaymentMethod on status, the payment-methods charge and revoke endpoints) ship with the gateway's recurring-payments release and are part of v1; their examples below are copied from the gateway DTOs (MerchantStoredPaymentMethodResponse, MerchantPaymentMethodChargeResponse, MerchantApiChargeFunctions.SerializeChargeResult). The gateway serializes with WhenWritingNull, so every null below is ABSENT on the wire: an SDK must read a missing field and a null field as the same thing. Refunds (createRefund, getRefund) ship with gateway #3502 and are part of v1; their examples are copied from MerchantRefundResponse and MerchantRefundService. A failed refund never carries an amount.",
   "version": "v1",
   "statusVocabulary": [
     "pending",
@@ -487,6 +487,203 @@
           }
         }
       }
+    },
+    "createRefund": {
+      "method": "POST",
+      "path": "/merchant-api/payments/{transactionId}/refunds",
+      "httpStatus": 202,
+      "note": "Idempotency-Key is required and signed. Omit amount to refund everything still refundable; amount is in minor units of the payment currency per the gateway currency exponents. reason is optional, at most 500 characters. 202 means queued, not done: read it back with getRefund or wait for payment.refunded. A replay of the same key answers 202 with the refund as it stands now.",
+      "fields": [
+        "refundId",
+        "transactionId",
+        "status",
+        "amount",
+        "currency",
+        "failureCode",
+        "failureMessage",
+        "completedAt"
+      ],
+      "partialExample": {
+        "success": true,
+        "data": {
+          "refundId": "re_7c1e9a2b4d6f48a0b3c5d7e9f1a2b3c4",
+          "transactionId": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+          "status": "pending",
+          "amount": 2500,
+          "currency": "EUR"
+        },
+        "metadata": {
+          "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+          "timestamp": "2026-09-26T10:04:12.5530000Z",
+          "apiVersion": "1.0",
+          "processingTimeMs": 212
+        }
+      },
+      "fullExample": {
+        "success": true,
+        "data": {
+          "refundId": "re_8d2f0b3c5e7a49b1c4d6e8f0a2b3c4d5",
+          "transactionId": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+          "status": "pending",
+          "currency": "HUF"
+        },
+        "metadata": {
+          "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+          "timestamp": "2026-09-26T10:04:12.5530000Z",
+          "apiVersion": "1.0",
+          "processingTimeMs": 198
+        }
+      },
+      "errorExamples": [
+        {
+          "httpStatus": 404,
+          "code": "PAYMENT_NOT_FOUND",
+          "body": {
+            "success": false,
+            "error": {
+              "message": "Payment not found.",
+              "code": "PAYMENT_NOT_FOUND",
+              "statusCode": 404,
+              "timestamp": "2026-09-26T10:04:12.5530000Z"
+            },
+            "metadata": {
+              "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+              "timestamp": "2026-09-26T10:04:12.5530000Z",
+              "apiVersion": "1.0",
+              "processingTimeMs": 41
+            }
+          }
+        },
+        {
+          "httpStatus": 422,
+          "code": "REFUND_AMOUNT_EXCEEDED",
+          "body": {
+            "success": false,
+            "error": {
+              "message": "The amount is more than what is left to refund (1500 in minor units, counting refunds in progress).",
+              "code": "REFUND_AMOUNT_EXCEEDED",
+              "statusCode": 422,
+              "timestamp": "2026-09-26T10:04:12.5530000Z"
+            },
+            "metadata": {
+              "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+              "timestamp": "2026-09-26T10:04:12.5530000Z",
+              "apiVersion": "1.0",
+              "processingTimeMs": 41
+            }
+          }
+        },
+        {
+          "httpStatus": 422,
+          "code": "PAYMENT_NOT_REFUNDABLE",
+          "body": {
+            "success": false,
+            "error": {
+              "message": "This payment cannot be refunded: it is not a completed payment, or it is already fully refunded.",
+              "code": "PAYMENT_NOT_REFUNDABLE",
+              "statusCode": 422,
+              "timestamp": "2026-09-26T10:04:12.5530000Z"
+            },
+            "metadata": {
+              "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+              "timestamp": "2026-09-26T10:04:12.5530000Z",
+              "apiVersion": "1.0",
+              "processingTimeMs": 41
+            }
+          }
+        },
+        {
+          "httpStatus": 422,
+          "code": "IDEMPOTENCY_KEY_REUSED",
+          "body": {
+            "success": false,
+            "error": {
+              "message": "This Idempotency-Key was first used for a different refund; use a fresh key.",
+              "code": "IDEMPOTENCY_KEY_REUSED",
+              "statusCode": 422,
+              "timestamp": "2026-09-26T10:04:12.5530000Z"
+            },
+            "metadata": {
+              "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+              "timestamp": "2026-09-26T10:04:12.5530000Z",
+              "apiVersion": "1.0",
+              "processingTimeMs": 41
+            }
+          }
+        }
+      ]
+    },
+    "getRefund": {
+      "method": "GET",
+      "path": "/merchant-api/payments/{transactionId}/refunds/{refundId}",
+      "httpStatus": 200,
+      "note": "Signed with an empty idempotency key and an empty body. REFUND_NOT_FOUND right after a 202 means the refund is not picked up yet: poll again for up to 60 seconds.",
+      "fields": [
+        "refundId",
+        "transactionId",
+        "status",
+        "amount",
+        "currency",
+        "failureCode",
+        "failureMessage",
+        "completedAt"
+      ],
+      "succeededExample": {
+        "success": true,
+        "data": {
+          "refundId": "re_7c1e9a2b4d6f48a0b3c5d7e9f1a2b3c4",
+          "transactionId": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+          "status": "succeeded",
+          "amount": 2500,
+          "currency": "EUR",
+          "completedAt": "2026-09-26T10:05:40.1200000Z"
+        },
+        "metadata": {
+          "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+          "timestamp": "2026-09-26T10:04:12.5530000Z",
+          "apiVersion": "1.0",
+          "processingTimeMs": 37
+        }
+      },
+      "failedExample": {
+        "success": true,
+        "data": {
+          "refundId": "re_9e3a1c4d6f8b40c2d5e7f9a1b3c4d5e6",
+          "transactionId": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+          "status": "failed",
+          "currency": "EUR",
+          "failureCode": "REFUND_FAILED",
+          "failureMessage": "The refund could not be completed. Retry with a new Idempotency-Key if it is still wanted.",
+          "completedAt": "2026-09-26T10:05:41.0000000Z"
+        },
+        "metadata": {
+          "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+          "timestamp": "2026-09-26T10:04:12.5530000Z",
+          "apiVersion": "1.0",
+          "processingTimeMs": 35
+        }
+      },
+      "errorExamples": [
+        {
+          "httpStatus": 404,
+          "code": "REFUND_NOT_FOUND",
+          "body": {
+            "success": false,
+            "error": {
+              "message": "Refund not found on this payment. A refund appears here once the refund pipeline has picked it up.",
+              "code": "REFUND_NOT_FOUND",
+              "statusCode": 404,
+              "timestamp": "2026-09-26T10:04:12.5530000Z"
+            },
+            "metadata": {
+              "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
+              "timestamp": "2026-09-26T10:04:12.5530000Z",
+              "apiVersion": "1.0",
+              "processingTimeMs": 41
+            }
+          }
+        }
+      ]
     }
   },
   "storedPaymentMethodStatusVocabulary": [
@@ -530,5 +727,28 @@
     "UPSTREAM_CONTRACT_ERROR",
     "MERCHANT_API_UNAVAILABLE"
   ],
-  "$revokeErrorNote": "502 UPSTREAM_CONTRACT_ERROR: the provider refused, nothing changed, not retryable. 503 MERCHANT_API_UNAVAILABLE: nothing changed, retry later."
+  "$revokeErrorNote": "502 UPSTREAM_CONTRACT_ERROR: the provider refused, nothing changed, not retryable. 503 MERCHANT_API_UNAVAILABLE: nothing changed, retry later.",
+  "$refundStatusNote": "pending = queued; processing = with the payment provider; succeeded and failed are final. failed is final for that Idempotency-Key: a new attempt needs a new key.",
+  "refundStatusVocabulary": [
+    "pending",
+    "processing",
+    "succeeded",
+    "failed"
+  ],
+  "$refundErrorNote": "The codes the refund routes answer with: 404 PAYMENT_NOT_FOUND, 404 REFUND_NOT_FOUND (status read only, retry for up to 60 seconds), 422 PAYMENT_NOT_REFUNDABLE and REFUND_AMOUNT_EXCEEDED (nothing queued, key not burnt), 422 IDEMPOTENCY_KEY_REUSED, 409 DUPLICATE_REQUEST (retry with the SAME key for up to 120 seconds), 400 IDEMPOTENCY_KEY_REQUIRED. A 500 means nothing was queued: retry with the SAME key. REFUND_FAILED is not an HTTP error: it is a failureCode on a failed refund.",
+  "refundErrorCodes": [
+    "PAYMENT_NOT_FOUND",
+    "REFUND_NOT_FOUND",
+    "PAYMENT_NOT_REFUNDABLE",
+    "REFUND_AMOUNT_EXCEEDED",
+    "IDEMPOTENCY_KEY_REUSED",
+    "DUPLICATE_REQUEST",
+    "IDEMPOTENCY_KEY_REQUIRED"
+  ],
+  "$refundFailureNote": "failureCode on a failed refund (status read or same-key replay). Treat an unknown value as REFUND_FAILED.",
+  "refundFailureCodes": [
+    "REFUND_AMOUNT_EXCEEDED",
+    "PAYMENT_NOT_REFUNDABLE",
+    "REFUND_FAILED"
+  ]
 }
