@@ -1553,7 +1553,8 @@ def test_get_status_passes_the_stored_payment_method_through_and_leaves_payment_
     }}))
 
     status = client.get_status(TRANSACTION_ID)
-    assert status["storedPaymentMethod"] == stored
+    # The gateway omits a null retiredReason on the wire; the SDK reads absent as None.
+    assert status["storedPaymentMethod"] == dict(stored, retiredReason=None)
     # The gateway's own paymentMethod is a category string, not the card; it is not
     # typed by this SDK but it must not be mistaken for, or clobbered by, the card on file.
     assert status["paymentMethod"] == "card"
@@ -1567,6 +1568,7 @@ def test_get_status_normalises_an_unreported_brand_and_expiry_and_adds_no_key_wi
     urlopen((200, {"success": True, "data": dict(bare, status="succeeded", storedPaymentMethod={"id": PAYMENT_METHOD_ID, "status": "active"})}))
     assert client.get_status(TRANSACTION_ID)["storedPaymentMethod"] == {
         "id": PAYMENT_METHOD_ID, "brand": None, "last4": None, "expiryMonth": None, "expiryYear": None, "status": "active",
+        "retiredReason": None,
     }
 
 

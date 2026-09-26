@@ -77,18 +77,42 @@ class StoredPaymentMethodStatus(str, Enum):
 
     Read off ``get_status()["storedPaymentMethod"]["status"]``. Only ``ACTIVE`` methods
     can be charged. ``REVOKED`` is what :meth:`DominaiteClient.revoke_payment_method`
-    leaves behind; ``EXPIRED`` means the card's expiry date has passed. Treat a value
-    you do not recognise as not chargeable.
+    leaves behind; ``EXPIRED`` means the card's expiry date has passed. ``RETIRED`` means
+    the platform stopped the card on its own (``retiredReason`` says why); it never
+    becomes active again, so ask the customer to save a card again. Treat a value you do
+    not recognise as not chargeable.
     """
 
     ACTIVE = "active"
     REVOKED = "revoked"
     EXPIRED = "expired"
+    RETIRED = "retired"
 
 
 #: Every stored payment method status the API can return today, in contract order.
 STORED_PAYMENT_METHOD_STATUSES: Tuple[str, ...] = tuple(
     member.value for member in StoredPaymentMethodStatus
+)
+
+
+class StoredPaymentMethodRetiredReason(str, Enum):
+    """Why the platform retired a stored payment method, in contract order.
+
+    Read off ``get_status()["storedPaymentMethod"]["retiredReason"]``: None unless the
+    status is ``retired``, and kept if you revoke the card afterwards. ``HARD_DECLINE``:
+    a charge on it was declined as final. ``CHARGEBACK``: a charge on it was disputed.
+    ``SOURCE_SALE_REVERSED``: the payment that saved it was fully refunded or disputed.
+    Treat a value you do not recognise as retired for an unknown reason.
+    """
+
+    HARD_DECLINE = "hard_decline"
+    CHARGEBACK = "chargeback"
+    SOURCE_SALE_REVERSED = "source_sale_reversed"
+
+
+#: Every retired reason the API can return today, in contract order.
+STORED_PAYMENT_METHOD_RETIRED_REASONS: Tuple[str, ...] = tuple(
+    member.value for member in StoredPaymentMethodRetiredReason
 )
 
 

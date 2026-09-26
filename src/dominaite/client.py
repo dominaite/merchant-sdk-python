@@ -935,7 +935,7 @@ def _charge(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _stored_payment_method(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Same rule for the card on file: brand, last4 and the expiry are absent when unreported."""
+    """Same rule for the card on file: brand, last4, the expiry and retiredReason may be absent."""
     stored = dict(data)
     stored["id"] = str(data.get("id") or "")
     stored["brand"] = data["brand"] if isinstance(data.get("brand"), str) else None
@@ -952,4 +952,5 @@ def _stored_payment_method(data: Dict[str, Any]) -> Dict[str, Any]:
         else None
     )
     stored["status"] = str(data.get("status") or "")
+    stored["retiredReason"] = data["retiredReason"] if isinstance(data.get("retiredReason"), str) else None
     return stored
