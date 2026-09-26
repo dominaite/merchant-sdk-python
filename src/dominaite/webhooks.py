@@ -13,6 +13,7 @@ import time
 from typing import Any, Dict, Optional, Tuple, TypedDict, Union
 
 from .exceptions import WebhookVerificationError
+from .models import StoredPaymentMethod
 
 #: Header Dominaite signs each delivery with. An endpoint can be configured to send a
 #: different header name; the value format is the same either way.
@@ -45,6 +46,45 @@ class WebhookEvent(_WebhookEventRequired, total=False):
     """
 
     apiVersion: str
+
+
+class _PaymentEventDataRequired(TypedDict):
+    transactionId: str
+    status: str
+    previousStatus: Optional[str]
+    kind: Optional[str]
+    amount: int
+    grossAmount: int
+    surchargeAmount: Optional[int]
+    currency: str
+    originalTransactionId: Optional[str]
+    idempotencyKey: Optional[str]
+
+
+class PaymentEventData(_PaymentEventDataRequired, total=False):
+    """``data`` of a ``payment.*`` event.
+
+    ``amount`` is what you get paid and ``grossAmount`` what moved on the card, both in
+    minor units; on ``payment.refunded`` ``transactionId`` is the refund's own id,
+    ``amount`` that refund's amount and ``originalTransactionId`` the refunded payment.
+    Webhooks send null fields as explicit ``null``; the optional keys below can be
+    missing on events rendered before the gateway sent them.
+
+    ``storedPaymentMethod`` is the card a ``save_card`` payment kept on file, the same
+    :class:`StoredPaymentMethod` as on :meth:`DominaiteClient.get_status`. It is only set
+    on ``payment.succeeded`` and ``payment.requires_capture``, and even there it can be
+    None although a card was saved (it can be stored after the approval was announced).
+    The status read is the source of truth for the card.
+    """
+
+    paymentMethod: Optional[str]
+    walletType: Optional[str]
+    orderReference: Optional[str]
+    orderId: Optional[str]
+    description: Optional[str]
+    paymentMethodBrand: Optional[str]
+    paymentMethodLast4: Optional[str]
+    storedPaymentMethod: Optional[StoredPaymentMethod]
 
 
 class _AgreementEventDataRequired(TypedDict):

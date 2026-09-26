@@ -610,8 +610,8 @@ class DominaiteClient:
         still live.
 
         ``storedPaymentMethod`` is the card kept on file by a session created with
-        ``save_card=True``: ``{"id", "brand", "last4", "expiryMonth", "expiryYear",
-        "status"}``, present once the payment is approved (and it stays after a revoke,
+        ``save_card=True``, a :class:`StoredPaymentMethod`: ``{"id", "brand", "last4",
+        "expiryMonth", "expiryYear", "status", "retiredReason"}``, present once the payment is approved (and it stays after a revoke,
         with ``status`` ``revoked``); absent or None until then, for sessions without
         ``save_card`` and for declined or abandoned ones. ``brand``, ``last4`` and the
         expiry are None when the provider did not report them. It is not the

@@ -34,7 +34,7 @@ from .exceptions import (
     TransportError,
     WebhookVerificationError,
 )
-from .models import Refund
+from .models import Refund, StoredPaymentMethod
 from .statuses import (
     CHARGE_STATUSES,
     DECLINE_CLASSES,
@@ -58,6 +58,7 @@ from .webhooks import (
     AgreementEventData,
     ChargeEventData,
     ChargeEventPaymentMethod,
+    PaymentEventData,
     WebhookEvent,
     sign_webhook,
     verify_webhook,
@@ -100,6 +101,7 @@ __all__ = [
     "DominaiteClient",
     "DominaiteError",
     "ErrorCode",
+    "PaymentEventData",
     "PaymentStatus",
     "RateLimitError",
     "Refund",
@@ -107,6 +109,7 @@ __all__ = [
     "RefundStatus",
     "RevokeError",
     "StorefrontError",
+    "StoredPaymentMethod",
     "StoredPaymentMethodRetiredReason",
     "StoredPaymentMethodStatus",
     "TransportError",

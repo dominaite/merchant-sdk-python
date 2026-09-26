@@ -43,6 +43,7 @@ from dominaite import (
     RefundError,
     RefundStatus,
     RevokeError,
+    StoredPaymentMethod,
     StoredPaymentMethodRetiredReason,
     StoredPaymentMethodStatus,
     TransportError,
@@ -235,6 +236,13 @@ def test_get_status_returns_the_saved_card_example_stored_payment_method_include
     # A status without a saved card carries the key as null in the fixture.
     assert "storedPaymentMethod" in endpoint["example"]
     assert endpoint["example"]["storedPaymentMethod"] is None
+
+
+def test_the_stored_payment_method_type_has_exactly_the_contract_fields():
+    """The same type is reused for data.storedPaymentMethod on payment.* webhooks."""
+    fields = set(ENDPOINTS["getStatus"]["storedPaymentMethodFields"])
+    assert set(StoredPaymentMethod.__required_keys__) == fields
+    assert not StoredPaymentMethod.__optional_keys__
 
 
 def test_get_status_reads_absent_card_fields_as_none_like_the_wire(client, answers_with):

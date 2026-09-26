@@ -14,12 +14,17 @@ The secret below is the dummy from the public contract. It authenticates nothing
 
 import hmac
 import json
+from typing import Optional, get_type_hints
 
 import pytest
 
 from dominaite import (
     AgreementEventData,
     ChargeEventData,
+    PaymentEventData,
+    StoredPaymentMethod,
+    StoredPaymentMethodRetiredReason,
+    StoredPaymentMethodStatus,
     WebhookEvent,
     WebhookVerificationError,
     sign_webhook,
@@ -402,12 +407,13 @@ def test_an_event_from_before_api_version_and_sequence_still_verifies():
         (WebhookEvent, AGREEMENT_BODY),
         (AgreementEventData, AGREEMENT_BODY),
         (ChargeEventData, CHARGE_BODY),
+        (PaymentEventData, None),
     ],
-    ids=["envelope", "agreement-data", "charge-data"],
+    ids=["envelope", "agreement-data", "charge-data", "payment-data"],
 )
 def test_the_exported_types_describe_the_wire_shape(event_type, body):
     """The TypedDicts name exactly the keys a delivery carries, no more, no fewer."""
-    decoded = json.loads(body)
+    decoded = json.loads(body if body is not None else _payment_body())
     shape = decoded if event_type is WebhookEvent else decoded["data"]
 
     assert event_type.__required_keys__ | event_type.__optional_keys__ == set(shape)
@@ -419,8 +425,83 @@ def test_the_exported_types_describe_the_wire_shape(event_type, body):
         (WebhookEvent, "apiVersion"),
         (AgreementEventData, "sequence"),
         (ChargeEventData, "sequence"),
+        (PaymentEventData, "storedPaymentMethod"),
     ],
 )
 def test_the_new_fields_are_optional_so_old_payloads_still_fit(event_type, key):
     assert key in event_type.__optional_keys__
     assert key not in event_type.__required_keys__
+
+
+# --- storedPaymentMethod on payment.* ----------------------------------------
+# Webhooks are serialized with the nulls written out, unlike the API responses, so a
+# payment event without a card carries "storedPaymentMethod":null. Absent must read the
+# same: an event rendered before the field existed has no key at all.
+
+ACTIVE_CARD = (
+    '{"id":"pm_0123456789abcdef0123456789abcdef","brand":"visa","last4":"4242",'
+    '"expiryMonth":12,"expiryYear":2030,"status":"active","retiredReason":null}'
+)
+RETIRED_CARD = (
+    '{"id":"pm_0123456789abcdef0123456789abcdef","brand":"visa","last4":"4242",'
+    '"expiryMonth":12,"expiryYear":2030,"status":"retired","retiredReason":"hard_decline"}'
+)
+
+
+def _payment_body(card="null", event_type="payment.succeeded"):
+    """A current payment.* delivery, compact and in the gateway's key order."""
+    return (
+        '{"id":"5b6c7d8e-9f0a-4b1c-8d2e-3f4a5b6c7d8e","type":"' + event_type + '",'
+        '"apiVersion":"2026-09-25","createdAt":"2026-09-26T10:00:00Z","data":{'
+        '"transactionId":"0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0","status":"succeeded",'
+        '"previousStatus":"pending","kind":"sale","amount":8440,"grossAmount":8440,'
+        '"surchargeAmount":null,"currency":"EUR","paymentMethod":"card","walletType":null,'
+        '"originalTransactionId":null,"idempotencyKey":"checkout-1042-8440-EUR",'
+        '"orderReference":"order-1042","orderId":"ord_1","description":null,'
+        '"paymentMethodBrand":"visa","paymentMethodLast4":"4242",'
+        '"storedPaymentMethod":' + card + '}}'
+    )
+
+
+def _verified(body):
+    return verify_webhook(body, _signed(body), SECRET, now=NOW)
+
+
+def test_a_payment_event_carries_the_saved_card():
+    event = _verified(_payment_body(ACTIVE_CARD))
+
+    card = event["data"]["storedPaymentMethod"]
+    assert card == json.loads(ACTIVE_CARD)
+    assert card["status"] == StoredPaymentMethodStatus.ACTIVE
+    assert card["retiredReason"] is None
+
+
+def test_a_payment_event_without_a_card_reads_none_whether_null_or_absent():
+    explicit = _verified(_payment_body("null"))
+    assert "storedPaymentMethod" in explicit["data"]
+    assert explicit["data"]["storedPaymentMethod"] is None
+
+    # The canonical vector predates the field: no key at all, and .get reads it as None.
+    absent = verify_webhook(BODY, EXPECTED_HEADER, SECRET, now=NOW)
+    assert "storedPaymentMethod" not in absent["data"]
+    assert absent["data"].get("storedPaymentMethod") is None
+
+
+def test_a_payment_event_carries_a_retired_card_with_its_reason():
+    event = _verified(_payment_body(RETIRED_CARD, "payment.requires_capture"))
+
+    card = event["data"]["storedPaymentMethod"]
+    assert card["status"] == StoredPaymentMethodStatus.RETIRED
+    assert card["retiredReason"] == StoredPaymentMethodRetiredReason.HARD_DECLINE
+
+
+def test_the_webhook_card_is_the_status_read_card_type():
+    """One type for the card on file, whether it came from get_status or a webhook."""
+    hints = get_type_hints(PaymentEventData)
+    assert hints["storedPaymentMethod"] == Optional[StoredPaymentMethod]
+    assert set(StoredPaymentMethod.__required_keys__) == set(json.loads(ACTIVE_CARD))
+
+
+def test_the_canonical_payment_vector_still_fits_the_required_keys():
+    data = json.loads(BODY)["data"]
+    assert PaymentEventData.__required_keys__ == set(data)
