@@ -8,7 +8,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, Mapping, NamedTuple, Optional, Union
+from typing import Any, Dict, Mapping, NamedTuple, Optional, Union, cast
 
 from .exceptions import (
     STOREFRONT_ERROR_CODES,
@@ -19,10 +19,12 @@ from .exceptions import (
     DominaiteError,
     ErrorCode,
     RateLimitError,
+    RefundError,
     RevokeError,
     StorefrontError,
     TransportError,
 )
+from .models import Refund
 
 __version__ = "0.3.0"
 
@@ -30,6 +32,7 @@ DEFAULT_BASE_URL = "https://api.dominaite.com/payments"
 SESSIONS_PATH = "/merchant-api/checkout/sessions"
 PAYMENT_METHODS_PATH = "/merchant-api/payment-methods"
 PING_PATH = "/merchant-api/ping"
+PAYMENTS_PATH = "/merchant-api/payments"
 DEFAULT_TIMEOUT_SECONDS = 45.0  # serverless cold starts hit 10+s on dev; 15s was a coin flip
 
 #: Hosts allowed to be addressed over plain http. Everything else must be https, so the
@@ -71,6 +74,10 @@ _PAYMENT_METHOD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 #: Everything else with a code is the gateway telling this route something specific (a
 #: decline, an unknown outcome, a refusal) and arrives as ChargeError / RevokeError.
 _GENERIC_FAILURE_STATUSES = frozenset({400, 401, 403, 404, 429})
+
+#: A refund id is ``re_`` + 32 hex today, but held to the same single-path-segment rule as a
+#: payment method id rather than to its current shape.
+_REFUND_ID_RE = _PAYMENT_METHOD_ID_RE
 
 
 class _Reply(NamedTuple):
@@ -310,6 +317,17 @@ def order_idempotency_key(
     return _normalize_idempotency_key(
         "{0}-{1}-{2}-{3}".format(scope, order_id, amount_minor, code)
     )
+
+
+def _normalize_transaction_id(transaction_id: str) -> str:
+    # The canonical path is signed with the lowercase hyphenated form, so that is what
+    # goes into the URL too.
+    normalized = transaction_id.strip().lower()
+    if not _TRANSACTION_ID_RE.match(normalized):
+        raise ValueError(
+            "transaction_id must be the UUID returned by create_checkout_session()"
+        )
+    return normalized
 
 
 def _normalize_payment_method_id(payment_method_id: Any) -> str:
@@ -609,11 +627,7 @@ class DominaiteClient:
         :raises ApiError: Unknown transaction id (HTTP 404) or unexpected response.
         :raises TransportError: Network-level failure (safe to retry).
         """
-        normalized = transaction_id.strip().lower()
-        if not _TRANSACTION_ID_RE.match(normalized):
-            raise ValueError(
-                "transaction_id must be the UUID returned by create_checkout_session()"
-            )
+        normalized = _normalize_transaction_id(transaction_id)
 
         status = self._request("GET", SESSIONS_PATH + "/" + normalized, None, "")
         # Passed through as sent, except the card on file: the gateway omits its null
@@ -760,6 +774,97 @@ class DominaiteClient:
                 result=dict(reply.envelope),
             )
         raise _rejection(reply)
+
+    def create_refund(
+        self,
+        transaction_id: str,
+        amount: Optional[int] = None,
+        reason: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Refund:
+        """Refund a payment, in full or in part.
+
+        The refund is queued, not done, when this returns (HTTP 202): its ``status`` is
+        ``pending``. Read it back with :meth:`get_refund` or wait for ``payment.refunded``,
+        which fires once the money has moved. A refund that fails sends no webhook, so poll
+        if you need to know about failures.
+
+        Signed like a charge and carrying the ``Idempotency-Key`` you pass: the same key
+        answers the same refund and never refunds twice, so retry a timeout WITH THE SAME
+        KEY. A replay answers 202 with the refund as it stands now.
+
+        :param transaction_id: The ``transactionId`` of the payment, from
+            :meth:`create_checkout_session` or :meth:`charge_payment_method`.
+        :param amount: Integer in MINOR units of the payment's currency (2500 = 25.00 EUR,
+            but 2500 HUF is 2500 Ft); :func:`to_minor_units` converts a decimal exactly.
+            Leave it out to refund everything still refundable. Partial refunds add up.
+        :param reason: Free text stored with the refund, at most 500 characters.
+        :param idempotency_key: Required. Derive it from YOUR refund (the return or credit
+            note id), never mint one per attempt. Omitting it raises ``ValueError`` before
+            anything is sent.
+        :returns: The :class:`Refund`, every field present (None where the gateway sent
+            none).
+
+        :raises RefundError: The gateway answered with a code (see :class:`RefundError`
+            for each one and whether it is ``retryable``).
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature.
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``, then retry WITH
+            the same ``idempotency_key``.
+        :raises ApiError: An unexpected response.
+        :raises TransportError: Network-level failure or a 5xx; nothing was queued on a
+            5xx. Retry WITH the same ``idempotency_key``.
+        """
+        normalized = _normalize_transaction_id(transaction_id)
+        # bool is an int in Python; True must not go out as a refund of 1.
+        if amount is not None and (
+            isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0
+        ):
+            raise ValueError(
+                "amount must be a positive integer in MINOR units, or left out to refund "
+                "everything still refundable"
+            )
+        if reason is not None and not isinstance(reason, str):
+            raise ValueError("reason must be a string")
+        key = _normalize_idempotency_key(idempotency_key)
+
+        # A full refund sends no amount key at all, not a null: the body is what gets
+        # signed, and the gateway reads a missing amount as "everything left".
+        body: Dict[str, Any] = {}
+        if amount is not None:
+            body["amount"] = amount
+        if reason is not None:
+            body["reason"] = reason
+
+        reply = self._send("POST", PAYMENTS_PATH + "/" + normalized + "/refunds", body, key)
+        return _refund_result(reply)
+
+    def get_refund(self, transaction_id: str, refund_id: str) -> Refund:
+        """Read one refund of a payment.
+
+        ``REFUND_NOT_FOUND`` right after :meth:`create_refund` means the refund is not
+        picked up yet: poll again for up to 60 seconds (the :class:`RefundError` says
+        ``retryable``). Signed with an empty idempotency key and an empty body, like
+        :meth:`get_status`.
+
+        :param transaction_id: The ``transactionId`` of the refunded payment.
+        :param refund_id: The ``refundId`` from :meth:`create_refund`.
+        :returns: The :class:`Refund`, every field present (None where the gateway sent
+            none).
+
+        :raises RefundError: ``PAYMENT_NOT_FOUND`` or ``REFUND_NOT_FOUND`` (404).
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature.
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``.
+        :raises ApiError: An unexpected response.
+        :raises TransportError: Network-level failure (safe to retry).
+        """
+        normalized = _normalize_transaction_id(transaction_id)
+        refund = str(refund_id or "").strip()
+        if not _REFUND_ID_RE.match(refund):
+            raise ValueError("refund_id must be the refundId from create_refund()")
+        reply = self._send(
+            "GET", PAYMENTS_PATH + "/" + normalized + "/refunds/" + refund, None, ""
+        )
+        return _refund_result(reply)
 
     def _request(
         self,
@@ -932,6 +1037,57 @@ def _charge(data: Dict[str, Any]) -> Dict[str, Any]:
     charge["declineCode"] = data["declineCode"] if isinstance(data.get("declineCode"), str) else None
     charge["transactionId"] = str(data.get("transactionId") or "")
     return charge
+
+
+def _refund_result(reply: _Reply) -> Refund:
+    """Read a refund route's reply: a refund on 2xx, a RefundError when the gateway sent a code."""
+    if 200 <= reply.status < 300:
+        if isinstance(reply.payload.get("refundId"), str):
+            return _refund(reply.payload)
+        raise ApiError(
+            reply.status,
+            "The API answered the refund without a refund body",
+            error_code="UNEXPECTED_RESPONSE",
+        )
+    error_code = reply.error.get("code") or reply.payload.get("errorCode")
+    # Every 4xx with a code is the refund route telling us something specific, 400 and 404
+    # included (REFUND_NOT_FOUND is retryable, PAYMENT_NOT_FOUND is not). Auth and rate
+    # limiting never get here; a 5xx stays a TransportError: nothing was queued.
+    if error_code and 400 <= reply.status < 500:
+        raise RefundError(
+            reply.status,
+            str(error_code),
+            str(reply.error.get("message") or reply.payload.get("errorMessage") or "The refund was refused."),
+            result=dict(reply.envelope),
+        )
+    if reply.status >= 400:
+        raise _rejection(reply)
+    raise ApiError(
+        reply.status,
+        "Unexpected HTTP {0} response; the Dominaite API answers 2xx or a "
+        "documented error. Check base_url and anything proxying it.".format(reply.status),
+        error_code="UNEXPECTED_STATUS",
+    )
+
+
+def _optional_str(data: Dict[str, Any], key: str) -> Optional[str]:
+    value = data.get(key)
+    return value if isinstance(value, str) else None
+
+
+def _refund(data: Dict[str, Any]) -> Refund:
+    """The refund body as one shape: the gateway omits null fields, absent reads as None."""
+    refund = dict(data)
+    refund["refundId"] = str(data.get("refundId") or "")
+    refund["transactionId"] = str(data.get("transactionId") or "")
+    refund["status"] = str(data.get("status") or "")
+    amount = data.get("amount")
+    refund["amount"] = amount if isinstance(amount, int) and not isinstance(amount, bool) else None
+    refund["currency"] = str(data.get("currency") or "")
+    refund["failureCode"] = _optional_str(data, "failureCode")
+    refund["failureMessage"] = _optional_str(data, "failureMessage")
+    refund["completedAt"] = _optional_str(data, "completedAt")
+    return cast(Refund, refund)
 
 
 def _stored_payment_method(data: Dict[str, Any]) -> Dict[str, Any]:

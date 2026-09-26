@@ -52,6 +52,14 @@ class ErrorCode(str, Enum):
     UPSTREAM_CONTRACT_ERROR = "UPSTREAM_CONTRACT_ERROR"
     MERCHANT_API_UNAVAILABLE = "MERCHANT_API_UNAVAILABLE"
 
+    # Refunds (RefundError). REFUND_AMOUNT_EXCEEDED and PAYMENT_NOT_REFUNDABLE are also
+    # failureCode values on a failed refund; REFUND_FAILED is only ever a failureCode.
+    PAYMENT_NOT_FOUND = "PAYMENT_NOT_FOUND"
+    REFUND_NOT_FOUND = "REFUND_NOT_FOUND"
+    PAYMENT_NOT_REFUNDABLE = "PAYMENT_NOT_REFUNDABLE"
+    REFUND_AMOUNT_EXCEEDED = "REFUND_AMOUNT_EXCEEDED"
+    REFUND_FAILED = "REFUND_FAILED"
+
 
 #: Every ``errorCode`` the API can refuse a checkout session with - a business refusal,
 #: sent as HTTP 200 with ``success: false``. Listed so you can assert your own handling
@@ -97,6 +105,34 @@ CHARGE_ERROR_CODES: Tuple[str, ...] = (
 #: The codes :meth:`DominaiteClient.revoke_payment_method` raises as
 #: :class:`RevokeError`, in the gateway's own order.
 REVOKE_ERROR_CODES: Tuple[str, ...] = ("UPSTREAM_CONTRACT_ERROR", "MERCHANT_API_UNAVAILABLE")
+
+#: The codes :meth:`DominaiteClient.create_refund` and :meth:`DominaiteClient.get_refund`
+#: raise as :class:`RefundError`, in contract order. ``REFUND_FAILED`` is not here: a
+#: refund that fails is a result with ``status`` ``failed``, not an exception.
+REFUND_ERROR_CODES: Tuple[str, ...] = (
+    "PAYMENT_NOT_FOUND",
+    "REFUND_NOT_FOUND",
+    "PAYMENT_NOT_REFUNDABLE",
+    "REFUND_AMOUNT_EXCEEDED",
+    "IDEMPOTENCY_KEY_REUSED",
+    "DUPLICATE_REQUEST",
+    "IDEMPOTENCY_KEY_REQUIRED",
+)
+
+#: The ``failureCode`` values a failed refund can carry, in contract order. Treat a value
+#: that is not listed as ``REFUND_FAILED``.
+REFUND_FAILURE_CODES: Tuple[str, ...] = (
+    "REFUND_AMOUNT_EXCEEDED",
+    "PAYMENT_NOT_REFUNDABLE",
+    "REFUND_FAILED",
+)
+
+#: The refund codes worth retrying WITH THE SAME idempotency key, and for how many
+#: seconds before giving up. Every other refund code is final for that request.
+REFUND_RETRY_WINDOWS_SECONDS: Dict[str, int] = {
+    "REFUND_NOT_FOUND": 60,
+    "DUPLICATE_REQUEST": 120,
+}
 
 
 class DominaiteError(Exception):
@@ -314,6 +350,50 @@ class RevokeError(DominaiteError):
         super().__init__(message)
         self.http_status = http_status
         self.error_code = error_code
+        #: The full envelope, for fields not modelled above.
+        self.result = result if result is not None else {}
+
+
+class RefundError(ApiError):
+    """The gateway answered a refund call with an error code instead of a refund.
+
+    ``http_status`` and ``error_code`` say what happened, ``retryable`` whether the same
+    call WITH THE SAME idempotency key can succeed later, and ``retry_stop_after_seconds``
+    how long to keep trying (None when not retryable). Branch on ``error_code``:
+
+    - ``PAYMENT_NOT_FOUND`` (404): no card-not-present payment with this id under your
+      account. Not retryable.
+    - ``REFUND_NOT_FOUND`` (404, :meth:`DominaiteClient.get_refund` only): right after the
+      202 the refund may not be picked up yet. Retryable for up to 60 seconds; after that
+      the id is unknown.
+    - ``PAYMENT_NOT_REFUNDABLE`` (422): not paid, already fully refunded, or everything
+      left is already being refunded. Nothing was queued and the key is not burnt.
+    - ``REFUND_AMOUNT_EXCEEDED`` (422): more than what is left to refund, counting refunds
+      in progress; the message names the amount left. Nothing was queued and the key is
+      not burnt.
+    - ``IDEMPOTENCY_KEY_REUSED`` (422): the key was first used for a different amount,
+      reason or payment. Use a fresh key for a genuinely new refund.
+    - ``DUPLICATE_REQUEST`` (409): a request with this key is being processed right now.
+      Retry with the SAME key after a second, for up to 120 seconds.
+    - ``IDEMPOTENCY_KEY_REQUIRED`` (400): the key is missing or too long.
+
+    A 5xx is a :class:`TransportError` instead: nothing was queued, retry with the same
+    key. Subclasses :class:`ApiError`, so ``except ApiError`` still catches it.
+    ``result`` is the whole envelope the gateway sent.
+    """
+
+    def __init__(
+        self,
+        http_status: int,
+        error_code: str,
+        message: str,
+        result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(http_status, message, error_code=error_code)
+        #: Seconds to keep retrying with the same key, or None when retrying cannot help.
+        self.retry_stop_after_seconds = REFUND_RETRY_WINDOWS_SECONDS.get(error_code)
+        #: True when the same call with the same key can still succeed.
+        self.retryable = self.retry_stop_after_seconds is not None
         #: The full envelope, for fields not modelled above.
         self.result = result if result is not None else {}
 

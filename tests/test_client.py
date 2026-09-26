@@ -15,7 +15,10 @@ from dominaite import (
     CHARGE_ERROR_CODES,
     DEFAULT_BASE_URL,
     PAYMENT_METHODS_PATH,
+    PAYMENTS_PATH,
     PING_PATH,
+    REFUND_ERROR_CODES,
+    REFUND_FAILURE_CODES,
     REVOKE_ERROR_CODES,
     SESSION_REFUSAL_ERROR_CODES,
     SESSIONS_PATH,
@@ -28,6 +31,8 @@ from dominaite import (
     DominaiteClient,
     ErrorCode,
     RateLimitError,
+    RefundError,
+    RefundStatus,
     RevokeError,
     StorefrontError,
     TransportError,
@@ -995,6 +1000,8 @@ def test_every_code_the_sdk_groups_has_a_named_constant():
         + STOREFRONT_ERROR_CODES
         + CHARGE_ERROR_CODES
         + REVOKE_ERROR_CODES
+        + REFUND_ERROR_CODES
+        + REFUND_FAILURE_CODES
     )
     assert set(grouped) <= {member.value for member in ErrorCode}
 
@@ -1782,3 +1789,197 @@ def test_revoke_returns_none_on_a_204_for_an_already_revoked_method_too(client, 
     assert client.revoke_payment_method(PAYMENT_METHOD_ID) is None
     assert client.revoke_payment_method(PAYMENT_METHOD_ID) is None
     assert len(recorder.requests) == 2
+
+
+# --- refunds -----------------------------------------------------------------
+
+
+REFUND_ID = "re_7c1e9a2b4d6f48a0b3c5d7e9f1a2b3c4"
+REFUND_KEY = "refund-cn-5521"
+REFUNDS_PATH = PAYMENTS_PATH + "/" + TRANSACTION_ID + "/refunds"
+# The wire form of a queued partial refund: the gateway omits the null fields.
+QUEUED_REFUND = {
+    "refundId": REFUND_ID,
+    "transactionId": TRANSACTION_ID,
+    "status": "pending",
+    "amount": 1500,
+    "currency": "HUF",
+}
+NULL_REFUND_FIELDS = {"failureCode": None, "failureMessage": None, "completedAt": None}
+
+
+def _accepted(refund=None):
+    return (202, {"success": True, "data": refund if refund is not None else QUEUED_REFUND})
+
+
+def _refund_error(status, code):
+    return (status, {"success": False, "error": {"code": code, "message": "refused: " + code, "statusCode": status}})
+
+
+def test_create_refund_sends_the_key_in_the_header_and_the_signature(client, urlopen):
+    recorder = urlopen(_accepted())
+
+    refund = client.create_refund(TRANSACTION_ID, amount=1500, idempotency_key=REFUND_KEY)
+
+    request = recorder.last
+    headers = _headers(request)
+    assert request.get_method() == "POST"
+    assert request.full_url == BASE_URL + REFUNDS_PATH
+    assert request.data.decode("utf-8") == '{"amount":1500}'
+    assert headers["idempotency-key"] == REFUND_KEY
+    assert headers["x-signature"] == sign_request(
+        SECRET, headers["x-timestamp"], "POST", REFUNDS_PATH, REFUND_KEY, '{"amount":1500}'
+    )
+    assert refund == dict(QUEUED_REFUND, **NULL_REFUND_FIELDS)
+    assert refund["status"] == RefundStatus.PENDING
+
+
+def test_a_full_refund_sends_no_amount_key_at_all(client, urlopen):
+    recorder = urlopen(_accepted(dict(QUEUED_REFUND, amount=None)))
+
+    refund = client.create_refund(TRANSACTION_ID, idempotency_key=REFUND_KEY)
+
+    assert recorder.last.data == b"{}"
+    assert refund["amount"] is None
+
+    client.create_refund(TRANSACTION_ID, reason="Returned in store", idempotency_key=REFUND_KEY)
+    assert json.loads(recorder.last.data) == {"reason": "Returned in store"}
+
+
+def test_create_refund_signs_the_lowercase_transaction_id_path(client, urlopen):
+    recorder = urlopen(_accepted())
+
+    client.create_refund(LETTERED_TRANSACTION_ID.upper(), amount=1500, idempotency_key=REFUND_KEY)
+
+    path = PAYMENTS_PATH + "/" + LETTERED_TRANSACTION_ID + "/refunds"
+    headers = _headers(recorder.last)
+    assert recorder.last.full_url == BASE_URL + path
+    assert headers["x-signature"] == sign_request(
+        SECRET, headers["x-timestamp"], "POST", path, REFUND_KEY, '{"amount":1500}'
+    )
+
+
+@pytest.mark.parametrize("key", [None, ""])
+def test_create_refund_refuses_to_send_without_a_key(client, urlopen, key):
+    recorder = urlopen(_accepted())
+    with pytest.raises(ValueError, match="idempotency_key is required"):
+        client.create_refund(TRANSACTION_ID, amount=1500, idempotency_key=key)
+    assert recorder.requests == []
+
+
+@pytest.mark.parametrize("amount", [0, -1, True, 15.0, "1500"])
+def test_create_refund_refuses_an_amount_that_is_not_positive_minor_units(client, urlopen, amount):
+    recorder = urlopen(_accepted())
+    with pytest.raises(ValueError, match="MINOR"):
+        client.create_refund(TRANSACTION_ID, amount=amount, idempotency_key=REFUND_KEY)
+    assert recorder.requests == []
+
+
+def test_create_refund_refuses_a_transaction_id_that_is_not_a_uuid(client, urlopen):
+    recorder = urlopen(_accepted())
+    with pytest.raises(ValueError, match="UUID"):
+        client.create_refund("../ping", idempotency_key=REFUND_KEY)
+    assert recorder.requests == []
+
+
+def test_get_refund_signs_an_empty_key_and_an_empty_body(client, urlopen):
+    succeeded = dict(QUEUED_REFUND, status="succeeded", completedAt="2026-09-26T10:05:40Z")
+    recorder = urlopen((200, {"success": True, "data": succeeded}))
+
+    refund = client.get_refund(TRANSACTION_ID, REFUND_ID)
+
+    request = recorder.last
+    headers = _headers(request)
+    path = REFUNDS_PATH + "/" + REFUND_ID
+    assert request.get_method() == "GET"
+    assert request.full_url == BASE_URL + path
+    assert request.data is None
+    assert "idempotency-key" not in headers
+    assert headers["x-signature"] == sign_request(SECRET, headers["x-timestamp"], "GET", path, "", "")
+    assert refund == dict(succeeded, failureCode=None, failureMessage=None)
+    assert refund["status"] == RefundStatus.SUCCEEDED
+
+
+def test_get_refund_reads_a_failed_refund_with_no_amount_and_its_failure_code(client, urlopen):
+    failed = {
+        "refundId": REFUND_ID,
+        "transactionId": TRANSACTION_ID,
+        "status": "failed",
+        "currency": "HUF",
+        "failureCode": "REFUND_FAILED",
+        "failureMessage": "The refund could not be completed.",
+        "completedAt": "2026-09-26T10:05:41Z",
+    }
+    urlopen((200, {"success": True, "data": failed}))
+
+    refund = client.get_refund(TRANSACTION_ID, REFUND_ID)
+
+    assert refund == dict(failed, amount=None)
+    assert refund["status"] == RefundStatus.FAILED
+    assert refund["failureCode"] in REFUND_FAILURE_CODES
+
+
+@pytest.mark.parametrize("bad", ["", "re_1/../x", "re 1", "re_1?x=1"])
+def test_get_refund_refuses_a_refund_id_that_would_not_stay_one_path_segment(client, urlopen, bad):
+    recorder = urlopen((200, {"success": True, "data": QUEUED_REFUND}))
+    with pytest.raises(ValueError):
+        client.get_refund(TRANSACTION_ID, bad)
+    assert recorder.requests == []
+
+
+@pytest.mark.parametrize(
+    "status, code, retry_stop_after_seconds",
+    [
+        (404, "PAYMENT_NOT_FOUND", None),
+        (404, "REFUND_NOT_FOUND", 60),
+        (422, "PAYMENT_NOT_REFUNDABLE", None),
+        (422, "REFUND_AMOUNT_EXCEEDED", None),
+        (422, "IDEMPOTENCY_KEY_REUSED", None),
+        (409, "DUPLICATE_REQUEST", 120),
+        (400, "IDEMPOTENCY_KEY_REQUIRED", None),
+    ],
+)
+@pytest.mark.parametrize("call", ["create", "get"])
+def test_every_refund_code_is_a_refund_error_with_its_retry_classification(
+    client, urlopen, status, code, retry_stop_after_seconds, call
+):
+    urlopen(_refund_error(status, code))
+
+    with pytest.raises(RefundError) as raised:
+        if call == "create":
+            client.create_refund(TRANSACTION_ID, amount=1500, idempotency_key=REFUND_KEY)
+        else:
+            client.get_refund(TRANSACTION_ID, REFUND_ID)
+
+    error = raised.value
+    assert isinstance(error, ApiError)
+    assert not isinstance(error, TransportError)
+    assert error.http_status == status
+    assert error.error_code == code
+    assert error.retryable is (retry_stop_after_seconds is not None)
+    assert error.retry_stop_after_seconds == retry_stop_after_seconds
+    assert str(error) == "refused: " + code
+    assert error.result["error"]["code"] == code
+
+
+def test_the_refund_error_cases_cover_every_code_the_sdk_claims():
+    assert set(REFUND_ERROR_CODES) == {
+        "PAYMENT_NOT_FOUND", "REFUND_NOT_FOUND", "PAYMENT_NOT_REFUNDABLE", "REFUND_AMOUNT_EXCEEDED",
+        "IDEMPOTENCY_KEY_REUSED", "DUPLICATE_REQUEST", "IDEMPOTENCY_KEY_REQUIRED",
+    }
+    # A failed refund is a result, not an exception.
+    assert "REFUND_FAILED" not in REFUND_ERROR_CODES
+
+
+@pytest.mark.parametrize("outcome", [(500, {"success": False}), _refund_error(503, "MERCHANT_API_UNAVAILABLE")])
+def test_a_5xx_on_a_refund_is_a_transport_error_retry_with_the_same_key(client, urlopen, outcome):
+    urlopen(outcome)
+    with pytest.raises(TransportError):
+        client.create_refund(TRANSACTION_ID, amount=1500, idempotency_key=REFUND_KEY)
+
+
+def test_a_2xx_without_a_refund_body_is_an_api_error_not_a_half_built_refund(client, urlopen):
+    urlopen((202, {"success": True, "data": {}}))
+    with pytest.raises(ApiError) as raised:
+        client.create_refund(TRANSACTION_ID, idempotency_key=REFUND_KEY)
+    assert raised.value.error_code == "UNEXPECTED_RESPONSE"
