@@ -272,6 +272,56 @@ idempotency key: once the session is a few minutes past expiry, that returns a f
 for the same order (see
 [Recovering from a replay refusal](#recovering-from-a-replay-refusal)).
 
+## Card fields
+
+Instead of the hosted widget, you can render card fields inside your own checkout page. Card
+fields are enabled per merchant on request: ask Dominaite support to switch them on. Until then a
+session with `integration="fields"` is rejected with a 400 (`INVALID_SELECTION` on
+`integration`).
+
+Pass `integration="fields"` (or `CheckoutIntegration.FIELDS`) when you create the session. Leave
+it out (or pass `"widget"`) for the hosted widget. It is part of the idempotency identity, so a
+replay of the same key with a different `integration` is refused with `IDEMPOTENCY_KEY_REUSED`.
+
+```python
+from dominaite import CheckoutIntegration
+
+session = client.create_checkout_session(
+    amount=8440,
+    currency="EUR",
+    order_reference="order-1042",
+    integration=CheckoutIntegration.FIELDS,
+    idempotency_key=order_idempotency_key("checkout", "1042", 8440, "EUR"),
+)
+# session["integration"] == "fields", session["clientSecret"] is set
+```
+
+Hand `transactionId`, `integration`, `cashierKey`, `cashierToken` and `clientSecret` to the
+payer's page, load the drop-in and mount it:
+
+```html
+<div id="checkout"></div>
+<script src="https://pay.dominaite.com/v1/checkout.js"></script>
+<script>
+  const checkout = Dominaite.checkout({
+    transactionId: "{{ transaction_id }}",
+    integration: "fields",
+    cashierKey: "{{ cashier_key }}",
+    cashierToken: "{{ cashier_token }}",
+    clientSecret: "{{ client_secret }}",
+  })
+  checkout.on("success", () => { /* show a "thank you, confirming" state */ })
+  checkout.mount("#checkout")
+</script>
+```
+
+`clientSecret` is what lets the browser charge this one session: keep it out of your logs and
+escape it for the context you template it into. A widget session has no `clientSecret` key, so
+read it with `session.get("clientSecret")`.
+
+The page saying "success" is not proof of payment. Mark the order paid only from the
+`payment.succeeded` webhook or a `get_status()` read, exactly as with the widget.
+
 ## Stored payment methods (recurring)
 
 Pass `save_card=True` when you create a session and, once that payment is approved, the gateway
