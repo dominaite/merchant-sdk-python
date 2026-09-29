@@ -98,8 +98,8 @@
         "checkout": {
           "transactionId": "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d",
           "orderId": "dom_1a2b3c4d5e6f",
-          "cashierKey": "ck_live_blox_8c7d6e5f4a3b2c1d",
-          "cashierToken": "ctok_blox_0a1b2c3d4e5f6a7b",
+          "cashierKey": "ck_live_fields_8c7d6e5f4a3b2c1d",
+          "cashierToken": "ctok_fields_0a1b2c3d4e5f6a7b",
           "amount": 8440,
           "currency": "EUR",
           "expiresAt": "2026-08-21T11:15:30.000Z",
