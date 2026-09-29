@@ -22,6 +22,7 @@ import pytest
 from dominaite import (
     CHARGE_ERROR_CODES,
     CHARGE_STATUSES,
+    CHECKOUT_INTEGRATIONS,
     DECLINE_CLASSES,
     PAYMENT_STATUSES,
     REFUND_ERROR_CODES,
@@ -36,6 +37,7 @@ from dominaite import (
     ApiError,
     ChargeError,
     ChargeStatus,
+    CheckoutIntegration,
     CheckoutRefusedError,
     DeclineClass,
     DominaiteClient,
@@ -183,9 +185,41 @@ def test_create_checkout_session_returns_exactly_the_checkout_fields(
         idempotency_key=IDEMPOTENCY_KEY,
     )
 
-    # create_checkout_session() hands back the `checkout` object, not the envelope.
-    assert sorted(checkout) == sorted(endpoint["checkoutFields"])
+    # create_checkout_session() hands back the `checkout` object, not the envelope. A
+    # widget session has no clientSecret: it is null, so absent on the wire.
     assert checkout == endpoint["successExample"]["checkout"]
+    assert sorted(checkout) == sorted(
+        field for field in endpoint["checkoutFields"] if field != "clientSecret"
+    )
+    assert checkout["integration"] == CheckoutIntegration.WIDGET
+    assert checkout.get("clientSecret") is None
+
+
+def test_create_checkout_session_returns_the_fields_session_with_its_client_secret(
+    client, answers_with
+):
+    endpoint = ENDPOINTS["createCheckoutSession"]
+    example = endpoint["fieldsSuccessExample"]
+    answers_with(example)
+
+    checkout = client.create_checkout_session(
+        amount=8440,
+        currency="EUR",
+        order_reference="order-1042",
+        integration=CheckoutIntegration.FIELDS,
+        idempotency_key=IDEMPOTENCY_KEY,
+    )
+
+    assert checkout == example["checkout"]
+    assert sorted(checkout) == sorted(endpoint["checkoutFields"])
+    assert checkout["integration"] == CheckoutIntegration.FIELDS
+    assert isinstance(checkout["clientSecret"], str)
+    assert 0 < len(checkout["clientSecret"]) <= 128
+
+
+def test_integration_enum_equals_the_contract_vocabulary():
+    assert list(CHECKOUT_INTEGRATIONS) == CONTRACT["integrationVocabulary"]
+    assert [member.value for member in CheckoutIntegration] == CONTRACT["integrationVocabulary"]
 
 
 def test_a_refusal_is_raised_with_the_whole_envelope_intact(client, answers_with):
@@ -433,6 +467,11 @@ def test_a_revoke_of_an_unknown_id_is_the_generic_api_error_404(client, answers_
 
 
 def test_the_contract_examples_carry_exactly_their_declared_fields():
+    session_endpoint = ENDPOINTS["createCheckoutSession"]
+    assert sorted(session_endpoint["fieldsSuccessExample"]) == sorted(session_endpoint["fields"])
+    assert sorted(session_endpoint["fieldsSuccessExample"]["checkout"]) == sorted(
+        session_endpoint["checkoutFields"]
+    )
     charge_endpoint = ENDPOINTS["chargePaymentMethod"]
     fields = sorted(charge_endpoint["fields"])
     assert sorted(charge_endpoint["successExample"]["data"]) == fields

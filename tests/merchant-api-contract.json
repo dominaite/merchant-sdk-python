@@ -31,6 +31,11 @@
     "STOREFRONT_NOT_WHITELISTED"
   ],
   "$storefrontErrorNote": "Create-session refusals from the storefront (online location) the payment is attributed to: 400 STOREFRONT_MISMATCH (the API key is bound to one storefront and the request named a different locationId), 409 STOREFRONT_INACTIVE, 409 STOREFRONT_NOT_WHITELISTED. They arrive as HTTP errors, not the success=false shape, so they are deliberately not in sessionRefusalErrorCodes. One exception: when the Idempotency-Key already opened a session, STOREFRONT_MISMATCH comes back as HTTP 200 with success=false. Nothing was created in any case, and resending the same request gets the same answer.",
+  "integrationVocabulary": [
+    "widget",
+    "fields"
+  ],
+  "$integrationNote": "integration on the create-session request picks how the payer enters the card: widget (the default when absent) is the hosted cashier widget, fields is card fields rendered in the merchant's own page by the checkout.js drop-in. Card fields are enabled per merchant on request; fields on an account without them is a 400 INVALID_SELECTION on field integration, as is any other value. integration is part of the idempotency identity, so replaying a key with a different integration is IDEMPOTENCY_KEY_REUSED. checkout.integration is always echoed, on create and on replay. checkout.clientSecret is present only for fields: an opaque string of at most 128 characters, the same on every replay, that the drop-in sends as its bearer credential. Hand it to the payer's browser for that session only; never log or store it beyond the session.",
   "endpoints": {
     "ping": {
       "method": "GET",
@@ -68,7 +73,9 @@
         "cashierToken",
         "amount",
         "currency",
-        "expiresAt"
+        "expiresAt",
+        "integration",
+        "clientSecret"
       ],
       "successExample": {
         "success": true,
@@ -79,7 +86,25 @@
           "cashierToken": "ctok_5e4f3a2b1c0d9e8f",
           "amount": 8440,
           "currency": "EUR",
-          "expiresAt": "2026-08-21T11:15:30.000Z"
+          "expiresAt": "2026-08-21T11:15:30.000Z",
+          "integration": "widget"
+        },
+        "transactionId": null,
+        "errorCode": null,
+        "errorMessage": null
+      },
+      "fieldsSuccessExample": {
+        "success": true,
+        "checkout": {
+          "transactionId": "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d",
+          "orderId": "dom_1a2b3c4d5e6f",
+          "cashierKey": "ck_live_blox_8c7d6e5f4a3b2c1d",
+          "cashierToken": "ctok_blox_0a1b2c3d4e5f6a7b",
+          "amount": 8440,
+          "currency": "EUR",
+          "expiresAt": "2026-08-21T11:15:30.000Z",
+          "integration": "fields",
+          "clientSecret": "cs_4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c"
         },
         "transactionId": null,
         "errorCode": null,
