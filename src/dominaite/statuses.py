@@ -178,3 +178,20 @@ class RefundStatus(str, Enum):
 
 #: Every refund status the API can return today, in contract order.
 REFUND_STATUSES: Tuple[str, ...] = tuple(member.value for member in RefundStatus)
+
+
+class CheckoutIntegration(str, Enum):
+    """How the payer enters the card, the ``integration`` of
+    :meth:`DominaiteClient.create_checkout_session`, in the order the API contract lists them.
+
+    ``WIDGET`` (the default when you pass nothing) is the hosted cashier widget. ``FIELDS`` is
+    card fields rendered in your own page by the checkout.js drop-in; they are enabled per
+    merchant on request.
+    """
+
+    WIDGET = "widget"
+    FIELDS = "fields"
+
+
+#: Every integration value the API accepts today, in contract order.
+CHECKOUT_INTEGRATIONS: Tuple[str, ...] = tuple(member.value for member in CheckoutIntegration)

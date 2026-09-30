@@ -37,6 +37,7 @@ from .exceptions import (
 from .models import Refund, StoredPaymentMethod
 from .statuses import (
     CHARGE_STATUSES,
+    CHECKOUT_INTEGRATIONS,
     DECLINE_CLASSES,
     PAYMENT_STATUSES,
     REFUND_STATUSES,
@@ -44,6 +45,7 @@ from .statuses import (
     STORED_PAYMENT_METHOD_STATUSES,
     TERMINAL_PAYMENT_STATUSES,
     ChargeStatus,
+    CheckoutIntegration,
     DeclineClass,
     PaymentStatus,
     RefundStatus,
@@ -67,6 +69,7 @@ from .webhooks import (
 __all__ = [
     "CHARGE_ERROR_CODES",
     "CHARGE_STATUSES",
+    "CHECKOUT_INTEGRATIONS",
     "CURRENCY_EXPONENTS",
     "DECLINE_CLASSES",
     "DEFAULT_BASE_URL",
@@ -96,6 +99,7 @@ __all__ = [
     "ChargeEventData",
     "ChargeEventPaymentMethod",
     "ChargeStatus",
+    "CheckoutIntegration",
     "CheckoutRefusedError",
     "DeclineClass",
     "DominaiteClient",

@@ -452,6 +452,7 @@ class DominaiteClient:
         description: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         save_card: Optional[bool] = None,
+        integration: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a hosted checkout session for one payment.
 
@@ -475,8 +476,18 @@ class DominaiteClient:
             The stored method shows up as ``storedPaymentMethod`` on :meth:`get_status` after
             the payment succeeds; a declined first payment stores nothing. The card
             details never reach you: you get an id, a brand and the last four digits.
+        :param integration: How the payer enters the card: ``"widget"`` (the default when
+            omitted) or ``"fields"`` for card fields in your own page (see
+            :class:`CheckoutIntegration`). Card fields are enabled per merchant on request;
+            ``"fields"`` on an account without them is rejected with a 400. Part of the
+            idempotency identity: replaying a key with a different integration is refused
+            with ``IDEMPOTENCY_KEY_REUSED``. Left out of the body when None.
         :returns: ``{"transactionId", "orderId", "cashierKey", "cashierToken", "amount",
-            "currency", "expiresAt"}``.
+            "currency", "expiresAt", "integration", "clientSecret"}``. ``integration`` is
+            always present. ``clientSecret`` is set only for ``"fields"`` sessions (absent
+            for a widget session, so read it with ``.get``): an opaque string of at most
+            128 characters, the same on every replay, that the payer's page hands to
+            checkout.js. Keep it out of your logs.
 
         :raises ValueError: A missing ``idempotency_key`` or another invalid argument,
             before any request is made.
@@ -510,6 +521,9 @@ class DominaiteClient:
             body["description"] = description
         if save_card is not None:
             body["saveCard"] = bool(save_card)
+        if integration is not None:
+            # A CheckoutIntegration member goes out as its plain value.
+            body["integration"] = str(getattr(integration, "value", integration))
 
         response = self._request("POST", SESSIONS_PATH, body, key)
 

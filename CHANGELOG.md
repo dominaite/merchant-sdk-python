@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0 (unreleased)
+
+### Added
+
+- Card fields: `integration` on `create_checkout_session` (`"widget"` or `"fields"`, left out of
+  the body when None), and `integration` and `clientSecret` on the returned session.
+  `clientSecret` is set only for fields sessions. `CheckoutIntegration` and
+  `CHECKOUT_INTEGRATIONS` are exported. Card fields are enabled per merchant on request; see the
+  README.
+- Contract fixture: `integrationVocabulary`, the two new checkout fields and a fields session
+  example.
+
 ## 0.3.1
 
 ### Added

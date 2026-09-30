@@ -27,6 +27,7 @@ from dominaite import (
     ApiError,
     AuthenticationError,
     ChargeError,
+    CheckoutIntegration,
     CheckoutRefusedError,
     DominaiteClient,
     ErrorCode,
@@ -1547,6 +1548,40 @@ def test_save_card_is_omitted_when_not_passed(client, urlopen):
     client.create_checkout_session(amount=2500, currency="EUR", order_reference="order-1042", idempotency_key=IDEMPOTENCY_KEY)
 
     assert "saveCard" not in json.loads(recorder.last.data)
+
+
+@pytest.mark.parametrize(
+    "integration, sent",
+    [
+        ("widget", "widget"),
+        ("fields", "fields"),
+        (CheckoutIntegration.FIELDS, "fields"),
+        (CheckoutIntegration.WIDGET, "widget"),
+    ],
+)
+def test_integration_is_sent_in_the_signed_session_body(client, urlopen, integration, sent):
+    recorder = urlopen(_ok())
+
+    client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference="order-1042", integration=integration,
+        idempotency_key=IDEMPOTENCY_KEY,
+    )
+
+    request = recorder.last
+    assert json.loads(request.data)["integration"] == sent
+    headers = _headers(request)
+    assert headers["x-signature"] == sign_request(
+        SECRET, headers["x-timestamp"], "POST", SESSIONS_PATH,
+        headers["idempotency-key"], request.data.decode("utf-8"),
+    )
+
+
+def test_integration_is_omitted_when_not_passed(client, urlopen):
+    recorder = urlopen(_ok())
+
+    client.create_checkout_session(amount=2500, currency="EUR", order_reference="order-1042", idempotency_key=IDEMPOTENCY_KEY)
+
+    assert "integration" not in json.loads(recorder.last.data)
 
 
 def test_get_status_passes_the_stored_payment_method_through_and_leaves_payment_method_a_string(client, urlopen):
