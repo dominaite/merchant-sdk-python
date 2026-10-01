@@ -133,12 +133,14 @@
         "createdAt",
         "updatedAt",
         "expiresAt",
-        "storedPaymentMethod"
+        "storedPaymentMethod",
+        "pspReference"
       ],
       "example": {
         "transactionId": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
         "orderId": "dom_9a8b7c6d5e4f",
         "orderReference": "order-1042",
+        "pspReference": "psp_8f3a21c4",
         "status": "succeeded",
         "amount": 8440,
         "currency": "EUR",
@@ -152,6 +154,7 @@
         "transactionId": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
         "orderId": "dom_9a8b7c6d5e4f",
         "orderReference": "order-1042",
+        "pspReference": "psp_8f3a21c4",
         "status": "succeeded",
         "amount": 8440,
         "currency": "EUR",
@@ -173,6 +176,7 @@
         "transactionId": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
         "orderId": "dom_9a8b7c6d5e4f",
         "orderReference": "order-1042",
+        "pspReference": "psp_8f3a21c4",
         "status": "refunded",
         "amount": 8440,
         "currency": "EUR",
