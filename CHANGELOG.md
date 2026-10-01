@@ -11,10 +11,11 @@
   README.
 - Contract fixture: `integrationVocabulary`, the two new checkout fields and a fields session
   example.
-- `pspReference` on `payment.*` webhook data (`PaymentEventData`) and on the `get_status`
-  response: the payment processor's reference for the transaction. None until known, and absent
-  from gateways that predate it. Refund and cancel events carry the original sale's reference;
-  `charge.*` events do not have it.
+- Processor reference: `pspReference` on the `get_status` response and on `PaymentEventData`. The
+  payment processor's reference for the transaction, `None` until known and on a sale settled by
+  reconciliation without a processor webhook. Refund and cancel events carry the original sale's
+  reference. Not on `charge.*` events.
+- Contract fixture: `pspReference` in the status read fields and examples.
 
 ## 0.3.1
 
