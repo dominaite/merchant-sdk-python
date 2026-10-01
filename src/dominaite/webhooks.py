@@ -75,12 +75,18 @@ class PaymentEventData(_PaymentEventDataRequired, total=False):
     on ``payment.succeeded`` and ``payment.requires_capture``, and even there it can be
     None although a card was saved (it can be stored after the approval was announced).
     The status read is the source of truth for the card.
+
+    ``pspReference`` is the payment processor's reference for the transaction. It is None
+    until the processor has reported one, and a sale settled by reconciliation without a
+    processor webhook can keep it None. ``payment.refunded`` and ``payment.cancelled``
+    carry the original sale's reference. ``charge.*`` events do not have it.
     """
 
     paymentMethod: Optional[str]
     walletType: Optional[str]
     orderReference: Optional[str]
     orderId: Optional[str]
+    pspReference: Optional[str]
     description: Optional[str]
     paymentMethodBrand: Optional[str]
     paymentMethodLast4: Optional[str]

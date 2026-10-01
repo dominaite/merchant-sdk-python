@@ -632,6 +632,10 @@ class DominaiteClient:
         ``paymentMethod`` field, which is the gateway's string category of how the
         payer paid (``card``, ``wallet``, ...) and passes through untouched.
 
+        ``pspReference`` is the payment processor's reference for the transaction. It is None
+        until the processor has reported one, and a sale settled by reconciliation without a
+        processor webhook can keep it None. Gateways that predate the field leave the key out.
+
         :param transaction_id: The ``transactionId`` from
             :meth:`create_checkout_session`.
 

@@ -426,6 +426,7 @@ def test_the_exported_types_describe_the_wire_shape(event_type, body):
         (AgreementEventData, "sequence"),
         (ChargeEventData, "sequence"),
         (PaymentEventData, "storedPaymentMethod"),
+        (PaymentEventData, "pspReference"),
     ],
 )
 def test_the_new_fields_are_optional_so_old_payloads_still_fit(event_type, key):
@@ -448,7 +449,7 @@ RETIRED_CARD = (
 )
 
 
-def _payment_body(card="null", event_type="payment.succeeded"):
+def _payment_body(card="null", event_type="payment.succeeded", psp='"psp_123"'):
     """A current payment.* delivery, compact and in the gateway's key order."""
     return (
         '{"id":"5b6c7d8e-9f0a-4b1c-8d2e-3f4a5b6c7d8e","type":"' + event_type + '",'
@@ -457,7 +458,7 @@ def _payment_body(card="null", event_type="payment.succeeded"):
         '"previousStatus":"pending","kind":"sale","amount":8440,"grossAmount":8440,'
         '"surchargeAmount":null,"currency":"EUR","paymentMethod":"card","walletType":null,'
         '"originalTransactionId":null,"idempotencyKey":"checkout-1042-8440-EUR",'
-        '"orderReference":"order-1042","orderId":"ord_1","description":null,'
+        '"orderReference":"order-1042","orderId":"ord_1","pspReference":' + psp + ',"description":null,'
         '"paymentMethodBrand":"visa","paymentMethodLast4":"4242",'
         '"storedPaymentMethod":' + card + '}}'
     )
@@ -505,3 +506,19 @@ def test_the_webhook_card_is_the_status_read_card_type():
 def test_the_canonical_payment_vector_still_fits_the_required_keys():
     data = json.loads(BODY)["data"]
     assert PaymentEventData.__required_keys__ == set(data)
+
+
+def test_a_payment_event_carries_the_psp_reference():
+    event = _verified(_payment_body())
+    assert event["data"]["pspReference"] == "psp_123"
+
+
+def test_a_payment_event_without_a_psp_reference_reads_none_whether_null_or_absent():
+    explicit = _verified(_payment_body(psp="null"))
+    assert "pspReference" in explicit["data"]
+    assert explicit["data"]["pspReference"] is None
+
+    # The canonical vector predates the field: no key at all, and .get reads it as None.
+    absent = verify_webhook(BODY, EXPECTED_HEADER, SECRET, now=NOW)
+    assert "pspReference" not in absent["data"]
+    assert absent["data"].get("pspReference") is None
