@@ -1614,6 +1614,17 @@ def test_get_status_normalises_an_unreported_brand_and_expiry_and_adds_no_key_wi
     }
 
 
+@pytest.mark.parametrize("extra", [{"pspReference": "psp_123"}, {"pspReference": None}, {}], ids=["set", "null", "absent"])
+def test_get_status_passes_the_psp_reference_through(client, urlopen, extra):
+    data = dict({"transactionId": TRANSACTION_ID, "status": "succeeded"}, **extra)
+    urlopen((200, {"success": True, "data": data}))
+
+    status = client.get_status(TRANSACTION_ID)
+
+    assert status == data
+    assert status.get("pspReference") == extra.get("pspReference")
+
+
 def test_charge_reproduces_the_charge_vector_end_to_end(client, urlopen, monkeypatch):
     recorder = urlopen(_placed())
     monkeypatch.setattr("dominaite.client.time.time", lambda: 1755302400)
