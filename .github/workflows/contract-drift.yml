@@ -44,6 +44,11 @@ jobs:
             sessionsPath: .sessionsPath,
             statusPathTemplate: .statusPathTemplate,
             statuses: .statuses,
+            wallets: {
+              walletTypes: .wallets.walletTypes,
+              reportingFields: [.wallets.reportingFields[] | {path, type, required}],
+              enablementSetups: [.wallets.enablement[].setup]
+            },
             webhookEventCatalog: .webhookEventCatalog,
             errorCodes: (.errorCodes | with_entries(.value |= map({code, httpStatus, retry}))),
             validationHttpStatus: .validationResponseShape.httpStatus,

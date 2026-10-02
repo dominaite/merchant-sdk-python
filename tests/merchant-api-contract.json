@@ -134,7 +134,9 @@
         "updatedAt",
         "expiresAt",
         "storedPaymentMethod",
-        "pspReference"
+        "pspReference",
+        "paymentMethod",
+        "walletType"
       ],
       "example": {
         "transactionId": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
@@ -145,6 +147,8 @@
         "amount": 8440,
         "currency": "EUR",
         "refundedAmount": null,
+        "paymentMethod": "wallet",
+        "walletType": "apple_pay",
         "createdAt": "2026-08-21T09:15:30.000Z",
         "updatedAt": "2026-08-21T09:16:05.000Z",
         "expiresAt": null,
@@ -159,6 +163,8 @@
         "amount": 8440,
         "currency": "EUR",
         "refundedAmount": null,
+        "paymentMethod": "card",
+        "walletType": null,
         "createdAt": "2026-08-21T09:15:30.000Z",
         "updatedAt": "2026-08-21T09:16:05.000Z",
         "expiresAt": null,
@@ -181,6 +187,8 @@
         "amount": 8440,
         "currency": "EUR",
         "refundedAmount": 8440,
+        "paymentMethod": "card",
+        "walletType": null,
         "createdAt": "2026-08-21T09:15:30.000Z",
         "updatedAt": "2026-08-23T14:02:40.000Z",
         "expiresAt": null,
