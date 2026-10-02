@@ -121,7 +121,7 @@
     "getStatus": {
       "method": "GET",
       "path": "/merchant-api/checkout/sessions/{transactionId}",
-      "note": "status carries a statusVocabulary value. expiresAt answers only 'until when can the payer act' - null once the payer's part is over, which is NOT the same as terminal (requires_capture is non-terminal with no window). Branch on status for liveness. storedPaymentMethod is the card kept on file by a session created with saveCard: present once the payment is approved, and it stays present after a revoke with status revoked; null (absent on the wire) until then, for sessions without saveCard, and for declined or abandoned ones. It is NOT the gateway's paymentMethod field, which is the string category of how the payer paid (card, wallet, bank_transfer, sepa) and passes through these SDKs untyped.",
+      "note": "status carries a statusVocabulary value. expiresAt answers only 'until when can the payer act' - null once the payer's part is over, which is NOT the same as terminal (requires_capture is non-terminal with no window). Branch on status for liveness. storedPaymentMethod is the card kept on file by a session created with saveCard: present once the payment is approved, and it stays present after a revoke with status revoked; null (absent on the wire) until then, for sessions without saveCard, and for declined or abandoned ones. It is NOT the gateway's paymentMethod field, which is the string category of how the payer paid (card, wallet, bank_transfer, sepa), listed in fields below with walletType.",
       "fields": [
         "transactionId",
         "orderId",
