@@ -195,3 +195,40 @@ class CheckoutIntegration(str, Enum):
 
 #: Every integration value the API accepts today, in contract order.
 CHECKOUT_INTEGRATIONS: Tuple[str, ...] = tuple(member.value for member in CheckoutIntegration)
+
+
+class PaymentMethodCategory(str, Enum):
+    """How the payer paid, the ``paymentMethod`` of :meth:`DominaiteClient.get_status`, in the
+    order the API contract lists the categories.
+
+    Reporting data, not a money-flow switch: a wallet payment refunds, captures and disputes
+    exactly like a card payment. ``get_status()`` hands you the raw string (None while the
+    payment is still open and on older transactions), so an unknown value survives the trip to
+    your code instead of blowing up inside the SDK.
+    """
+
+    CARD = "card"
+    WALLET = "wallet"
+    BANK_TRANSFER = "bank_transfer"
+    SEPA = "sepa"
+
+
+#: Every payment method category the API reports today, in contract order.
+PAYMENT_METHOD_CATEGORIES: Tuple[str, ...] = tuple(member.value for member in PaymentMethodCategory)
+
+
+class WalletType(str, Enum):
+    """The wallets the API names in ``walletType`` today, in contract order.
+
+    The field can carry a lower-cased identifier for a wallet not in this list yet: treat an
+    unknown value as a valid wallet, not an error. ``get_status()`` hands you the raw string,
+    None for non-wallet payments.
+    """
+
+    APPLE_PAY = "apple_pay"
+    GOOGLE_PAY = "google_pay"
+    SAMSUNG_PAY = "samsung_pay"
+
+
+#: Every wallet the API names today, in contract order.
+WALLET_TYPES: Tuple[str, ...] = tuple(member.value for member in WalletType)

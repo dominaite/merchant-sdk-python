@@ -2,7 +2,16 @@
 
 import pytest
 
-from dominaite import PAYMENT_STATUSES, TERMINAL_PAYMENT_STATUSES, PaymentStatus, is_paid, is_terminal
+from dominaite import (
+    PAYMENT_METHOD_CATEGORIES,
+    PAYMENT_STATUSES,
+    TERMINAL_PAYMENT_STATUSES,
+    PaymentMethodCategory,
+    PaymentStatus,
+    WalletType,
+    is_paid,
+    is_terminal,
+)
 
 TERMINAL = ["succeeded", "failed", "cancelled", "abandoned", "refunded", "partially_refunded"]
 OPEN = ["pending", "processing", "requires_capture", "disputed"]
@@ -44,3 +53,9 @@ def test_requires_capture_is_neither_paid_nor_terminal():
     """An approved hold: the payer has paid, the money is not captured yet."""
     assert not is_paid("requires_capture")
     assert not is_terminal("requires_capture")
+
+
+def test_wallet_vocabularies_compare_equal_to_the_raw_strings_get_status_returns():
+    assert PAYMENT_METHOD_CATEGORIES == ("card", "wallet", "bank_transfer", "sepa")
+    assert PaymentMethodCategory.WALLET == "wallet"
+    assert WalletType.APPLE_PAY == "apple_pay"

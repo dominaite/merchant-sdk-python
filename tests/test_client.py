@@ -1625,6 +1625,28 @@ def test_get_status_passes_the_psp_reference_through(client, urlopen, extra):
     assert status.get("pspReference") == extra.get("pspReference")
 
 
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"paymentMethod": "wallet", "walletType": "apple_pay"},
+        {"paymentMethod": "wallet", "walletType": "paypal"},
+        {"paymentMethod": "card", "walletType": None},
+        {"paymentMethod": None, "walletType": None},
+        {},
+    ],
+    ids=["wallet", "unknown-wallet", "card", "open", "absent"],
+)
+def test_get_status_passes_the_wallet_reporting_fields_through(client, urlopen, extra):
+    data = dict({"transactionId": TRANSACTION_ID, "status": "succeeded"}, **extra)
+    urlopen((200, {"success": True, "data": data}))
+
+    status = client.get_status(TRANSACTION_ID)
+
+    assert status == data
+    assert status.get("paymentMethod") == extra.get("paymentMethod")
+    assert status.get("walletType") == extra.get("walletType")
+
+
 def test_charge_reproduces_the_charge_vector_end_to_end(client, urlopen, monkeypatch):
     recorder = urlopen(_placed())
     monkeypatch.setattr("dominaite.client.time.time", lambda: 1755302400)
