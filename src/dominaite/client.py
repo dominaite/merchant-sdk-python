@@ -26,7 +26,7 @@ from .exceptions import (
 )
 from .models import Refund
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 DEFAULT_BASE_URL = "https://api.dominaite.com/payments"
 SESSIONS_PATH = "/merchant-api/checkout/sessions"
