@@ -559,6 +559,10 @@ Each delivery is a flat JSON object - there is no `success` wrapper, so do not b
   "createdAt": "2026-08-20T14:00:00Z",
   "data": {
     "transactionId": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+    "orderReference": "order-123",
+    "orderId": "dom_0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+    "pspReference": "psp_8f2a61c0",
+    "description": "Pro plan",
     "status": "succeeded",
     "previousStatus": "pending",
     "kind": "sale",
@@ -566,6 +570,10 @@ Each delivery is a flat JSON object - there is no `success` wrapper, so do not b
     "grossAmount": 8701,
     "surchargeAmount": 261,
     "currency": "EUR",
+    "paymentMethod": "card",
+    "walletType": null,
+    "paymentMethodBrand": "visa",
+    "paymentMethodLast4": "4242",
     "originalTransactionId": null,
     "idempotencyKey": "order-123"
   }
@@ -580,6 +588,29 @@ Amounts are minor units. On `payment.*` events `amount` is what you get paid and
 is what moved on the card; on `payment.refunded` `amount` is what went back to the customer.
 `payment.refunded` fires once per completed refund, partial or full: its `transactionId` is the
 refund's own id and `originalTransactionId` the payment it refunds.
+
+Every `payment.*` event identifies the payment with the same keys:
+
+- `orderReference` is your own order reference from create session. Match deliveries to your
+  orders on it. It is null for payments not started through the API or created without one;
+  refund and cancel events carry the original payment's value.
+- `orderId` is the hosted checkout order id, as on `get_status()`. Null on refund and
+  cancellation events and for payments taken outside hosted checkout.
+- `pspReference` is the payment processor's reference, as on `get_status()`. Null until the
+  processor reports it, so a `payment.succeeded` can arrive without it; read the status later to
+  pick it up. Refund and cancel events carry the original payment's reference.
+- `description` is what you sent on create session. Null when none was given and on refund and
+  cancellation events.
+- `paymentMethodBrand` (lower-cased, e.g. `visa`) and `paymentMethodLast4` are set once a card
+  payment was attempted. Null while the payment is open, for non-card methods, and when the
+  provider did not report them. `paymentMethod` and `walletType` say how the payer paid
+  (`card`, `wallet`, ...; `apple_pay`, `google_pay`, ...). They are reporting data: a wallet
+  payment refunds, captures and disputes like a card.
+- `idempotencyKey` is the key you sent on create session, null on refund and dispute events.
+  `originalTransactionId` is set on `payment.refunded` (the refunded payment) and on the
+  `payment.succeeded` of a captured authorization (the authorization), null otherwise.
+
+All of them are typed on `PaymentEventData`.
 
 Unlike the API responses, webhooks write null fields out as `null`. Read a missing key and a
 `null` the same way.
