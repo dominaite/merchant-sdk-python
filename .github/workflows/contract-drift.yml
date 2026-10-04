@@ -9,8 +9,9 @@ name: contract-drift
 # enumerations match (the wire-contract test pins them), release, then commit the
 # refreshed fixture.
 #
-# Source is the dev gateway: staging and production do not serve the endpoint yet.
-# Switch CONTRACT_URL to https://api.staging.dominaite.com/payments/... once they do.
+# Source is the production API host, the contract's own apiBase. The fixture tracks
+# what merchants actually receive, and the public hostname does not change when the
+# service behind it moves.
 on:
   schedule:
     - cron: '0 6 * * 1'
@@ -24,7 +25,7 @@ jobs:
   drift:
     runs-on: ubuntu-latest
     env:
-      CONTRACT_URL: https://func-dom-gw-payments-dev-gwc-01.azurewebsites.net/api/merchant-api/integration/contract
+      CONTRACT_URL: https://api.dominaite.com/payments/merchant-api/integration/contract
       FIXTURE: tests/merchant-api-wire-contract.json
     steps:
       - uses: actions/checkout@v4

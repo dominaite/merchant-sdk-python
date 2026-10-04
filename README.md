@@ -41,10 +41,10 @@ dashboard, dev key - a prod key will not authenticate against dev):
 ```bash
 export DOMINAITE_KEY_ID='dmk_...'          # the key id shown on the tab
 export DOMINAITE_SECRET='dms_...'          # the secret shown once at key creation
-export DOMINAITE_BASE_URL='https://func-dom-gw-payments-dev-gwc-01.azurewebsites.net/api'
+export DOMINAITE_BASE_URL='https://...'           # the base URL of your dev environment
 ```
 
-That base URL is the dev payments service. Production is
+Production is
 `https://api.dominaite.com/payments`, which is the SDK's default when you pass no `base_url`.
 
 `base_url` has to be `https://`. Every request carries your key id and a signature, and over
