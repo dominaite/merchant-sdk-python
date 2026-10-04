@@ -636,6 +636,13 @@ class DominaiteClient:
         until the processor has reported one, and a sale settled by reconciliation without a
         processor webhook can keep it None. Gateways that predate the field leave the key out.
 
+        ``paymentMethod`` is how the payer paid (:data:`PAYMENT_METHOD_CATEGORIES`), None while
+        the payment is still open and on older transactions. ``walletType`` names the wallet when
+        ``paymentMethod`` is ``wallet`` (:data:`WALLET_TYPES`), None for non-wallet payments; a
+        lower-cased value not in that list yet is a valid wallet, not an error. Both are
+        reporting data and pass through as sent: a wallet payment refunds, captures and
+        disputes like a card.
+
         :param transaction_id: The ``transactionId`` from
             :meth:`create_checkout_session`.
 

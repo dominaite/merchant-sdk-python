@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Wallet reporting fields: `paymentMethod` and `walletType` on the `get_status` response, passed
+  through as sent. `paymentMethod` is `card`, `wallet`, `bank_transfer` or `sepa`, `None` while
+  the payment is still open and on older transactions; `walletType` names the wallet, `None` for
+  non-wallet payments, and an unknown lower-cased value is a valid wallet. Reporting data only:
+  a wallet payment refunds, captures and disputes like a card. `PaymentMethodCategory`,
+  `PAYMENT_METHOD_CATEGORIES`, `WalletType` and `WALLET_TYPES` are exported.
+- Contract fixtures: `paymentMethod` and `walletType` in the status read fields and examples, and
+  the `wallets` block in the wire contract, pinned against `WALLET_TYPES`.
+
 ## 0.4.0
 
 ### Added

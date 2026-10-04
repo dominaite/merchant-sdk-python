@@ -737,6 +737,13 @@ elif is_terminal(status):  # failed, cancelled, abandoned, refunded, partially_r
 `is_terminal` is also True for `succeeded`, so check `is_paid` first. The terminal set is
 exported as `TERMINAL_PAYMENT_STATUSES`.
 
+`paymentMethod` (`card`, `wallet`, `bank_transfer` or `sepa`; None while the payment is still
+open and on older transactions) and `walletType` (`apple_pay`, `google_pay`, `samsung_pay`; None
+for non-wallet payments) say how the payer paid. They are reporting data, not a money-flow
+switch: a wallet payment refunds, captures and disputes like a card. `walletType` can carry a
+lower-cased wallet not in that list yet; treat it as a valid wallet, not an error. The known
+values are exported as `PAYMENT_METHOD_CATEGORIES` and `WALLET_TYPES`.
+
 Poll after the payer returns to you, or on your order timeout - not in a tight loop; the
 endpoint is rate limited per key.
 
