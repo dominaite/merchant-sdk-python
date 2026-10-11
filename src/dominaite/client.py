@@ -69,7 +69,7 @@ _TRANSACTION_ID_RE = re.compile(
 _PAYMENT_METHOD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 
 #: Statuses that stay generic on the payment-method routes even when the envelope
-#: carries a code: validation (400), authentication (401, 403), unknown id (404) and
+#: carries a code: validation (400), authentication and scope (401, 403), unknown id (404) and
 #: rate limiting (429) mean the same thing on every route and keep their usual errors.
 #: Everything else with a code is the gateway telling this route something specific (a
 #: decline, an unknown outcome, a refusal) and arrives as ChargeError / RevokeError.
@@ -492,7 +492,8 @@ class DominaiteClient:
         :raises ValueError: A missing ``idempotency_key`` or another invalid argument,
             before any request is made.
         :raises AuthenticationError: Wrong/revoked credentials or bad signature
-            (fix config; do not retry).
+            (401; fix config, do not retry), or a key without the ``payments`` scope
+            (403).
         :raises CheckoutRefusedError: The gateway refused the session (inspect
             ``error_code``).
         :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``, then retry WITH
@@ -646,7 +647,8 @@ class DominaiteClient:
         :param transaction_id: The ``transactionId`` from
             :meth:`create_checkout_session`.
 
-        :raises AuthenticationError: Wrong/revoked credentials or bad signature.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``payments`` scope (403).
         :raises RateLimitError: HTTP 429; polling too fast. Wait
             ``retry_after_seconds`` before the next poll.
         :raises ApiError: Unknown transaction id (HTTP 404) or unexpected response.
@@ -708,7 +710,8 @@ class DominaiteClient:
             ``DUPLICATE_REQUEST`` (409), ``IDEMPOTENCY_KEY_REUSED`` (422),
             ``PAYMENT_METHOD_CHARGES_DISABLED`` or ``PAYMENT_PROCESSING_UNAVAILABLE``
             (503, retry later with the same key).
-        :raises AuthenticationError: Wrong/revoked credentials or bad signature.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``payments`` scope (403).
         :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``, then retry WITH
             the same ``idempotency_key``.
         :raises ApiError: An id that is not yours (HTTP 404), input validation (400)
@@ -779,7 +782,8 @@ class DominaiteClient:
             ``MERCHANT_API_UNAVAILABLE`` (503, retry later) or
             ``UPSTREAM_CONTRACT_ERROR`` (502, the provider refused for good - contact
             support with the id).
-        :raises AuthenticationError: Wrong/revoked credentials or bad signature.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``payments`` scope (403).
         :raises RateLimitError: HTTP 429.
         :raises ApiError: An id that is not yours (HTTP 404) or unexpected response.
         :raises TransportError: Network-level failure (safe to retry).
@@ -832,7 +836,8 @@ class DominaiteClient:
 
         :raises RefundError: The gateway answered with a code (see :class:`RefundError`
             for each one and whether it is ``retryable``).
-        :raises AuthenticationError: Wrong/revoked credentials or bad signature.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``payments`` scope (403).
         :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``, then retry WITH
             the same ``idempotency_key``.
         :raises ApiError: An unexpected response.
@@ -877,7 +882,8 @@ class DominaiteClient:
             none).
 
         :raises RefundError: ``PAYMENT_NOT_FOUND`` or ``REFUND_NOT_FOUND`` (404).
-        :raises AuthenticationError: Wrong/revoked credentials or bad signature.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``payments`` scope (403).
         :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``.
         :raises ApiError: An unexpected response.
         :raises TransportError: Network-level failure (safe to retry).
@@ -987,7 +993,12 @@ class DominaiteClient:
         except ValueError:
             decoded = None
         if not isinstance(decoded, dict):
-            raise ApiError(status, "The API returned a non-JSON response")
+            # A 429 is a rate limit whatever its body: something in front of the API can
+            # throttle too, with an HTML page or nothing at all. It gets the same error and
+            # the same Retry-After reading as the API's own.
+            if status != 429:
+                raise ApiError(status, "The API returned a non-JSON response")
+            decoded = {}
 
         # The gateway wraps responses as { success, data, ... }; unwrap when present.
         # Error responses carry the machine-readable code at error.code.
@@ -998,9 +1009,20 @@ class DominaiteClient:
             envelope_error = {}
 
         if status in (401, 403):
+            code = str(
+                result.get("errorCode")
+                or envelope_error.get("code")
+                or ("FORBIDDEN" if status == 403 else "UNAUTHORIZED")
+            )
             raise AuthenticationError(
-                str(result.get("errorCode") or envelope_error.get("code") or "UNAUTHORIZED"),
-                "Authentication failed - check your key id, secret, and server clock.",
+                code,
+                _auth_message(
+                    status,
+                    code,
+                    result.get("errorMessage") or envelope_error.get("message"),
+                ),
+                http_status=status,
+                result=dict(decoded),
             )
         if status == 429:
             # Deliberately not retried here, not even by
@@ -1016,9 +1038,14 @@ class DominaiteClient:
                     or "Rate limit exceeded; slow down and retry later."
                 ),
                 retry_after_seconds=retry_after,
+                # The gateway's own code for its limits. A charge-specific limit keeps its
+                # own code (CHARGE_VELOCITY_EXCEEDED, CHARGE_DECLINE_RATE_EXCEEDED).
                 error_code=str(
-                    result.get("errorCode") or envelope_error.get("code") or "RATE_LIMITED"
+                    result.get("errorCode")
+                    or envelope_error.get("code")
+                    or ErrorCode.RATE_LIMIT_EXCEEDED.value
                 ),
+                result=dict(decoded),
             )
         return _Reply(status, decoded, result, envelope_error)
 
@@ -1045,6 +1072,32 @@ def _rejection(reply: _Reply) -> DominaiteError:
             or "Request rejected"
         ),
         error_code=str(error_code) if error_code else None,
+        result=dict(reply.envelope),
+    )
+
+
+def _auth_message(status: int, code: str, server_message: Any) -> str:
+    """The message of an AuthenticationError: a credential hint on 401 only.
+
+    A 403 means the signature was good, so pointing the caller at the key id, the secret or
+    the clock would send them after the wrong problem.
+    """
+    if status == 401:
+        return "Authentication failed - check your key id, secret, and server clock."
+    if code == ErrorCode.INSUFFICIENT_SCOPE:
+        # The server names the scope the route needs; keep that, then say what to do.
+        named = str(server_message or "This API key does not hold the scope this route needs")
+        return (
+            named.rstrip(".") + ". Use a key that holds that scope; a key's scopes are "
+            "fixed when it is issued."
+        )
+    if code == ErrorCode.VERIFY_ONLY_NOT_ENABLED:
+        return (
+            "Verify-only sessions are not enabled for your account. Nothing was created. "
+            "We switch it on for your account: ask Dominaite support."
+        )
+    return "The API refused this request for this key (HTTP 403){0}".format(
+        ": " + str(server_message) if server_message else "."
     )
 
 

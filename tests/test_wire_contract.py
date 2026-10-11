@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 from dominaite import (
+    AUTHORIZATION_ERROR_CODES,
     PAYMENT_STATUSES,
     SESSION_REFUSAL_ERROR_CODES,
     STOREFRONT_ERROR_CODES,
@@ -53,6 +54,12 @@ def test_storefront_codes_match_the_gateway_statuses_and_none_is_retryable():
     }
     assert all(entry["retry"] is False for entry in storefront)
     assert not set(STOREFRONT_ERROR_CODES) & set(SESSION_REFUSAL_ERROR_CODES)
+
+
+def test_authorization_codes_are_exactly_the_gateway_403_group_in_order():
+    authorization = WIRE["errorCodes"]["authorization"]
+    assert [entry["code"] for entry in authorization] == list(AUTHORIZATION_ERROR_CODES)
+    assert all(entry["httpStatus"] == 403 and entry["retry"] is False for entry in authorization)
 
 
 def test_the_contract_still_lists_this_sdk():

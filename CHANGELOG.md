@@ -12,6 +12,24 @@
   `PAYMENT_METHOD_CATEGORIES`, `WalletType` and `WALLET_TYPES` are exported.
 - Contract fixtures: `paymentMethod` and `walletType` in the status read fields and examples, and
   the `wallets` block in the wire contract, pinned against `WALLET_TYPES`.
+- `ApiError.result`, on every subclass too: the whole JSON body the API sent. Read
+  `result["error"]["validationErrors"]` for the fields a 400 refused, and `params` where a code
+  carries them.
+- `AUTHORIZATION_ERROR_CODES`, and the `ErrorCode` members `INSUFFICIENT_SCOPE`,
+  `VERIFY_ONLY_NOT_ENABLED`, `RATE_LIMIT_EXCEEDED`, `CHARGE_VELOCITY_EXCEEDED` and
+  `CHARGE_DECLINE_RATE_EXCEEDED`.
+- Wire contract fixture: the `authorization` error group (`INSUFFICIENT_SCOPE`, HTTP 403), pinned
+  against `AUTHORIZATION_ERROR_CODES`.
+
+### Changed
+
+- A 403 is no longer reported as a credential failure. `AuthenticationError` has `http_status`
+  (401 or 403) and `result`. Only a 401 keeps the "check your key id, secret, and server clock"
+  hint. A 403 `INSUFFICIENT_SCOPE` keeps the gateway's message, which names the missing scope. A
+  403 `VERIFY_ONLY_NOT_ENABLED` says that we switch it on for your account.
+- `RateLimitError.error_code` falls back to `RATE_LIMIT_EXCEEDED`, the gateway's own code, when
+  a 429 carries none (it was `RATE_LIMITED`). A 429 whose body is not JSON is now a
+  `RateLimitError` too, with its `Retry-After`.
 
 ## 0.4.0
 

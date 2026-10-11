@@ -12,6 +12,7 @@ import urllib.request
 import pytest
 
 from dominaite import (
+    AUTHORIZATION_ERROR_CODES,
     CHARGE_ERROR_CODES,
     DEFAULT_BASE_URL,
     PAYMENT_METHODS_PATH,
@@ -365,6 +366,110 @@ def test_ping_401_raises_authentication_with_the_error_code(client, urlopen):
         client.ping()
 
     assert caught.value.error_code == "IP_NOT_ALLOWED"
+
+
+def _gateway_error(status, code, message):
+    """An error body in the gateway's envelope shape."""
+    return {
+        "success": False,
+        "error": {"statusCode": status, "code": code, "message": message},
+        "metadata": {"requestId": "req_1"},
+    }
+
+
+def test_a_401_points_at_the_credentials(client, urlopen):
+    urlopen((401, _gateway_error(401, "INVALID_SIGNATURE", "Signature mismatch")))
+
+    with pytest.raises(AuthenticationError) as caught:
+        client.ping()
+
+    assert caught.value.http_status == 401
+    assert caught.value.error_code == "INVALID_SIGNATURE"
+    assert "check your key id, secret, and server clock" in str(caught.value)
+
+
+def test_a_missing_scope_is_a_403_that_names_the_scope_and_never_the_clock(client, urlopen):
+    """The signature was good, so a credential hint would send the caller after the wrong
+    problem. The gateway's message names the scope the route needs; it has to survive."""
+    body = _gateway_error(
+        403,
+        "INSUFFICIENT_SCOPE",
+        "This API key does not have the 'payments' scope this route requires",
+    )
+    urlopen((403, body))
+
+    with pytest.raises(AuthenticationError) as caught:
+        client.get_status(TRANSACTION_ID)
+
+    error = caught.value
+    assert error.http_status == 403
+    assert error.error_code == ErrorCode.INSUFFICIENT_SCOPE
+    assert "'payments' scope" in str(error)
+    assert "key that holds that scope" in str(error)
+    for credential_hint in ("clock", "secret", "key id"):
+        assert credential_hint not in str(error)
+    assert error.result == body
+
+
+def test_verify_only_not_enabled_is_a_403_that_says_we_switch_it_on(client, urlopen):
+    urlopen(
+        (
+            403,
+            _gateway_error(
+                403,
+                "VERIFY_ONLY_NOT_ENABLED",
+                "Verify-only sessions are not enabled for this account.",
+            ),
+        )
+    )
+
+    with pytest.raises(AuthenticationError) as caught:
+        client.create_checkout_session(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
+        )
+
+    error = caught.value
+    assert error.http_status == 403
+    assert error.error_code == ErrorCode.VERIFY_ONLY_NOT_ENABLED
+    assert "We switch it on for your account" in str(error)
+    assert "clock" not in str(error)
+
+
+@pytest.mark.parametrize(
+    "body, code, text",
+    [
+        (_gateway_error(403, "SOMETHING_NEW", "Not for this key."), "SOMETHING_NEW", "Not for this key."),
+        ({}, "FORBIDDEN", "(HTTP 403)."),
+    ],
+    ids=["unknown-code", "no-code"],
+)
+def test_any_other_403_keeps_the_server_message_and_no_credential_hint(
+    client, urlopen, body, code, text
+):
+    urlopen((403, body))
+
+    with pytest.raises(AuthenticationError) as caught:
+        client.ping()
+
+    assert caught.value.http_status == 403
+    assert caught.value.error_code == code
+    assert text in str(caught.value)
+    assert "clock" not in str(caught.value)
+
+
+def test_a_4xx_rejection_carries_the_whole_body_the_gateway_sent(client, urlopen):
+    body = _gateway_error(404, "NOT_FOUND", "Transaction not found")
+    body["error"]["validationErrors"] = [{"field": "id", "code": "NOT_FOUND"}]
+    urlopen((404, body))
+
+    with pytest.raises(ApiError) as caught:
+        client.get_status(TRANSACTION_ID)
+
+    assert caught.value.http_status == 404
+    assert caught.value.result == body
 
 
 def test_get_status_normalizes_transaction_id_casing(client, urlopen):
@@ -996,7 +1101,8 @@ def test_the_checkout_codes_are_named_constants_equal_to_the_wire_string(name):
 
 def test_every_code_the_sdk_groups_has_a_named_constant():
     grouped = (
-        SESSION_REFUSAL_ERROR_CODES
+        AUTHORIZATION_ERROR_CODES
+        + SESSION_REFUSAL_ERROR_CODES
         + VALIDATION_ERROR_CODES
         + STOREFRONT_ERROR_CODES
         + CHARGE_ERROR_CODES
@@ -1346,6 +1452,49 @@ def test_a_rate_limit_is_still_catchable_as_an_api_error(client, urlopen):
 
     with pytest.raises(ApiError):
         client.get_status(TRANSACTION_ID)
+
+
+def test_a_429_without_a_code_gets_the_gateways_rate_limit_code(client, urlopen):
+    urlopen((429, {"success": False}, {"Retry-After": "7"}))
+
+    with pytest.raises(RateLimitError) as caught:
+        client.get_status(TRANSACTION_ID)
+
+    assert caught.value.error_code == ErrorCode.RATE_LIMIT_EXCEEDED
+    assert caught.value.retry_after_seconds == 7
+
+
+def test_a_429_that_is_not_json_is_still_a_rate_limit_with_its_retry_after(client, urlopen):
+    """A proxy in front of the API can throttle with an HTML page. It is still a rate limit,
+    not an unexplained failure, and its Retry-After still counts."""
+    urlopen((429, b"<html><body>Too Many Requests</body></html>", {"Retry-After": "12"}))
+
+    with pytest.raises(RateLimitError) as caught:
+        client.get_status(TRANSACTION_ID)
+
+    assert caught.value.http_status == 429
+    assert caught.value.error_code == ErrorCode.RATE_LIMIT_EXCEEDED
+    assert caught.value.retry_after_seconds == 12
+    assert caught.value.result == {}
+
+
+def test_a_charge_limit_429_keeps_its_own_code_and_the_body(client, urlopen):
+    body = _gateway_error(429, "CHARGE_VELOCITY_EXCEEDED", "Too many charges on this card")
+    body["error"]["params"] = {"windowSeconds": 86400, "limit": 10}
+    urlopen((429, body, {"Retry-After": "3600"}))
+
+    with pytest.raises(RateLimitError) as caught:
+        client.charge_payment_method(
+            "pm_0123456789abcdef0123456789abcdef",
+            amount=1000,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
+        )
+
+    assert caught.value.error_code == ErrorCode.CHARGE_VELOCITY_EXCEEDED
+    assert caught.value.retry_after_seconds == 3600
+    assert caught.value.result["error"]["params"] == {"windowSeconds": 86400, "limit": 10}
 
 
 def test_a_rate_limit_is_never_retried_automatically(client, urlopen):

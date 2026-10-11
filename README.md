@@ -141,6 +141,7 @@ credentials, your clock, your signing, and the dev gateway.
 | `AuthenticationError` + `INVALID_SIGNATURE` | Secret does not match the key id. |
 | `AuthenticationError` + `TIMESTAMP_OUT_OF_RANGE` | Your machine's clock is more than 5 minutes off. |
 | `AuthenticationError` + `IP_NOT_ALLOWED` | The key has an IP allowlist that does not include you. |
+| `AuthenticationError` + `INSUFFICIENT_SCOPE` (`http_status` 403) | The key and the signature are good, but the key does not hold the `payments` scope. Use a payments key. |
 | `CheckoutRefusedError` | You authenticated fine; the gateway declined to open a session. |
 | `StorefrontError` + `STOREFRONT_NOT_WHITELISTED` | Your website's domain is not approved with the payment provider yet. See [Storefront errors](#storefront-errors). |
 | `TransportError` | Wrong base URL, or the service is down. Retry with the same key. |
@@ -810,14 +811,14 @@ answers `PRIOR_ATTEMPT_FAILED` and the key is spent; reconcile and use a fresh k
 
 | Exception | Means | Retry? |
 |---|---|---|
-| `AuthenticationError` | Bad credentials, bad signature, clock skew, IP not allowlisted | No - fix config |
+| `AuthenticationError` | `http_status` 401: bad credentials, bad signature, clock skew, IP not allowlisted. `http_status` 403: the key is good but may not do this (`INSUFFICIENT_SCOPE`, `VERIFY_ONLY_NOT_ENABLED`) | No - fix config, or use a key with the right scope |
 | `CheckoutRefusedError` | The gateway refused to open the session (`error_code`) | Depends on the code |
 | `StorefrontError` | The storefront (website) cannot take payments yet, or the key belongs to another one (`error_code`, `http_status`). Subclass of `ApiError` | No - fix the setup |
 | `ChargeError` | The gateway answered a charge with a code instead of a charge (`error_code`, `http_status`, `charge`, `transaction_id`) | Depends on the code; never with a new key |
 | `RefundError` | The gateway answered a refund call with a code (`error_code`, `http_status`, `retryable`, `retry_stop_after_seconds`). Subclass of `ApiError` | Only when `retryable`, same key |
 | `RevokeError` | The gateway refused to revoke a stored payment method; nothing changed (`error_code`, `http_status`) | `MERCHANT_API_UNAVAILABLE` only |
-| `ApiError` | Unexpected response, or a 4xx like an unknown transaction id (`http_status`, `error_code`) | No |
-| `RateLimitError` | HTTP 429; you are sending faster than the key is allowed (`retry_after_seconds`) | Yes, after you wait |
+| `ApiError` | Unexpected response, or a 4xx like an unknown transaction id (`http_status`, `error_code`, and `result`: the whole JSON body, with `validationErrors` and `params` when the gateway sent them) | No |
+| `RateLimitError` | HTTP 429; you are sending faster than you are allowed (`error_code`, `retry_after_seconds`) | Yes, after you wait |
 | `TransportError` | Network failure or 5xx; you don't know if it landed | Yes, same idempotency key |
 | `WebhookVerificationError` | An incoming webhook is not authentic or not fresh (`error_code`) | No - respond 400 |
 
@@ -898,6 +899,18 @@ except RateLimitError as limit:
 `retry_after_seconds` is what the API asked you to wait, and honouring it is the shortest wait
 that will work. It is `None` when the API did not give a number of seconds - back off on your
 own schedule then.
+
+`error_code` is `RATE_LIMIT_EXCEEDED` for the two limits above. A charge has two more limits,
+each with its own code. Nothing was charged in either case:
+
+- `CHARGE_VELOCITY_EXCEEDED`: the card already has the most charges allowed in 24 hours, or
+  the charge would take you past your hourly limit for the currency.
+- `CHARGE_DECLINE_RATE_EXCEEDED`: the key collected too many declined charges in a short time.
+  Its charge route is locked for a while. Other routes keep working.
+
+Many failed authentication attempts from one IP address in a short time block that address
+for a while. Every request from it then gets a 429 with no `Retry-After`. Fix the credentials
+before you send again, or the next failures start a new block.
 
 The usual cause is polling `get_status` in a tight loop. Poll after the payer returns to you, or
 on your order timeout, and let webhooks do the rest.

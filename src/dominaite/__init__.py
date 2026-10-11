@@ -13,6 +13,7 @@ from .client import (
     sign_request,
 )
 from .exceptions import (
+    AUTHORIZATION_ERROR_CODES,
     CHARGE_ERROR_CODES,
     REFUND_ERROR_CODES,
     REFUND_FAILURE_CODES,
@@ -71,6 +72,7 @@ from .webhooks import (
 )
 
 __all__ = [
+    "AUTHORIZATION_ERROR_CODES",
     "CHARGE_ERROR_CODES",
     "CHARGE_STATUSES",
     "CHECKOUT_INTEGRATIONS",

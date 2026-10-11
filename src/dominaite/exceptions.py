@@ -22,11 +22,20 @@ class ErrorCode(str, Enum):
     as a failure too rather than crashing on it.
     """
 
-    # Authentication (AuthenticationError, HTTP 401/403).
+    # Authentication (AuthenticationError, HTTP 401).
     INVALID_API_KEY = "INVALID_API_KEY"
     INVALID_SIGNATURE = "INVALID_SIGNATURE"
     TIMESTAMP_OUT_OF_RANGE = "TIMESTAMP_OUT_OF_RANGE"
     IP_NOT_ALLOWED = "IP_NOT_ALLOWED"
+
+    # Permission (AuthenticationError, HTTP 403). The key authenticated, but it may not do this.
+    INSUFFICIENT_SCOPE = "INSUFFICIENT_SCOPE"
+    VERIFY_ONLY_NOT_ENABLED = "VERIFY_ONLY_NOT_ENABLED"
+
+    # Rate limiting (RateLimitError, HTTP 429). The two CHARGE_ codes come from the charge route.
+    RATE_LIMIT_EXCEEDED = "RATE_LIMIT_EXCEEDED"
+    CHARGE_VELOCITY_EXCEEDED = "CHARGE_VELOCITY_EXCEEDED"
+    CHARGE_DECLINE_RATE_EXCEEDED = "CHARGE_DECLINE_RATE_EXCEEDED"
 
     # Input validation on create (ApiError, HTTP 400).
     IDEMPOTENCY_KEY_REQUIRED = "IDEMPOTENCY_KEY_REQUIRED"
@@ -76,6 +85,12 @@ SESSION_REFUSAL_ERROR_CODES: Tuple[str, ...] = (
 #: ``success: false`` refusal shape, and arrive as :class:`ApiError` with the code on
 #: ``error_code``. They mean the request was malformed - fix the call, do not retry.
 VALIDATION_ERROR_CODES: Tuple[str, ...] = ("IDEMPOTENCY_KEY_REQUIRED",)
+
+#: The codes for a key that authenticated but may not call the route, HTTP 403, in contract
+#: order. They arrive as :class:`AuthenticationError` with ``http_status`` 403. Not retryable:
+#: ``INSUFFICIENT_SCOPE`` means the key does not hold the route's scope (``payments``,
+#: ``transactions:read`` or ``webhooks:manage``), and a key's scopes are fixed when it is issued.
+AUTHORIZATION_ERROR_CODES: Tuple[str, ...] = ("INSUFFICIENT_SCOPE",)
 
 #: The storefront codes a create call can be refused with, raised as
 #: :class:`StorefrontError`. ``STOREFRONT_NOT_WHITELISTED`` and ``STOREFRONT_INACTIVE``
@@ -151,14 +166,25 @@ class ApiError(DominaiteError):
     HTTP 400 rather than as a business refusal. It is None when the response carried
     no code (an unexpected shape, or a bare 404); branch on it only after checking it
     is set.
+
+    ``result`` is the whole JSON body the API sent ({} when there was none). Read the
+    details the gateway attaches there: ``result["error"]["validationErrors"]`` lists the
+    fields a 400 refused, and some codes carry ``params`` (for example the existing
+    endpoint's ``webhookId`` on ``WEBHOOK_ALREADY_REGISTERED``).
     """
 
     def __init__(
-        self, http_status: int, message: str, error_code: Optional[str] = None
+        self,
+        http_status: int,
+        message: str,
+        error_code: Optional[str] = None,
+        result: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(message)
         self.http_status = http_status
         self.error_code = error_code
+        #: The full JSON body the API sent, for fields not modelled above.
+        self.result = result if result is not None else {}
 
 
 class RateLimitError(ApiError):
@@ -174,10 +200,19 @@ class RateLimitError(ApiError):
     immediately is what turns a short spike into a sustained lockout, and only your code
     knows what else is queued behind this call. Back off, then retry.
 
+    ``error_code`` is ``RATE_LIMIT_EXCEEDED`` for the per-key and per-IP limits. A charge
+    can also answer 429 with its own code, and nothing was charged:
+
+    - ``CHARGE_VELOCITY_EXCEEDED``: the card already has the most charges allowed in 24
+      hours, or the charge would pass your hourly limit for the currency.
+    - ``CHARGE_DECLINE_RATE_EXCEEDED``: this API key collected too many declined charges in
+      a short time, so its charge route is locked for a while. Other routes keep working.
+
     ``retry_after_seconds`` is the whole number of seconds the API asked you to wait,
     taken from the ``Retry-After`` header. Honour it - it is the shortest wait that will
-    work. It is None when the API sent no such header, or sent it in the HTTP-date form
-    (which we do not translate, since a date is only meaningful against the server's
+    work. It is None when the API sent no such header (the block after many failed
+    authentication attempts from one IP address sends none), or sent it in the HTTP-date
+    form (which we do not translate, since a date is only meaningful against the server's
     clock). Fall back to your own backoff in that case::
 
         try:
@@ -194,8 +229,9 @@ class RateLimitError(ApiError):
         message: str,
         retry_after_seconds: Optional[int] = None,
         error_code: Optional[str] = None,
+        result: Optional[Dict[str, Any]] = None,
     ) -> None:
-        super().__init__(429, message, error_code=error_code)
+        super().__init__(429, message, error_code=error_code, result=result)
         #: Seconds the API asked you to wait, or None when it did not say.
         self.retry_after_seconds = retry_after_seconds
 
@@ -225,20 +261,42 @@ class StorefrontError(ApiError):
 
 
 class AuthenticationError(DominaiteError):
-    """The API rejected your credentials or signature.
+    """The API rejected your credentials or signature (HTTP 401), or refused the request
+    for this key (HTTP 403). ``http_status`` tells the two apart.
 
-    Not retryable - fix the key id, secret, or server clock. Machine-readable code
-    on ``error_code``:
+    Not retryable. A 401 is a credential problem - fix the key id, secret, or server
+    clock. Machine-readable code on ``error_code``:
 
     - ``INVALID_API_KEY``: wrong or revoked key id.
     - ``INVALID_SIGNATURE``: your signing is wrong; re-run the test vector.
     - ``TIMESTAMP_OUT_OF_RANGE``: server clock is off; fix NTP, do not retry-loop.
     - ``IP_NOT_ALLOWED``: this key is locked to addresses that don't include yours.
+
+    A 403 is NOT a credential problem: the key and the signature are good, but the key may
+    not do this. Do not rotate the key or touch the clock for it:
+
+    - ``INSUFFICIENT_SCOPE``: the key does not hold the scope this route needs. A
+      ``payments`` key makes payments; a reporting key holds ``transactions:read``,
+      ``webhooks:manage`` or both. Use a key with the right scope.
+    - ``VERIFY_ONLY_NOT_ENABLED``: ``verify_only`` sessions are not enabled for your
+      account. Nothing was created. We switch it on for your account: ask support.
+
+    ``result`` is the whole JSON body the API sent.
     """
 
-    def __init__(self, error_code: str, message: str) -> None:
+    def __init__(
+        self,
+        error_code: str,
+        message: str,
+        http_status: int = 401,
+        result: Optional[Dict[str, Any]] = None,
+    ) -> None:
         super().__init__(message)
         self.error_code = error_code
+        #: 401 for a credential failure, 403 for a key that may not do this.
+        self.http_status = http_status
+        #: The full JSON body the API sent, for fields not modelled above.
+        self.result = result if result is not None else {}
 
 
 class CheckoutRefusedError(DominaiteError):
@@ -389,13 +447,11 @@ class RefundError(ApiError):
         message: str,
         result: Optional[Dict[str, Any]] = None,
     ) -> None:
-        super().__init__(http_status, message, error_code=error_code)
+        super().__init__(http_status, message, error_code=error_code, result=result)
         #: Seconds to keep retrying with the same key, or None when retrying cannot help.
         self.retry_stop_after_seconds = REFUND_RETRY_WINDOWS_SECONDS.get(error_code)
         #: True when the same call with the same key can still succeed.
         self.retryable = self.retry_stop_after_seconds is not None
-        #: The full envelope, for fields not modelled above.
-        self.result = result if result is not None else {}
 
 
 class WebhookVerificationError(DominaiteError):
