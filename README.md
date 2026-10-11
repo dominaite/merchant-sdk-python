@@ -898,9 +898,9 @@ per object, and a redelivery carries the same number:
 The object is:
 
 - `agreement.*`: the agreement, `data["id"]`.
-- With scheduled charges on, `charge.*` for a charge the platform placed for an agreement (it
-  has a `periodNumber`): the agreement period, `data["agreementId"]` plus
-  `data["periodNumber"]`. So the retrying and failed events of one period compare across attempts.
+- With scheduled charges on, `charge.*` for a charge the platform placed for an agreement (it has a
+  `periodNumber`): the agreement period, `data["agreementId"]` plus `data["periodNumber"]`. With
+  scheduled charges on, the retrying and failed events of one period compare across attempts.
 - `charge.*` for a one-off charge you initiated: `data["chargeId"]`.
 
 ```python
