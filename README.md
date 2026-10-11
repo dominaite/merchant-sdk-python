@@ -394,8 +394,7 @@ else:
         ...  # not terminal: poll get_status(charge["transactionId"]) or wait for the webhook
     elif charge["status"] == ChargeStatus.FAILED:
         # HTTP 402 from the gateway, but not an exception: branch on the class, log the code.
-        # The 402 has a class only when the code alone decides it (soft_sca_required). Else it
-        # is None here and arrives on the charge.failed webhook and on get_status().
+        # The class can be None, for example when nobody declined the payment.
         # DeclineClass.HARD              - give up on this card, ask the customer for another one
         # DeclineClass.SOFT_FUNDS        - insufficient funds, retry later (not in a loop)
         # DeclineClass.SOFT_SCA_REQUIRED - the issuer wants the customer present: send them
@@ -422,10 +421,9 @@ returns the charge, 402 returns the charge too (`status` `failed`), and 409,
 422, 502 and 503 raise `ChargeError` with `error_code`, `http_status`, the gateway's message and,
 when the gateway attached the charge row, `charge` and `transaction_id`. Only authentication
 (401/403), an id that is not yours (404, `ApiError`), validation (400, `ApiError`), rate limiting
-(429) and network failures keep their generic exceptions. `declineClass` and `declineCode` are
-`None` unless the charge was declined; the gateway omits them on the wire and the SDK reads absent
-as `None`. `declineClass` can be `None` on a decline too: the 402 carries it only when the decline
-code alone decides it. Read the class from the `charge.failed` webhook or from `get_status()`.
+(429) and network failures keep their generic exceptions. `declineClass` and `declineCode` can be
+`None`, for example when nobody declined the payment. The gateway omits a null key on the wire, and
+the SDK reads absent as `None`.
 
 To bill an agreement, pass `agreement_id`. The gateway then checks the charge against the
 agreement: the card, the currency, the amount and the period. A charge that does not fit is
@@ -733,8 +731,8 @@ Recurring agreements add `agreement.activated`, `agreement.past_due`, `agreement
 `charge.succeeded`, `charge.failed` and `charge.retrying`. They ride the same signed envelope.
 A verify-only session sends `verification.succeeded` or `verification.failed`, and no
 `payment.*` event. Their `data` has the keys of a `payment.*` event, with `verifyOnly` set to
-`True`. On `verification.failed`, `declineClass` says why the card was declined. It is `None`
-when the payer abandoned the checkout.
+`True`. On `payment.failed` and `verification.failed`, `declineClass` says why the card was
+declined. It can be `None`, for example when nobody declined the payment.
 
 `payment.succeeded` is the only one that means money in hand. `requires_capture` is an approved
 hold, not a payment. `pending` and `processing` are never webhooked - if you want to show an
@@ -970,7 +968,8 @@ The status read has more keys. The API leaves out a key whose value is null, so 
 `.get`. The `CheckoutStatus` `TypedDict` names every key.
 
 - `declineClass`: on a `failed` payment, what to do next: `hard`, `soft_funds`,
-  `soft_sca_required` or `soft_other`. It can be `None` until the decline is classified.
+  `soft_sca_required` or `soft_other`. It can be `None`, for example when nobody declined the
+  payment.
 - `isRecurring`: `True` for a charge on a stored card, `False` for a checkout session.
 - `verifyOnly`: `True` on a verify-only session.
 - `agreement`: on a subscription session, the agreement `id` and its current `status`. Read

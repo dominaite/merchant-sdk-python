@@ -142,7 +142,7 @@ class CheckoutStatus(_CheckoutStatusRequired, total=False):
     Every status and class is a plain string: a value the SDK does not know yet is valid.
 
     - ``declineClass``: what to do with a ``failed`` payment (:data:`DECLINE_CLASSES`). It
-      can be None or absent on a failure too, when the decline cannot be classified yet.
+      can be None, for example when nobody declined the payment.
     - ``isRecurring``: True for a charge on a stored card, False for a checkout session.
     - ``verifyOnly``: True on a verify-only session, absent on every other session. The
       status is ``requires_capture``, then ``cancelled`` once the hold is released. A

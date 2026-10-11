@@ -2014,8 +2014,7 @@ def test_a_charge_passes_the_agreement_id_and_sequence_through(client, urlopen):
 
 
 def test_a_402_without_a_decline_class_is_a_result_with_decline_class_none(client, urlopen):
-    """The 402 carries a class only when the decline code alone decides it. Every other
-    decline is classified later, so a missing class must never make the charge an error."""
+    """declineClass can be null. A 402 without one is still a result, never an error."""
     declined = dict(CHARGE, status="failed", declineCode="05")
     urlopen((402, {
         "success": False, "data": declined,

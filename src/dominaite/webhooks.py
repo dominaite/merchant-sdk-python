@@ -81,11 +81,10 @@ class PaymentEventData(_PaymentEventDataRequired, total=False):
     processor webhook can keep it None. ``payment.refunded`` and ``payment.cancelled``
     carry the original sale's reference. ``charge.*`` events do not have it.
 
-    ``verifyOnly`` and ``declineClass`` are for the ``verification.*`` events of a
-    verify-only session, which carry this same data. There ``verifyOnly`` is True, and
-    ``declineClass`` says why a ``verification.failed`` was declined (None when the payer
-    abandoned the checkout). Every ``payment.*`` event has False and None, ``payment.failed``
-    too: read the class of a payment decline from :meth:`DominaiteClient.get_status`.
+    ``verifyOnly`` is True on the ``verification.*`` events of a verify-only session, which
+    carry this same data, and False on every ``payment.*`` event. ``declineClass`` says why
+    a ``payment.failed`` or a ``verification.failed`` was declined (:data:`DECLINE_CLASSES`).
+    It can be None, for example when nobody declined the payment.
     """
 
     paymentMethod: Optional[str]

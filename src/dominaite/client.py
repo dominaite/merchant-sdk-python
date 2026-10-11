@@ -774,8 +774,8 @@ class DominaiteClient:
         disputes like a card.
 
         ``declineClass`` says what to do with a ``failed`` payment (:data:`DECLINE_CLASSES`).
-        It can be None or absent on a failure too, when the decline cannot be classified
-        yet. ``isRecurring`` is True for a charge on a stored card. ``verifyOnly`` is True
+        It can be None, for example when nobody declined the payment. ``isRecurring`` is
+        True for a charge on a stored card. ``verifyOnly`` is True
         on a verify-only session and absent otherwise: its status goes
         ``requires_capture``, then ``cancelled``, and a ``storedPaymentMethod`` is what
         says that the card is verified. ``agreement`` (``{"id", "status",
@@ -825,12 +825,9 @@ class DominaiteClient:
         A decline is not an exception: the gateway answers HTTP 402 and this returns a
         charge with ``status`` ``failed``. Its ``declineClass`` tells you whether to give
         up on the card (``hard``), wait (``soft_funds``, ``soft_other``) or bring the
-        customer back for a hosted session (``soft_sca_required``). The 402 carries the
-        class only when the decline code alone decides it (``soft_sca_required``); for
-        every other decline it is None here. The class arrives a moment later on the
-        ``charge.failed`` webhook and on :meth:`get_status` with the returned
-        ``transactionId``. ``pending`` is not terminal - poll :meth:`get_status` with the
-        returned ``transactionId``.
+        customer back for a hosted session (``soft_sca_required``). It can be None, for
+        example when nobody declined the payment. ``pending`` is not terminal - poll
+        :meth:`get_status` with the returned ``transactionId``.
 
         :param payment_method_id: The ``storedPaymentMethod["id"]`` from
             :meth:`get_status` of a session created with ``save_card=True``.
@@ -850,10 +847,10 @@ class DominaiteClient:
         :returns: ``{"chargeId", "status", "declineClass", "declineCode",
             "transactionId"}``, plus ``agreementId`` and ``sequence`` when the gateway
             sends them. ``status`` is ``succeeded``, ``pending`` or
-            ``cancelled`` on a 201 (200 on a replay) and ``failed`` on a 402;
-            ``declineClass`` and ``declineCode`` are None unless the charge was
-            declined (the gateway omits them on the wire; absent reads as None), and
-            ``declineClass`` can be None on a decline too. ``agreementId`` names the
+            ``cancelled`` on a 201 (200 on a replay) and ``failed`` on a 402.
+            ``declineClass`` and ``declineCode`` can be None, for example when nobody
+            declined the payment (the gateway omits them on the wire; absent reads as
+            None). ``agreementId`` names the
             agreement the charge was placed under. ``sequence`` orders this answer against
             the ``charge.*`` events of the same object; it is 0 while the charge is
             pending.
@@ -1734,9 +1731,8 @@ def _auth_message(status: int, code: str, server_message: Any) -> str:
 def _charge(data: Dict[str, Any]) -> Dict[str, Any]:
     """The charge body as one shape.
 
-    The gateway omits ``declineClass`` and ``declineCode`` when they are null (every
-    201, a 402 whose class is not known yet, and a 502 ``CHARGE_FAILED`` row), so absent
-    reads as None. Anything else the gateway sends is carried through as sent,
+    The gateway omits ``declineClass`` and ``declineCode`` when they are null (a 201 or a
+    502 ``CHARGE_FAILED`` row, for example), so absent reads as None. Anything else the gateway sends is carried through as sent,
     ``agreementId`` and ``sequence`` included.
     """
     charge = dict(data)

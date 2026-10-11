@@ -514,10 +514,11 @@ def test_the_canonical_payment_vector_still_fits_the_required_keys():
     assert PaymentEventData.__required_keys__ == set(data)
 
 
-def test_a_payment_event_is_not_verify_only_and_has_no_decline_class():
-    data = _verified(_payment_body(event_type="payment.failed", status="failed"))["data"]
+def test_a_failed_payment_event_is_not_verify_only_and_carries_its_decline_class():
+    body = _payment_body(event_type="payment.failed", status="failed", decline='"soft_funds"')
+    data = _verified(body)["data"]
     assert data["verifyOnly"] is False
-    assert data["declineClass"] is None
+    assert data["declineClass"] == "soft_funds"
 
 
 @pytest.mark.parametrize(
