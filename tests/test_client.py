@@ -47,8 +47,12 @@ from dominaite import (
     RevokeError,
     StorefrontError,
     TransportError,
+    is_paid,
+    is_terminal,
     order_idempotency_key,
     sign_request,
+    sign_webhook,
+    verify_webhook,
 )
 from dominaite.client import MAX_RESPONSE_BYTES
 
@@ -3300,3 +3304,71 @@ def test_the_transaction_list_keeps_the_shared_failure_rules(client, urlopen, ou
 
     with pytest.raises(error):
         client.list_transactions("2026-10-01", "2026-10-08")
+
+
+# --- values the SDK has never seen -------------------------------------------
+
+
+def test_values_the_sdk_has_never_seen_pass_through_and_never_throw(client, urlopen):
+    """Every status, reason, class and type is a plain string. A value the API adds later
+    reaches the caller as sent, and the SDK never raises on it."""
+    stored = {"id": PAYMENT_METHOD_ID, "status": "suspended_v9", "retiredReason": "issuer_recall_v9"}
+    urlopen((200, {"success": True, "data": {
+        "transactionId": TRANSACTION_ID, "status": "settling_v9", "declineClass": "soft_issuer_v9",
+        "paymentMethod": "crypto_v9", "walletType": "mind_pay_v9", "storedPaymentMethod": stored,
+        "agreement": {"id": AGREEMENT_ID, "status": "paused_v9"},
+    }}))
+    status = client.get_status(TRANSACTION_ID)
+    assert status["status"] == "settling_v9"
+    assert status["declineClass"] == "soft_issuer_v9"
+    assert status["paymentMethod"] == "crypto_v9"
+    assert status["walletType"] == "mind_pay_v9"
+    assert status["storedPaymentMethod"]["status"] == "suspended_v9"
+    assert status["storedPaymentMethod"]["retiredReason"] == "issuer_recall_v9"
+    assert status["agreement"]["status"] == "paused_v9"
+    assert is_terminal(status["status"]) is False
+    assert is_paid(status["status"]) is False
+
+    urlopen(_placed(dict(CHARGE, status="under_review_v9", declineClass="soft_issuer_v9")))
+    charge = _charge(client)
+    assert charge["status"] == "under_review_v9"
+    assert charge["declineClass"] == "soft_issuer_v9"
+
+    urlopen(_accepted(dict(QUEUED_REFUND, status="reversed_v9", failureCode="REFUND_NEW_V9")))
+    refund = client.create_refund(TRANSACTION_ID, amount=1500, idempotency_key=REFUND_KEY)
+    assert refund["status"] == "reversed_v9"
+    assert refund["failureCode"] == "REFUND_NEW_V9"
+
+    urlopen((200, {"success": True, "data": dict(PLAN, status="paused_v9", intervalUnit="fortnight_v9")}))
+    plan = client.get_plan(PLAN_ID)
+    assert plan["status"] == "paused_v9"
+    assert plan["intervalUnit"] == "fortnight_v9"
+
+    urlopen((200, {"success": True, "data": dict(
+        AGREEMENT, status="on_hold_v9", pastDueReason="issuer_freeze_v9",
+    )}))
+    agreement = client.get_agreement(AGREEMENT_ID)
+    assert agreement["status"] == "on_hold_v9"
+    assert agreement["pastDueReason"] == "issuer_freeze_v9"
+
+    urlopen((200, {"success": True, "data": [dict(WEBHOOK_ENDPOINT, status="quarantined_v9")]}))
+    assert client.list_webhook_endpoints()[0]["status"] == "quarantined_v9"
+
+    urlopen(_page([dict(TRANSACTION_ROW, type="payout_v9", status="settling_v9")]))
+    row = client.list_transactions("2026-10-01", "2026-10-08")["items"][0]
+    assert row["type"] == "payout_v9"
+    assert row["status"] == "settling_v9"
+
+    recorder = urlopen(_created(WEBHOOK_ENDPOINT))
+    client.create_webhook_endpoint(**_webhook_arguments(events=["payment.settled_v9"]))
+    assert json.loads(recorder.last.data)["events"] == ["payment.settled_v9"]
+
+    body = json.dumps({
+        "id": "evt_1", "type": "payment.settled_v9", "createdAt": "2026-10-11T09:00:00Z",
+        "data": {"transactionId": TRANSACTION_ID, "status": "settling_v9"},
+    })
+    timestamp = "1760173200"
+    header = "t=" + timestamp + ",v1=" + sign_webhook(WEBHOOK_SECRET, timestamp, body)
+    event = verify_webhook(body, header, WEBHOOK_SECRET, now=int(timestamp))
+    assert event["type"] == "payment.settled_v9"
+    assert event["data"]["status"] == "settling_v9"
