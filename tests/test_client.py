@@ -1979,6 +1979,68 @@ def test_charge_sends_the_callers_key_and_the_description(client, urlopen):
     }
 
 
+def test_a_charge_for_an_agreement_sends_the_agreement_and_extra_fields_signed(client, urlopen):
+    recorder = urlopen(_placed(dict(CHARGE, agreementId=AGREEMENT_ID, sequence=0)))
+
+    _charge(client, agreement_id=AGREEMENT_ID, extra={"newField": True, "currency": "HUF"})
+
+    request = recorder.last
+    assert json.loads(request.data) == {
+        "amount": 2500, "currency": "HUF", "orderReference": "order-1043",
+        "agreementId": AGREEMENT_ID, "newField": True,
+    }
+    _assert_signed(request, "POST", CHARGE_PATH)
+
+
+def test_a_charge_passes_the_agreement_id_and_sequence_through(client, urlopen):
+    urlopen(_placed(dict(CHARGE, status="pending", agreementId=AGREEMENT_ID, sequence=0)))
+
+    charge = _charge(client, agreement_id=AGREEMENT_ID)
+
+    assert charge["agreementId"] == AGREEMENT_ID
+    assert charge["sequence"] == 0
+
+
+def test_a_402_without_a_decline_class_is_a_result_with_decline_class_none(client, urlopen):
+    """The 402 carries a class only when the decline code alone decides it. Every other
+    decline is classified later, so a missing class must never make the charge an error."""
+    declined = dict(CHARGE, status="failed", declineCode="05")
+    urlopen((402, {
+        "success": False, "data": declined,
+        "error": {"code": "CHARGE_DECLINED", "message": "The payment provider declined the charge.", "statusCode": 402},
+    }))
+
+    charge = _charge(client)
+
+    assert charge["status"] == "failed"
+    assert charge["declineClass"] is None
+    assert charge["declineCode"] == "05"
+
+
+def test_an_agreement_charge_refusal_is_a_charge_error_with_its_code(client, urlopen):
+    body = _gateway_error(422, "AGREEMENT_PERIOD_ALREADY_CHARGED", "This period was already charged.")
+    urlopen((422, body))
+
+    with pytest.raises(ChargeError) as caught:
+        _charge(client, agreement_id=AGREEMENT_ID)
+
+    assert caught.value.http_status == 422
+    assert caught.value.error_code == "AGREEMENT_PERIOD_ALREADY_CHARGED"
+    assert caught.value.charge is None
+    assert caught.value.result == body
+
+
+def test_a_charge_under_an_unknown_agreement_is_an_api_error_404_with_its_code(client, urlopen):
+    urlopen((404, _gateway_error(404, "AGREEMENT_NOT_FOUND", "Agreement not found.")))
+
+    with pytest.raises(ApiError) as caught:
+        _charge(client, agreement_id=AGREEMENT_ID)
+
+    assert not isinstance(caught.value, ChargeError)
+    assert caught.value.http_status == 404
+    assert caught.value.error_code == "AGREEMENT_NOT_FOUND"
+
+
 def test_a_402_decline_is_a_result_with_a_decline_class_not_an_exception(client, urlopen):
     declined = dict(CHARGE, status="failed", declineClass="soft_funds", declineCode="51")
     urlopen((402, {

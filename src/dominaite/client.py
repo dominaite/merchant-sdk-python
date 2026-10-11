@@ -740,6 +740,8 @@ class DominaiteClient:
         order_reference: str,
         description: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        agreement_id: Optional[str] = None,
+        extra: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Charge a card kept on file, off-session: no widget, no payer present.
 
@@ -748,11 +750,14 @@ class DominaiteClient:
         the gateway replays its first answer.
 
         A decline is not an exception: the gateway answers HTTP 402 and this returns a
-        charge with ``status`` ``failed`` plus a ``declineClass`` telling you whether
-        to give up on the card (``hard``), wait (``soft_funds``, ``soft_other``) or
-        bring the customer back for a hosted session (``soft_sca_required``).
-        ``pending`` is not terminal - poll :meth:`get_status` with the returned
-        ``transactionId``.
+        charge with ``status`` ``failed``. Its ``declineClass`` tells you whether to give
+        up on the card (``hard``), wait (``soft_funds``, ``soft_other``) or bring the
+        customer back for a hosted session (``soft_sca_required``). The 402 carries the
+        class only when the decline code alone decides it (``soft_sca_required``); for
+        every other decline it is None here. The class arrives a moment later on the
+        ``charge.failed`` webhook and on :meth:`get_status` with the returned
+        ``transactionId``. ``pending`` is not terminal - poll :meth:`get_status` with the
+        returned ``transactionId``.
 
         :param payment_method_id: The ``storedPaymentMethod["id"]`` from
             :meth:`get_status` of a session created with ``save_card=True``.
@@ -764,11 +769,21 @@ class DominaiteClient:
             ``order_idempotency_key("sub-2026-10", "8817", 2500, "EUR")``, never
             mint one per attempt. Omitting it raises ``ValueError`` before anything is
             sent.
+        :param agreement_id: The ``agr_`` id of the agreement this charge bills, sent
+            exactly as returned (it is case-sensitive). The gateway then checks the charge
+            against the agreement: the card, the currency, the amount and the period.
+        :param extra: More request fields, sent as given in the signed body. A key here
+            replaces the same key set by the arguments above.
         :returns: ``{"chargeId", "status", "declineClass", "declineCode",
-            "transactionId"}``. ``status`` is ``succeeded``, ``pending`` or
+            "transactionId"}``, plus ``agreementId`` and ``sequence`` when the gateway
+            sends them. ``status`` is ``succeeded``, ``pending`` or
             ``cancelled`` on a 201 (200 on a replay) and ``failed`` on a 402;
             ``declineClass`` and ``declineCode`` are None unless the charge was
-            declined (the gateway omits them on the wire; absent reads as None).
+            declined (the gateway omits them on the wire; absent reads as None), and
+            ``declineClass`` can be None on a decline too. ``agreementId`` names the
+            agreement the charge was placed under. ``sequence`` orders this answer against
+            the ``charge.*`` events of the same object; it is 0 while the charge is
+            pending.
 
         :raises ChargeError: The gateway answered with a code instead of a charge:
             ``CHARGE_OUTCOME_UNKNOWN`` (502, the charge MAY have happened - poll
@@ -776,13 +791,20 @@ class DominaiteClient:
             (502, nothing charged), ``PAYMENT_METHOD_NOT_ACTIVE`` or
             ``DUPLICATE_REQUEST`` (409), ``IDEMPOTENCY_KEY_REUSED`` (422),
             ``PAYMENT_METHOD_CHARGES_DISABLED`` or ``PAYMENT_PROCESSING_UNAVAILABLE``
-            (503, retry later with the same key).
+            (503, retry later with the same key). A charge with ``agreement_id`` can
+            also be refused with 422 ``AGREEMENT_METHOD_MISMATCH``,
+            ``AGREEMENT_CONSENT_MISSING``, ``AGREEMENT_CURRENCY_MISMATCH``,
+            ``CHARGE_AMOUNT_ABOVE_AGREEMENT``, ``AGREEMENT_AMOUNT_MISMATCH``,
+            ``AGREEMENT_NOT_STARTED``, ``AGREEMENT_ENDED`` or
+            ``AGREEMENT_PERIOD_ALREADY_CHARGED``. Nothing was charged on any of them.
         :raises AuthenticationError: Wrong/revoked credentials or bad signature
             (401), or a key without the ``payments`` scope (403).
         :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``, then retry WITH
-            the same ``idempotency_key``.
-        :raises ApiError: An id that is not yours (HTTP 404), input validation (400)
-            or an unexpected response.
+            the same ``idempotency_key``. ``error_code`` is ``CHARGE_VELOCITY_EXCEEDED`` or
+            ``CHARGE_DECLINE_RATE_EXCEEDED`` for the charge route's own limits.
+        :raises ApiError: An id that is not yours (HTTP 404, ``PAYMENT_METHOD_NOT_FOUND``
+            or ``AGREEMENT_NOT_FOUND``), input validation (400) or an unexpected
+            response.
         :raises TransportError: Network-level failure (safe to retry WITH the same
             ``idempotency_key``).
         """
@@ -792,8 +814,7 @@ class DominaiteClient:
             raise ValueError("description must be a string")
         key = _normalize_idempotency_key(idempotency_key)
 
-        # Built field by field: the body is what gets signed, and the contract for this
-        # route is exactly these fields in this order.
+        # The body is what gets signed, so it is built once, here, and sent as built.
         body: Dict[str, Any] = {
             "amount": amount,
             "currency": currency,
@@ -801,6 +822,10 @@ class DominaiteClient:
         }
         if description is not None:
             body["description"] = description
+        if agreement_id is not None:
+            body["agreementId"] = str(agreement_id)
+        if extra is not None:
+            body.update(extra)
 
         reply = self._send(
             "POST", PAYMENT_METHODS_PATH + "/" + method_id + "/charges", body, key
@@ -1172,8 +1197,9 @@ def _charge(data: Dict[str, Any]) -> Dict[str, Any]:
     """The charge body as one shape.
 
     The gateway omits ``declineClass`` and ``declineCode`` when they are null (every
-    201, and a 502 ``CHARGE_FAILED`` row), so absent reads as None. Anything else the
-    gateway sends is carried through.
+    201, a 402 whose class is not known yet, and a 502 ``CHARGE_FAILED`` row), so absent
+    reads as None. Anything else the gateway sends is carried through as sent,
+    ``agreementId`` and ``sequence`` included.
     """
     charge = dict(data)
     charge["chargeId"] = str(data.get("chargeId"))

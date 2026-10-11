@@ -379,6 +379,8 @@ else:
         ...  # not terminal: poll get_status(charge["transactionId"]) or wait for the webhook
     elif charge["status"] == ChargeStatus.FAILED:
         # HTTP 402 from the gateway, but not an exception: branch on the class, log the code.
+        # The 402 has a class only when the code alone decides it (soft_sca_required). Else it
+        # is None here and arrives on the charge.failed webhook and on get_status().
         # DeclineClass.HARD              - give up on this card, ask the customer for another one
         # DeclineClass.SOFT_FUNDS        - insufficient funds, retry later (not in a loop)
         # DeclineClass.SOFT_SCA_REQUIRED - the issuer wants the customer present: send them
@@ -401,13 +403,20 @@ except RevokeError as error:
 A charge is signed exactly like a session and carries an `Idempotency-Key`, so a retry after a
 timeout with the **same** key never charges the card twice: the gateway replays its first answer,
 HTTP status included. The HTTP status is the contract on this route: 201 (or 200 on a replay)
-returns the charge, 402 returns the charge too (`status` `failed` plus `declineClass`), and 409,
+returns the charge, 402 returns the charge too (`status` `failed`), and 409,
 422, 502 and 503 raise `ChargeError` with `error_code`, `http_status`, the gateway's message and,
 when the gateway attached the charge row, `charge` and `transaction_id`. Only authentication
 (401/403), an id that is not yours (404, `ApiError`), validation (400, `ApiError`), rate limiting
 (429) and network failures keep their generic exceptions. `declineClass` and `declineCode` are
 `None` unless the charge was declined; the gateway omits them on the wire and the SDK reads absent
-as `None`.
+as `None`. `declineClass` can be `None` on a decline too: the 402 carries it only when the decline
+code alone decides it. Read the class from the `charge.failed` webhook or from `get_status()`.
+
+To bill an agreement, pass `agreement_id`. The gateway then checks the charge against the
+agreement: the card, the currency, the amount and the period. A charge that does not fit is
+refused with a 422 `ChargeError`, for example `AGREEMENT_PERIOD_ALREADY_CHARGED` or
+`CHARGE_AMOUNT_ABOVE_AGREEMENT`, and nothing is charged. The returned charge has `agreementId`
+and `sequence`, which orders it against the `charge.*` events of the same object.
 
 Revoking signs an empty key and an empty body, like `get_status()`. A revoke that fails with
 `RevokeError` changed nothing: `MERCHANT_API_UNAVAILABLE` (503) is retryable,

@@ -28,6 +28,10 @@
 - `CheckoutSession`, `CheckoutStatus` and `CheckoutAgreement` `TypedDict`s. They name the keys
   of the session and of the status read, `verifyOnly`, `agreementId`, `declineClass`,
   `isRecurring`, `agreement` and `sequence` included. The methods still return plain dicts.
+- `charge_payment_method` takes `agreement_id` and `extra`. A charge with `agreement_id` bills
+  that agreement. The gateway checks the charge against it and refuses one that does not fit
+  with a 422 `ChargeError`, for example `AGREEMENT_PERIOD_ALREADY_CHARGED`. The returned charge
+  carries `agreementId` and `sequence` as the gateway sends them.
 
 ### Changed
 
@@ -38,6 +42,12 @@
 - `RateLimitError.error_code` falls back to `RATE_LIMIT_EXCEEDED`, the gateway's own code, when
   a 429 carries none (it was `RATE_LIMITED`). A 429 whose body is not JSON is now a
   `RateLimitError` too, with its `Retry-After`.
+
+### Fixed
+
+- The docs no longer promise a `declineClass` on every 402. The 402 carries it only when the
+  decline code alone decides it (`soft_sca_required`). The class of every other decline arrives
+  on the `charge.failed` webhook and on `get_status`.
 
 ## 0.4.0
 
