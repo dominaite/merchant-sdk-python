@@ -767,7 +767,8 @@ admin.delete_webhook_endpoint(endpoint["id"])
 `payment.abandoned`, `payment.refunded`, `payment.disputed`.
 
 Recurring agreements add `agreement.activated`, `agreement.past_due`, `agreement.cancelled`,
-`charge.succeeded`, `charge.failed` and `charge.retrying`. They ride the same signed envelope.
+`charge.succeeded` and `charge.failed`. With scheduled charges on, they also add
+`charge.retrying`. These events ride the same signed envelope.
 A verify-only session sends `verification.succeeded` or `verification.failed`, and no
 `payment.*` event. Their `data` has the keys of a `payment.*` event, with `verifyOnly` set to
 `True`. On `payment.failed` and `verification.failed`, `declineClass` says why the card was
