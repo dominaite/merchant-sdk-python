@@ -359,8 +359,12 @@ class ChargeError(DominaiteError):
       with the SAME key in a moment.
     - ``IDEMPOTENCY_KEY_REUSED`` (422): same key, different body or method; a bug on
       your side.
-    - ``PAYMENT_METHOD_CHARGES_DISABLED``, ``PAYMENT_PROCESSING_UNAVAILABLE`` (503):
-      nothing was charged; retry later with the SAME key.
+    - ``PAYMENT_PROCESSING_UNAVAILABLE`` (503): nothing was charged; retry later with the
+      SAME key.
+    - ``PAYMENT_METHOD_CHARGES_DISABLED`` (503): nothing was charged. If we never switched
+      stored-card charges on for your account, a retry does not help: ask Dominaite support.
+      If they are on, retry later with the SAME idempotency key. The code is the same in
+      both cases.
 
     ``result`` is the whole envelope the gateway sent, for fields not modelled above.
     """

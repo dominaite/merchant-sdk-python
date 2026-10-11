@@ -861,8 +861,11 @@ class DominaiteClient:
             ``error.transaction_id``, never retry under a new key), ``CHARGE_FAILED``
             (502, nothing charged), ``PAYMENT_METHOD_NOT_ACTIVE`` or
             ``DUPLICATE_REQUEST`` (409), ``IDEMPOTENCY_KEY_REUSED`` (422),
-            ``PAYMENT_METHOD_CHARGES_DISABLED`` or ``PAYMENT_PROCESSING_UNAVAILABLE``
-            (503, retry later with the same key). A charge with ``agreement_id`` can
+            ``PAYMENT_PROCESSING_UNAVAILABLE`` (503, retry later with the same key) or
+            ``PAYMENT_METHOD_CHARGES_DISABLED`` (503). If we never switched stored-card
+            charges on for your account, a retry does not help: ask Dominaite support. If
+            they are on, retry later with the same idempotency key. The code is the same in
+            both cases. A charge with ``agreement_id`` can
             also be refused with 422 ``AGREEMENT_METHOD_MISMATCH``,
             ``AGREEMENT_CONSENT_MISSING``, ``AGREEMENT_CURRENCY_MISMATCH``,
             ``CHARGE_AMOUNT_ABOVE_AGREEMENT``, ``AGREEMENT_AMOUNT_MISMATCH``,
@@ -1275,8 +1278,8 @@ class DominaiteClient:
         charged.
 
         To start it, call :meth:`create_checkout_session` with ``agreement_id``. That
-        payment activates the agreement and saves the card. From then on the platform
-        places the charge of each period on the saved card.
+        payment activates the agreement and saves the card. With scheduled charges on, the
+        platform charges the stored card each period.
 
         :param plan_id: The ``plan_`` id of an active plan, exactly as returned.
         :param customer_reference: Your own stable id for the customer, 1 to 100
