@@ -62,7 +62,7 @@ class _PaymentEventDataRequired(TypedDict):
 
 
 class PaymentEventData(_PaymentEventDataRequired, total=False):
-    """``data`` of a ``payment.*`` event.
+    """``data`` of a ``payment.*`` or ``verification.*`` event.
 
     ``amount`` is what you get paid and ``grossAmount`` what moved on the card, both in
     minor units; on ``payment.refunded`` ``transactionId`` is the refund's own id,
@@ -80,6 +80,12 @@ class PaymentEventData(_PaymentEventDataRequired, total=False):
     until the processor has reported one, and a sale settled by reconciliation without a
     processor webhook can keep it None. ``payment.refunded`` and ``payment.cancelled``
     carry the original sale's reference. ``charge.*`` events do not have it.
+
+    ``verifyOnly`` and ``declineClass`` are for the ``verification.*`` events of a
+    verify-only session, which carry this same data. There ``verifyOnly`` is True, and
+    ``declineClass`` says why a ``verification.failed`` was declined (None when the payer
+    abandoned the checkout). Every ``payment.*`` event has False and None, ``payment.failed``
+    too: read the class of a payment decline from :meth:`DominaiteClient.get_status`.
     """
 
     paymentMethod: Optional[str]
@@ -91,6 +97,8 @@ class PaymentEventData(_PaymentEventDataRequired, total=False):
     paymentMethodBrand: Optional[str]
     paymentMethodLast4: Optional[str]
     storedPaymentMethod: Optional[StoredPaymentMethod]
+    verifyOnly: bool
+    declineClass: Optional[str]
 
 
 class _AgreementEventDataRequired(TypedDict):

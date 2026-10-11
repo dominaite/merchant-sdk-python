@@ -427,6 +427,8 @@ def test_the_exported_types_describe_the_wire_shape(event_type, body):
         (ChargeEventData, "sequence"),
         (PaymentEventData, "storedPaymentMethod"),
         (PaymentEventData, "pspReference"),
+        (PaymentEventData, "verifyOnly"),
+        (PaymentEventData, "declineClass"),
     ],
 )
 def test_the_new_fields_are_optional_so_old_payloads_still_fit(event_type, key):
@@ -449,18 +451,22 @@ RETIRED_CARD = (
 )
 
 
-def _payment_body(card="null", event_type="payment.succeeded", psp='"psp_123"'):
+def _payment_body(
+    card="null", event_type="payment.succeeded", psp='"psp_123"', verify_only="false",
+    decline="null", status="succeeded",
+):
     """A current payment.* delivery, compact and in the gateway's key order."""
     return (
         '{"id":"5b6c7d8e-9f0a-4b1c-8d2e-3f4a5b6c7d8e","type":"' + event_type + '",'
         '"apiVersion":"2026-09-25","createdAt":"2026-09-26T10:00:00Z","data":{'
-        '"transactionId":"0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0","status":"succeeded",'
+        '"transactionId":"0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0","status":"' + status + '",'
         '"previousStatus":"pending","kind":"sale","amount":8440,"grossAmount":8440,'
         '"surchargeAmount":null,"currency":"EUR","paymentMethod":"card","walletType":null,'
         '"originalTransactionId":null,"idempotencyKey":"checkout-1042-8440-EUR",'
         '"orderReference":"order-1042","orderId":"ord_1","pspReference":' + psp + ',"description":null,'
         '"paymentMethodBrand":"visa","paymentMethodLast4":"4242",'
-        '"storedPaymentMethod":' + card + '}}'
+        '"storedPaymentMethod":' + card + ',"verifyOnly":' + verify_only + ','
+        '"declineClass":' + decline + '}}'
     )
 
 
@@ -506,6 +512,28 @@ def test_the_webhook_card_is_the_status_read_card_type():
 def test_the_canonical_payment_vector_still_fits_the_required_keys():
     data = json.loads(BODY)["data"]
     assert PaymentEventData.__required_keys__ == set(data)
+
+
+def test_a_payment_event_is_not_verify_only_and_has_no_decline_class():
+    data = _verified(_payment_body(event_type="payment.failed", status="failed"))["data"]
+    assert data["verifyOnly"] is False
+    assert data["declineClass"] is None
+
+
+@pytest.mark.parametrize(
+    "decline, expected", [('"soft_funds"', "soft_funds"), ("null", None)],
+    ids=["declined", "abandoned"],
+)
+def test_a_verification_event_carries_the_payment_data_with_verify_only_true(decline, expected):
+    body = _payment_body(
+        event_type="verification.failed", status="failed", verify_only="true", decline=decline,
+    )
+    event = _verified(body)
+
+    assert event["type"] == "verification.failed"
+    assert event["data"]["verifyOnly"] is True
+    assert event["data"]["declineClass"] == expected
+    assert set(event["data"]) == PaymentEventData.__required_keys__ | PaymentEventData.__optional_keys__
 
 
 def test_a_payment_event_carries_the_psp_reference():

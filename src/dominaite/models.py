@@ -251,9 +251,13 @@ class Agreement(_AgreementRequired, total=False):
     - ``storedPaymentMethodId``: the ``pm_`` id of the card on file, absent until saved.
     - ``maxAmountPerPeriod``: the most one charge may be on a variable agreement.
     - ``nextChargeAt``: the next scheduled charge, absent while pending and once ended.
-    - ``pastDueReason``: why the agreement is ``past_due``: ``card_expired`` and
-      ``card_revoked`` you fix with a new card; ``hard_decline`` and ``dunning_exhausted``
-      are the issuer's.
+    - ``pastDueReason``: why the agreement is ``past_due``. ``card_expired`` and
+      ``card_revoked``: the card on file cannot be charged, so ask for a new card.
+      ``hard_decline``: the issuer refused the card, and a retry on it is pointless.
+      ``dunning_exhausted``: the retries after soft declines ran out. ``sca_required``: the
+      issuer wants the customer to authenticate a payment in person, and a new card does
+      not help. ``unprocessable``: the platform refused the charge for a reason that no
+      retry fixes; contact support. A value the SDK does not know yet is valid.
     - ``consent``: an :class:`AgreementConsent`, absent until consent is recorded.
     """
 

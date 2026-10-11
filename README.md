@@ -732,7 +732,9 @@ admin.delete_webhook_endpoint(endpoint["id"])
 Recurring agreements add `agreement.activated`, `agreement.past_due`, `agreement.cancelled`,
 `charge.succeeded`, `charge.failed` and `charge.retrying`. They ride the same signed envelope.
 A verify-only session sends `verification.succeeded` or `verification.failed`, and no
-`payment.*` event.
+`payment.*` event. Their `data` has the keys of a `payment.*` event, with `verifyOnly` set to
+`True`. On `verification.failed`, `declineClass` says why the card was declined. It is `None`
+when the payer abandoned the checkout.
 
 `payment.succeeded` is the only one that means money in hand. `requires_capture` is an approved
 hold, not a payment. `pending` and `processing` are never webhooked - if you want to show an

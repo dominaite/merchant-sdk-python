@@ -28,6 +28,9 @@
 - `CheckoutSession`, `CheckoutStatus` and `CheckoutAgreement` `TypedDict`s. They name the keys
   of the session and of the status read, `verifyOnly`, `agreementId`, `declineClass`,
   `isRecurring`, `agreement` and `sequence` included. The methods still return plain dicts.
+- `PaymentEventData` names `verifyOnly` and `declineClass`. A `verification.*` event carries
+  the same data, with `verifyOnly` True and, on `verification.failed`, the `declineClass`.
+  Every `payment.*` event has False and None.
 - `charge_payment_method` takes `agreement_id` and `extra`. A charge with `agreement_id` bills
   that agreement. The gateway checks the charge against it and refuses one that does not fit
   with a 422 `ChargeError`, for example `AGREEMENT_PERIOD_ALREADY_CHARGED`. The returned charge
