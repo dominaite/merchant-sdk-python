@@ -41,27 +41,30 @@ The scopes of a key decide which methods it can call:
 | `transactions:read` | `list_transactions` |
 | `webhooks:manage` | `create_webhook_endpoint`, `list_webhook_endpoints`, `delete_webhook_endpoint` |
 
-A key with `payments` holds no other scope, so the other two scopes need a second key. The
-dashboard cannot create the second key today, so ask Dominaite support for it. The second key is
-for your whole account. It cannot be bound to one storefront.
+A key with `payments` holds no other scope, so the other two scopes need a second key: the
+reporting key. If your dashboard has no reporting key section, ask Dominaite support for the key.
+The reporting key is for your whole account. We cannot bind it to one storefront.
 A key issued before scopes existed holds `payments`. Every key can call `ping()`. A method that
 the key's scopes do not cover raises a 403 `AuthenticationError` with `error_code`
-`INSUFFICIENT_SCOPE`.
+`INSUFFICIENT_SCOPE`. A payments key always gets HTTP 403 `INSUFFICIENT_SCOPE` on
+`list_transactions()` and on the webhook endpoint methods.
 
 ## What we switch on for your account
 
-Some features work only after we switch them on for your account. The dashboard has no switch
-for them, so ask Dominaite support.
+Some features work only after we switch them on for your account, so ask Dominaite support.
+The dashboard has no switch for the first four.
 
-- **Saved-card charges.** `charge_payment_method()` charges a card that you saved. Without the
-  switch, it raises a 503 `ChargeError` with `PAYMENT_METHOD_CHARGES_DISABLED`.
-- **Subscription sessions and scheduled charges.** Without the switch for sessions, a session
-  with `agreement_id` raises `CheckoutRefusedError` with `SUBSCRIPTIONS_NOT_ENABLED`. Without
-  the switch for scheduled charges, the platform does not charge the saved card each period.
-- **Card verification.** A session with `verify_only=True` saves a card and takes no payment.
-  Without the switch, it raises a 403 `AuthenticationError` with `VERIFY_ONLY_NOT_ENABLED`.
-- **The second key.** The webhook endpoint methods and `list_transactions()` need it. With a
-  payments key, they raise a 403 `AuthenticationError` with `INSUFFICIENT_SCOPE`.
+- **Stored-card charges.** Without the switch, `charge_payment_method()` raises a 503
+  `ChargeError` with `PAYMENT_METHOD_CHARGES_DISABLED`.
+- **Subscription sessions.** Without the switch, `create_checkout_session()` with
+  `agreement_id` raises `CheckoutRefusedError` with `SUBSCRIPTIONS_NOT_ENABLED`.
+- **Scheduled charges.** Without the switch, the platform runs no scheduled charge and no
+  retry, even when the subscription session works.
+- **Verify-only sessions.** Without the switch, a session with `verify_only=True` raises a 403
+  `AuthenticationError` with `VERIFY_ONLY_NOT_ENABLED`.
+- **Card fields.** We switch them on per merchant on request. See [Card fields](#card-fields).
+- **The reporting key.** This is a second key, not a switch. A payments key always gets HTTP
+  403 `INSUFFICIENT_SCOPE` on `list_transactions()` and on the webhook endpoint methods.
 
 ## Quickstart against dev
 
@@ -364,10 +367,11 @@ and the expiry, and that `id` is what you charge and revoke with. Store it again
 (`paymentMethod` on the same status is something else: the gateway's string category of how the
 payer paid, `card`, `wallet` and so on.)
 
-Saving a card needs no switch. We switch saved-card charges on for your account. Until then,
-`charge_payment_method()` raises a 503 `ChargeError` with `PAYMENT_METHOD_CHARGES_DISABLED`. A
-retry does not help until we switch them on, so ask Dominaite support. We send the same code
-when we pause them for a short time. In that case, a later retry with the same key works.
+Saving a card needs no switch. We switch stored-card charges on for your account. Until then,
+`charge_payment_method()` raises a 503 `ChargeError` with `PAYMENT_METHOD_CHARGES_DISABLED`. It
+raises the same error when we pause stored-card charges for a short time. The code is the same
+in both cases. If we never switched stored-card charges on for your account, a retry does not
+help: ask Dominaite support. If they are on, retry later with the same idempotency key.
 
 ```python
 from dominaite import ChargeError, ChargeStatus, DeclineClass, RevokeError, StoredPaymentMethodStatus
@@ -401,8 +405,8 @@ except ChargeError as error:
         # under a new key: poll the transaction the gateway attached instead.
         poll_until_settled(error.transaction_id)
     elif error.error_code == "PAYMENT_METHOD_CHARGES_DISABLED":
-        # 503, nothing was charged. Not switched on for your account: a retry does not help,
-        # ask Dominaite support. Paused for a short time: retry later with the SAME key.
+        # 503, nothing was charged. Never switched on for your account: a retry does not
+        # help, ask Dominaite support. Switched on: retry later with the SAME idempotency key.
         ...
     elif error.error_code in ("DUPLICATE_REQUEST", "PAYMENT_PROCESSING_UNAVAILABLE"):
         ...  # nothing was charged; retry later with the SAME idempotency key
@@ -499,11 +503,12 @@ if stored and stored["status"] == StoredPaymentMethodStatus.ACTIVE:
 ## Subscriptions (plans and agreements)
 
 A plan is a price that you bill every period. An agreement subscribes one of your customers to a
-plan. We switch subscription sessions on for your account. Until then, you can create plans and
-agreements, but the subscription session is refused with `SUBSCRIPTIONS_NOT_ENABLED`. An
-agreement stays `pending` until its first payment. We also switch scheduled charges on for your
-account. After that, the platform places the charge of each period on the saved card. Until
-then, the platform runs no scheduled charge and no retry. Ask Dominaite support for both.
+plan. We switch subscription sessions on for your account. Until then,
+`create_checkout_session()` with `agreement_id` raises `CheckoutRefusedError` with
+`SUBSCRIPTIONS_NOT_ENABLED`. You can still create plans and agreements, but an agreement stays
+`pending` until its first payment. Scheduled charges are a separate switch. With scheduled
+charges on, the platform charges the stored card each period. Without that switch, the platform
+runs no scheduled charge and no retry. Ask Dominaite support for both switches.
 
 ```python
 plan = client.create_plan(
@@ -545,8 +550,8 @@ agreement = client.get_agreement(agreement["id"])
 2. Create one agreement for each customer and plan. It starts `pending` and charges nothing.
 3. Take the first payment with a subscription session: `create_checkout_session()` with
    `agreement_id` and `consent`. Send the agreement's amount and currency. On a plan with a
-   trial, the session charges the amount you send, and the first scheduled charge comes when
-   the trial ends.
+   trial, the session charges the amount you send. With scheduled charges on, the first
+   scheduled charge comes when the trial ends.
 4. `consent` names the consent text that your page showed the customer. Use one of
    `recurring.consentTextVersions` from `get_integration_contract()`, and send all three fields.
 5. A session that does not fit the agreement raises `CheckoutRefusedError`, and nothing is
@@ -554,8 +559,9 @@ agreement = client.get_agreement(agreement["id"])
    or `AGREEMENT_NOT_PENDING`.
 6. Follow the agreement with the `agreement.*` and `charge.*` webhooks, or read it with
    `get_agreement()`. See "Ordering agreement and charge events" below.
-7. `cancel_agreement()` stops the charges that are not placed yet. It does not reverse a charge.
-   If the agreement is already cancelled, the call succeeds again. A retry is safe.
+7. `cancel_agreement()` cancels the agreement. With scheduled charges on, it also stops the
+   scheduled charges that are not placed yet. It does not reverse a charge. If the agreement is
+   already cancelled, the call succeeds again. A retry is safe.
 
 To bill a card that the customer saved before, pass `stored_payment_method_id` and `consent` to
 `create_agreement()`. For a variable amount, pass `max_amount_per_period` and `consent`. A
@@ -579,9 +585,9 @@ Refund a paid payment in full or in part with `create_refund`. The amount is min
 payment's currency, so use `to_minor_units` rather than multiplying by 100: HUF has no decimals
 at the gateway.
 
-The API refunds online (card-not-present) payments only. A payment made on a terminal raises
-`RefundError` with `PAYMENT_NOT_FOUND` (404). Whoever holds the payments key can refund up to
-the paid amount, so keep that key on your server.
+The API refunds online (card-not-present) payments only. `create_refund()` on a terminal
+payment raises `RefundError` with `PAYMENT_NOT_FOUND` (404). Whoever holds the payments key can
+refund up to the paid amount, so keep that key on your server.
 
 ```python
 from dominaite import RefundError, RefundStatus, to_minor_units
@@ -651,8 +657,7 @@ except RefundError as error:
 
 ### List the refunds of a payment
 
-`list_refunds` returns the refunds made through this API for one payment, and the amounts that
-are still open:
+`list_refunds` returns a payment's refunds made through this API and the amounts still open:
 
 ```python
 listing = client.list_refunds(transaction_id)
@@ -722,10 +727,9 @@ payload.
 
 ### Manage endpoints with the API
 
-You can also register, list and delete endpoints from your server. These calls need the second
-key, with the `webhooks:manage` scope. Ask Dominaite support for that key. With a payments key,
-they raise a 403 `AuthenticationError` with `INSUFFICIENT_SCOPE`. The dashboard Webhooks page
-needs no key.
+You can also register, list and delete endpoints from your server. These calls need a reporting
+key that holds the `webhooks:manage` scope: see [Credentials](#credentials). The dashboard
+Webhooks page needs no key.
 
 ```python
 admin = DominaiteClient(webhooks_key_id, webhooks_key_secret)
@@ -894,9 +898,9 @@ per object, and a redelivery carries the same number:
 The object is:
 
 - `agreement.*`: the agreement, `data["id"]`.
-- `charge.*` for a charge the platform placed for an agreement (it has a `periodNumber`): the
-  agreement period, `data["agreementId"]` plus `data["periodNumber"]`, so the retrying and
-  failed events of one period compare across attempts.
+- With scheduled charges on, `charge.*` for a charge the platform placed for an agreement (it
+  has a `periodNumber`): the agreement period, `data["agreementId"]` plus
+  `data["periodNumber"]`. So the retrying and failed events of one period compare across attempts.
 - `charge.*` for a one-off charge you initiated: `data["chargeId"]`.
 
 ```python
@@ -1047,9 +1051,8 @@ answers `PRIOR_ATTEMPT_FAILED` and the key is spent; reconcile and use a fresh k
 ## Transactions
 
 `list_transactions()` lists your card payments created in a time window, one page at a time. Use
-it to reconcile and to build statements. It needs the second key, with the `transactions:read`
-scope. Ask Dominaite support for that key. With a payments key, the call raises a 403
-`AuthenticationError` with `INSUFFICIENT_SCOPE`.
+it to reconcile and to build statements. It needs a reporting key that holds the
+`transactions:read` scope: see [Credentials](#credentials).
 
 ```python
 import datetime
