@@ -62,7 +62,7 @@ class _PaymentEventDataRequired(TypedDict):
 
 
 class PaymentEventData(_PaymentEventDataRequired, total=False):
-    """``data`` of a ``payment.*`` event.
+    """``data`` of a ``payment.*`` or ``verification.*`` event.
 
     ``amount`` is what you get paid and ``grossAmount`` what moved on the card, both in
     minor units; on ``payment.refunded`` ``transactionId`` is the refund's own id,
@@ -80,6 +80,11 @@ class PaymentEventData(_PaymentEventDataRequired, total=False):
     until the processor has reported one, and a sale settled by reconciliation without a
     processor webhook can keep it None. ``payment.refunded`` and ``payment.cancelled``
     carry the original sale's reference. ``charge.*`` events do not have it.
+
+    ``verifyOnly`` is True on the ``verification.*`` events of a verify-only session, which
+    carry this same data, and False on every ``payment.*`` event. ``declineClass`` says why
+    a ``payment.failed`` or a ``verification.failed`` was declined (:data:`DECLINE_CLASSES`).
+    It can be None, for example when nobody declined the payment.
     """
 
     paymentMethod: Optional[str]
@@ -91,6 +96,8 @@ class PaymentEventData(_PaymentEventDataRequired, total=False):
     paymentMethodBrand: Optional[str]
     paymentMethodLast4: Optional[str]
     storedPaymentMethod: Optional[StoredPaymentMethod]
+    verifyOnly: bool
+    declineClass: Optional[str]
 
 
 class _AgreementEventDataRequired(TypedDict):
@@ -194,7 +201,8 @@ def verify_webhook(
         reorders keys or drops a space changes the bytes and the signature will not
         match.
     :param signature_header: The ``X-Webhook-Signature`` value, ``t=...,v1=...``.
-    :param secret: The endpoint secret from the dashboard, shown once at creation.
+    :param secret: The endpoint secret (``whsec_...``). It is shown once: in the dashboard,
+        or in the answer of :meth:`DominaiteClient.create_webhook_endpoint`.
     :param tolerance_seconds: How far the delivery timestamp may sit from ``now``.
     :param now: Unix seconds to check the timestamp against. Defaults to the system
         clock; pass it to keep your own tests deterministic.

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
 
 ### Added
 
@@ -12,6 +12,64 @@
   `PAYMENT_METHOD_CATEGORIES`, `WalletType` and `WALLET_TYPES` are exported.
 - Contract fixtures: `paymentMethod` and `walletType` in the status read fields and examples, and
   the `wallets` block in the wire contract, pinned against `WALLET_TYPES`.
+- `ApiError.result`, on every subclass too: the whole JSON body the API sent. Read
+  `result["error"]["validationErrors"]` for the fields a 400 refused, and `params` where a code
+  carries them.
+- `AUTHORIZATION_ERROR_CODES`, and the `ErrorCode` members `INSUFFICIENT_SCOPE`,
+  `VERIFY_ONLY_NOT_ENABLED`, `RATE_LIMIT_EXCEEDED`, `CHARGE_VELOCITY_EXCEEDED` and
+  `CHARGE_DECLINE_RATE_EXCEEDED`.
+- Contract fixture: the new status read, checkout session and charge fields, with examples.
+- Wire contract fixture: the `authorization` error group (`INSUFFICIENT_SCOPE`, HTTP 403), pinned
+  against `AUTHORIZATION_ERROR_CODES`.
+- `create_checkout_session` takes `verify_only`, `agreement_id`, `consent`, `location_id` and
+  `extra`. `verify_only=True` saves a card without a payment and sends `amount` 0; we switch it
+  on for your account. Every other session still refuses an amount below 1 before sending.
+  `agreement_id` with `consent` makes a subscription session. `extra` sends request fields that
+  this version does not model, inside the signed body.
+- `CheckoutSession`, `CheckoutStatus` and `CheckoutAgreement` `TypedDict`s. They name the keys
+  of the session and of the status read, `verifyOnly`, `agreementId`, `declineClass`,
+  `isRecurring`, `agreement` and `sequence` included. The methods still return plain dicts.
+- `PaymentEventData` names `verifyOnly` and `declineClass`. A `verification.*` event carries
+  the same data, with `verifyOnly` True. `declineClass` can be None, for example when nobody
+  declined the payment.
+- `charge_payment_method` takes `agreement_id` and `extra`. A charge with `agreement_id` bills
+  that agreement. The gateway checks the charge against it and refuses one that does not fit
+  with a 422 `ChargeError`, for example `AGREEMENT_PERIOD_ALREADY_CHARGED`. The returned charge
+  carries `agreementId`, `None` on a charge outside an agreement, and `sequence` as the gateway
+  sends it.
+- `list_refunds(transaction_id)` returns a `RefundList`: the refunds of a payment made through
+  this API, newest first, each a `Refund` with every key, plus `refundedAmount` and
+  `refundableAmount`. `create_refund` takes `extra`.
+- `get_integration_contract()` reads the public integration contract of the API. The route is
+  anonymous, so the request goes out without a signature. `CONTRACT_PATH` is exported.
+- Subscriptions: `create_plan`, `list_plans`, `get_plan`, `update_plan` and `delete_plan` (which
+  archives the plan), and `create_agreement`, `get_agreement` and `cancel_agreement`. They
+  return the `Plan` and `Agreement` `TypedDict`s. A create needs an idempotency key and takes
+  `extra`. `update_plan` sends no key, and `trial_days=0` and `cancel_url=""` reach the API.
+  Plan and agreement ids keep their case. `PLANS_PATH` and `AGREEMENTS_PATH` are exported.
+- Webhook endpoints: `create_webhook_endpoint`, `list_webhook_endpoints` and
+  `delete_webhook_endpoint`, with the `WebhookEndpoint` `TypedDict`. They need a key with the
+  `webhooks:manage` scope. `secret` is in the first answer of a create only. The SDK sends event
+  names as given. `WEBHOOKS_PATH` is exported.
+- `list_transactions(from_, to, status, limit, cursor)` returns a `TransactionPage`: the card
+  payments created in a window, oldest first, and `nextCursor` for the next page. It needs a key
+  with the `transactions:read` scope. The query goes in the URL, and the signature covers the
+  path only. `Transaction`, `TransactionPage` and `TRANSACTIONS_PATH` are exported.
+
+### Changed
+
+- A 403 is no longer reported as a credential failure. `AuthenticationError` has `http_status`
+  (401 or 403) and `result`. Only a 401 keeps the "check your key id, secret, and server clock"
+  hint. A 403 `INSUFFICIENT_SCOPE` keeps the gateway's message, which names the missing scope. A
+  403 `VERIFY_ONLY_NOT_ENABLED` says that we switch it on for your account.
+- `RateLimitError.error_code` falls back to `RATE_LIMIT_EXCEEDED`, the gateway's own code, when
+  a 429 carries none (it was `RATE_LIMITED`). A 429 whose body is not JSON is now a
+  `RateLimitError` too, with its `Retry-After`.
+
+### Fixed
+
+- The docs no longer promise a `declineClass` on every decline. It can be None, for example when
+  nobody declined the payment.
 
 ## 0.4.0
 

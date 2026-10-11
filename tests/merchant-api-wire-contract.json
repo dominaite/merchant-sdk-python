@@ -23,6 +23,13 @@
         "retry": false
       }
     ],
+    "authorization": [
+      {
+        "code": "INSUFFICIENT_SCOPE",
+        "httpStatus": 403,
+        "retry": false
+      }
+    ],
     "idempotency": [
       {
         "code": "IDEMPOTENCY_KEY_REQUIRED",

@@ -9,12 +9,14 @@ Python 3.9+, standard library only. No `requests`, no framework, nothing to vend
 
 ## Install
 
-The package name is `dominaite` on PyPI (verified free 2026-08-17; matches `import dominaite`,
-the same pattern Stripe uses). It is **not published yet** - until it is, install from a checkout:
+```bash
+pip install dominaite
+```
+
+The package name on PyPI is `dominaite`, the same as `import dominaite`. To work on the SDK
+itself, install it from a checkout:
 
 ```bash
-pip install /path/to/dominaite-python-sdk
-# or, while you are working on the SDK itself:
 pip install -e /path/to/dominaite-python-sdk
 ```
 
@@ -30,6 +32,19 @@ passwords:
 
 Every request is signed with the secret (HMAC-SHA256) and timestamped. Keep your server clock
 on NTP - signatures older than 5 minutes are rejected.
+
+The scopes of a key decide which methods it can call:
+
+| Scope | Methods |
+|---|---|
+| `payments` | Sessions, `get_status`, charges, revokes, refunds, plans and agreements |
+| `transactions:read` | `list_transactions` |
+| `webhooks:manage` | `create_webhook_endpoint`, `list_webhook_endpoints`, `delete_webhook_endpoint` |
+
+A key with `payments` holds no other scope, so use a separate reporting key for the other two.
+A key issued before scopes existed holds `payments`. Every key can call `ping()`. A method that
+the key's scopes do not cover raises a 403 `AuthenticationError` with `error_code`
+`INSUFFICIENT_SCOPE`.
 
 ## Quickstart against dev
 
@@ -141,6 +156,7 @@ credentials, your clock, your signing, and the dev gateway.
 | `AuthenticationError` + `INVALID_SIGNATURE` | Secret does not match the key id. |
 | `AuthenticationError` + `TIMESTAMP_OUT_OF_RANGE` | Your machine's clock is more than 5 minutes off. |
 | `AuthenticationError` + `IP_NOT_ALLOWED` | The key has an IP allowlist that does not include you. |
+| `AuthenticationError` + `INSUFFICIENT_SCOPE` (`http_status` 403) | The key and the signature are good, but the key does not hold the `payments` scope. Use a payments key. |
 | `CheckoutRefusedError` | You authenticated fine; the gateway declined to open a session. |
 | `StorefrontError` + `STOREFRONT_NOT_WHITELISTED` | Your website's domain is not approved with the payment provider yet. See [Storefront errors](#storefront-errors). |
 | `TransportError` | Wrong base URL, or the service is down. Retry with the same key. |
@@ -378,6 +394,7 @@ else:
         ...  # not terminal: poll get_status(charge["transactionId"]) or wait for the webhook
     elif charge["status"] == ChargeStatus.FAILED:
         # HTTP 402 from the gateway, but not an exception: branch on the class, log the code.
+        # The class can be None, for example when nobody declined the payment.
         # DeclineClass.HARD              - give up on this card, ask the customer for another one
         # DeclineClass.SOFT_FUNDS        - insufficient funds, retry later (not in a loop)
         # DeclineClass.SOFT_SCA_REQUIRED - the issuer wants the customer present: send them
@@ -400,19 +417,133 @@ except RevokeError as error:
 A charge is signed exactly like a session and carries an `Idempotency-Key`, so a retry after a
 timeout with the **same** key never charges the card twice: the gateway replays its first answer,
 HTTP status included. The HTTP status is the contract on this route: 201 (or 200 on a replay)
-returns the charge, 402 returns the charge too (`status` `failed` plus `declineClass`), and 409,
+returns the charge, 402 returns the charge too (`status` `failed`), and 409,
 422, 502 and 503 raise `ChargeError` with `error_code`, `http_status`, the gateway's message and,
 when the gateway attached the charge row, `charge` and `transaction_id`. Only authentication
 (401/403), an id that is not yours (404, `ApiError`), validation (400, `ApiError`), rate limiting
-(429) and network failures keep their generic exceptions. `declineClass` and `declineCode` are
-`None` unless the charge was declined; the gateway omits them on the wire and the SDK reads absent
-as `None`.
+(429) and network failures keep their generic exceptions. `declineClass` and `declineCode` can be
+`None`, for example when nobody declined the payment. The gateway omits a null key on the wire, and
+the SDK reads absent as `None`.
+
+To bill an agreement, pass `agreement_id`. The gateway then checks the charge against the
+agreement: the card, the currency, the amount and the period. A charge that does not fit is
+refused with a 422 `ChargeError`, for example `AGREEMENT_PERIOD_ALREADY_CHARGED` or
+`CHARGE_AMOUNT_ABOVE_AGREEMENT`, and nothing is charged. The returned charge has `agreementId`
+(`None` outside an agreement) and `sequence`, which orders it against the `charge.*` events of
+the same object.
 
 Revoking signs an empty key and an empty body, like `get_status()`. A revoke that fails with
 `RevokeError` changed nothing: `MERCHANT_API_UNAVAILABLE` (503) is retryable,
 `UPSTREAM_CONTRACT_ERROR` (502) is not. After a revoke the status read keeps the
 `storedPaymentMethod` with `status` `revoked`, and a charge against it is refused with
 `PAYMENT_METHOD_NOT_ACTIVE`.
+
+### Save a card without a payment (verify-only)
+
+A verify-only session saves the card and takes no payment. The checkout places a small
+authorization to check the card. The platform releases it within about 15 minutes. Nobody is
+charged. We switch it on for your account. Until then, the API refuses the session with a 403:
+an `AuthenticationError` with `error_code` `VERIFY_ONLY_NOT_ENABLED`.
+
+```python
+session = client.create_checkout_session(
+    amount=0,
+    currency="EUR",
+    order_reference="verify-cus-42",
+    verify_only=True,
+    idempotency_key="verify-cus-42",
+)
+# ... the customer completes the hosted checkout ...
+status = client.get_status(session["transactionId"])
+stored = status.get("storedPaymentMethod")
+if stored and stored["status"] == StoredPaymentMethodStatus.ACTIVE:
+    db.save_card(customer_id, stored["id"])  # pm_...
+```
+
+1. Send `amount=0`. The API refuses every other amount on a verify-only session.
+2. Do not send `save_card=False`, `integration="fields"` or `agreement_id`. The API refuses
+   them on a verify-only session.
+3. Read the result from `storedPaymentMethod`, not from `status`. The status of a checked card
+   is `requires_capture`, then `cancelled` when the authorization is released.
+4. `verifyOnly` is `True` on the returned session and on the status read.
+5. `order_idempotency_key()` refuses an amount of 0. Use your own key, unique per check.
+6. The webhook events are `verification.succeeded` and `verification.failed`. A verify-only
+   session fires no `payment.*` events.
+
+## Subscriptions (plans and agreements)
+
+A plan is a price that you bill every period. An agreement subscribes one of your customers to a
+plan. After the first payment, the platform places the charge of each period on the saved card.
+We switch subscriptions on for your account. Until then, you can create plans and agreements, but
+the subscription session is refused with `SUBSCRIPTIONS_NOT_ENABLED`.
+
+```python
+plan = client.create_plan(
+    name="Pro monthly",
+    amount=2500,
+    currency="EUR",
+    interval_unit="month",
+    cancel_url="https://shop.example/account/cancel",
+    idempotency_key="plan-pro-monthly-2500-eur",
+)
+db.save_plan(plan["id"])  # plan_...
+
+agreement = client.create_agreement(
+    plan_id=plan["id"],
+    customer_reference="cus-42",  # your own stable id for the customer
+    idempotency_key="agreement-cus-42-pro-monthly",
+)
+
+session = client.create_checkout_session(
+    amount=agreement["amount"],
+    currency=agreement["currency"],
+    order_reference="sub-cus-42-first",
+    agreement_id=agreement["id"],
+    consent={
+        "textVersion": "recurring-2026-09",  # one of recurring.consentTextVersions
+        "acceptedAt": "2026-10-11T09:30:00Z",
+        "ip": customer_ip,
+    },
+    idempotency_key="sub-cus-42-first",
+)
+# ... the customer completes the hosted checkout ...
+agreement = client.get_agreement(agreement["id"])
+# "active" after the first payment is approved, still "pending" after a decline
+```
+
+1. Create a plan once for each price. Amount, currency and interval cannot change after that.
+   To change a price, create a new plan and archive the old one with `delete_plan()`. Existing
+   agreements keep their terms.
+2. Create one agreement for each customer and plan. It starts `pending` and charges nothing.
+3. Take the first payment with a subscription session: `create_checkout_session()` with
+   `agreement_id` and `consent`. Send the agreement's amount and currency. On a plan with a
+   trial, the session charges the amount you send, and the first scheduled charge comes when
+   the trial ends.
+4. `consent` names the consent text that your page showed the customer. Use one of
+   `recurring.consentTextVersions` from `get_integration_contract()`, and send all three fields.
+5. A session that does not fit the agreement raises `CheckoutRefusedError`, and nothing is
+   created. Read `error_code`, for example `AGREEMENT_AMOUNT_MISMATCH`, `AGREEMENT_SESSION_OPEN`
+   or `AGREEMENT_NOT_PENDING`.
+6. Follow the agreement with the `agreement.*` and `charge.*` webhooks, or read it with
+   `get_agreement()`. See "Ordering agreement and charge events" below.
+7. `cancel_agreement()` stops the charges that are not placed yet. It does not reverse a charge.
+   If the agreement is already cancelled, the call succeeds again. A retry is safe.
+
+To bill a card that the customer saved before, pass `stored_payment_method_id` and `consent` to
+`create_agreement()`. For a variable amount, pass `max_amount_per_period` and `consent`. A
+subscription session refuses an agreement with a maximum (`AGREEMENT_VARIABLE_AMOUNT_UNSUPPORTED`).
+
+`update_plan()` changes only `name`, `trial_days` and `cancel_url`. `trial_days=0` removes the
+trial and `cancel_url=""` removes the cancel page. A trial change applies to agreements created
+after it. The update sends no idempotency key. `list_plans()` returns at most 200 plans, active
+plans first, and has no paging.
+
+Plan and agreement ids are case-sensitive. Store them and send them exactly as returned. A
+refusal raises `ApiError` with `error_code`, for example `PLAN_NOT_FOUND` (404),
+`PLAN_NOT_ACTIVE` (409) or `AGREEMENT_ENDED` (409). `result` holds the whole answer:
+`MAX_AMOUNT_BELOW_PLAN_AMOUNT` carries the plan's amount in
+`result["error"]["validationErrors"][0]["params"]["min"]`. The methods return plain dicts,
+described by the `Plan` and `Agreement` `TypedDict`s. A status value not listed there is valid.
 
 ## Refunds
 
@@ -486,11 +617,30 @@ except RefundError as error:
         ...  # error.error_code says why; nothing was refunded
 ```
 
+### List the refunds of a payment
+
+`list_refunds` returns every refund of a payment and the amounts that are still open:
+
+```python
+listing = client.list_refunds(transaction_id)
+listing["refundableAmount"]  # minor units a new refund can take now
+listing["refundedAmount"]    # minor units refunded so far, from every source
+for refund in listing["refunds"]:  # newest first, each with every Refund key
+    print(refund["refundId"], refund["status"])
+```
+
+1. `refunds` holds the refunds made through this API. The two amounts also count refunds made
+   in the dashboard.
+2. `refundableAmount` leaves out refunds still in progress. It is 0 when the payment cannot be
+   refunded.
+3. The list is not paged. An unknown payment is a `RefundError` with `PAYMENT_NOT_FOUND`.
+
 ## Webhooks
 
 Webhooks are how you find out what happened to a payment. Create an endpoint in the Dominaite
-dashboard, pick the events you care about, and store the `whsec_...` secret it shows you - like
-the API secret, it is shown **once**.
+dashboard or with `create_webhook_endpoint()` (see "Manage endpoints with the API" below), pick
+the events you care about, and store the `whsec_...` secret it shows you - like the API secret,
+it is shown **once**.
 
 Dominaite POSTs each event to your URL with an `X-Webhook-Signature` header:
 
@@ -537,6 +687,42 @@ most common webhook integration bug.
 stranger POSTed at you. Do not branch on `event["type"]` or trust an amount from an unverified
 payload.
 
+### Manage endpoints with the API
+
+You can also register, list and delete endpoints from your server. These calls need a key with
+the `webhooks:manage` scope. A key with the `payments` scope cannot hold it, so use a separate
+key.
+
+```python
+admin = DominaiteClient(webhooks_key_id, webhooks_key_secret)
+
+endpoint = admin.create_webhook_endpoint(
+    url="https://shop.example/webhooks/dominaite",
+    events=["payment.succeeded", "payment.failed", "payment.refunded"],
+    idempotency_key="webhook-shop-main",
+)
+save_secret(endpoint["id"], endpoint["secret"])  # whsec_..., in this answer only
+
+for item in admin.list_webhook_endpoints():  # newest first, never with a secret
+    print(item["id"], item["url"], item["status"])
+
+admin.delete_webhook_endpoint(endpoint["id"])
+```
+
+1. `secret` is in the first answer only. A replay with the same key and the list leave it out.
+   If you lose the secret, delete the endpoint and create it again.
+2. After a timeout or a 503, retry with the same `idempotency_key`. The retry replaces an
+   endpoint that the lost attempt registered. A new key cannot do this.
+3. A key used again more than a day later raises `WEBHOOK_ALREADY_REGISTERED`.
+   `result["error"]["params"]["webhookId"]` names the endpoint. Use a fresh key for a new
+   endpoint.
+4. `events` takes the types listed under "The events" below. The SDK sends the names as given.
+   The API refuses an unknown type with `VALIDATION_ERROR`.
+5. The URL must be HTTPS on a public host, or the API refuses it with `WEBHOOK_URL_REJECTED`.
+   You can have 25 active endpoints. One more raises `WEBHOOK_LIMIT_REACHED`.
+6. `delete_webhook_endpoint()` on an unknown or deleted id raises `WEBHOOK_NOT_FOUND`. After a
+   lost answer, treat that as done.
+
 ### The events
 
 `payment.succeeded`, `payment.failed`, `payment.requires_capture`, `payment.cancelled`,
@@ -544,6 +730,10 @@ payload.
 
 Recurring agreements add `agreement.activated`, `agreement.past_due`, `agreement.cancelled`,
 `charge.succeeded`, `charge.failed` and `charge.retrying`. They ride the same signed envelope.
+A verify-only session sends `verification.succeeded` or `verification.failed`, and no
+`payment.*` event. Their `data` has the keys of a `payment.*` event, with `verifyOnly` set to
+`True`. On `payment.failed` and `verification.failed`, `declineClass` says why the card was
+declined. It can be `None`, for example when nobody declined the payment.
 
 `payment.succeeded` is the only one that means money in hand. `requires_capture` is an approved
 hold, not a payment. `pending` and `processing` are never webhooked - if you want to show an
@@ -775,6 +965,20 @@ switch: a wallet payment refunds, captures and disputes like a card. `walletType
 lower-cased wallet not in that list yet; treat it as a valid wallet, not an error. The known
 values are exported as `PAYMENT_METHOD_CATEGORIES` and `WALLET_TYPES`.
 
+The status read has more keys. The API leaves out a key whose value is null, so read them with
+`.get`. The `CheckoutStatus` `TypedDict` names every key.
+
+- `declineClass`: on a `failed` payment, what to do next: `hard`, `soft_funds`,
+  `soft_sca_required` or `soft_other`. It can be `None`, for example when nobody declined the
+  payment.
+- `isRecurring`: `True` for a charge on a stored card, `False` for a checkout session.
+- `verifyOnly`: `True` on a verify-only session.
+- `agreement`: on a subscription session, the agreement `id` and its current `status`. Read
+  `agreement["status"]`, not the payment status, to know if the subscription started.
+- `pspReference`: the payment processor's reference, for documents such as a receipt. It is
+  `None` until the processor reports it.
+- `sequence`: orders this read against the `charge.*` events of the same object.
+
 Poll after the payer returns to you, or on your order timeout - not in a tight loop; the
 endpoint is rate limited per key.
 
@@ -806,18 +1010,50 @@ order-derived key for the life of the order to keep that path open. The band is 
 once the platform has independently closed the attempt (about an hour past expiry), the replay
 answers `PRIOR_ATTEMPT_FAILED` and the key is spent; reconcile and use a fresh key.
 
+## Transactions
+
+`list_transactions()` lists your card payments created in a time window, one page at a time. Use
+it to reconcile and to build statements. It needs a key with the `transactions:read` scope.
+
+```python
+import datetime
+
+start = datetime.datetime(2026, 10, 1, tzinfo=datetime.timezone.utc)
+end = datetime.datetime(2026, 10, 8, tzinfo=datetime.timezone.utc)
+
+cursor = None
+while True:
+    page = client.list_transactions(start, end, status="succeeded", cursor=cursor)
+    for row in page["items"]:
+        record(row["transactionId"], row["type"], row["amount"], row.get("refundedAmount"))
+    cursor = page["nextCursor"]
+    if cursor is None:
+        break
+```
+
+1. The window is `from_` included, `to` not included, and at most 31 days long.
+2. Send an ISO 8601 UTC string, a timezone-aware `datetime` or a `date`. The SDK refuses a
+   naive `datetime`, because its zone is unknown.
+3. Rows come oldest first. Send `nextCursor` back as `cursor` with the same window and status,
+   until it is `None`. Paging never repeats or skips a row.
+4. A payment is in the window of its `createdAt`, with its status at the time of the read. A
+   refund is not a row of its own. It shows on its payment as `refundedAmount` and `status`.
+5. `type` is `payment`, `charge` or `verification`. A `verification` row is not a purchase.
+6. For a statement, end the window a few minutes in the past. Read again later to get changes
+   such as refunds. Fees are not in this list.
+
 ## Errors
 
 | Exception | Means | Retry? |
 |---|---|---|
-| `AuthenticationError` | Bad credentials, bad signature, clock skew, IP not allowlisted | No - fix config |
+| `AuthenticationError` | `http_status` 401: bad credentials, bad signature, clock skew, IP not allowlisted. `http_status` 403: the key is good but may not do this (`INSUFFICIENT_SCOPE`, `VERIFY_ONLY_NOT_ENABLED`) | No - fix config, or use a key with the right scope |
 | `CheckoutRefusedError` | The gateway refused to open the session (`error_code`) | Depends on the code |
 | `StorefrontError` | The storefront (website) cannot take payments yet, or the key belongs to another one (`error_code`, `http_status`). Subclass of `ApiError` | No - fix the setup |
 | `ChargeError` | The gateway answered a charge with a code instead of a charge (`error_code`, `http_status`, `charge`, `transaction_id`) | Depends on the code; never with a new key |
 | `RefundError` | The gateway answered a refund call with a code (`error_code`, `http_status`, `retryable`, `retry_stop_after_seconds`). Subclass of `ApiError` | Only when `retryable`, same key |
 | `RevokeError` | The gateway refused to revoke a stored payment method; nothing changed (`error_code`, `http_status`) | `MERCHANT_API_UNAVAILABLE` only |
-| `ApiError` | Unexpected response, or a 4xx like an unknown transaction id (`http_status`, `error_code`) | No |
-| `RateLimitError` | HTTP 429; you are sending faster than the key is allowed (`retry_after_seconds`) | Yes, after you wait |
+| `ApiError` | Unexpected response, or a 4xx like an unknown transaction id (`http_status`, `error_code`, and `result`: the whole JSON body, with `validationErrors` and `params` when the gateway sent them) | No |
+| `RateLimitError` | HTTP 429; you are sending faster than you are allowed (`error_code`, `retry_after_seconds`) | Yes, after you wait |
 | `TransportError` | Network failure or 5xx; you don't know if it landed | Yes, same idempotency key |
 | `WebhookVerificationError` | An incoming webhook is not authentic or not fresh (`error_code`) | No - respond 400 |
 
@@ -899,6 +1135,18 @@ except RateLimitError as limit:
 that will work. It is `None` when the API did not give a number of seconds - back off on your
 own schedule then.
 
+`error_code` is `RATE_LIMIT_EXCEEDED` for the two limits above. A charge has two more limits,
+each with its own code. Nothing was charged in either case:
+
+- `CHARGE_VELOCITY_EXCEEDED`: the card already has the most charges allowed in 24 hours, or
+  the charge would take you past your hourly limit for the currency.
+- `CHARGE_DECLINE_RATE_EXCEEDED`: the key collected too many declined charges in a short time.
+  Its charge route is locked for a while. Other routes keep working.
+
+Many failed authentication attempts from one IP address in a short time block that address
+for a while. Every request from it then gets a 429 with no `Retry-After`. Fix the credentials
+before you send again, or the next failures start a new block.
+
 The usual cause is polling `get_status` in a tight loop. Poll after the payer returns to you, or
 on your order timeout, and let webhooks do the rest.
 
@@ -912,6 +1160,30 @@ on your order timeout, and let webhooks do the rest.
 visible ASCII: letters, digits and punctuation, no spaces, no accented or non-Latin letters.
 Anything else raises `ValueError` before the request is sent. If your order ids are not ASCII,
 derive the key from something that is (your numeric order id, or a hash of the reference).
+
+## Integration contract
+
+`get_integration_contract()` reads the public contract of the API: the request fields, the
+statuses, the error codes, the webhook events and the signing recipe that the API uses now.
+
+1. The route is anonymous. The request goes out without a signature, so a success does not
+   check your credentials. Use `ping()` for that.
+2. Read accepted values from it, for example `recurring.consentTextVersions` for `consent`.
+
+## Fields the SDK does not model yet
+
+The API can accept a request field before this SDK has an argument for it. Send it in `extra`:
+
+```python
+session = client.create_checkout_session(..., extra={"newField": "value"})
+```
+
+1. `create_checkout_session`, `charge_payment_method`, `create_refund`, `create_plan`,
+   `update_plan`, `create_agreement` and `create_webhook_endpoint` take `extra`. They send each
+   key as given, in the signed body.
+2. A key in `extra` replaces the same field that an argument set.
+3. The API ignores a field that it does not know, so a misspelled name is not an error. Check
+   the name in the API reference.
 
 ## Running the tests
 

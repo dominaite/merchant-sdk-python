@@ -1,5 +1,6 @@
 """Server-side client for the Dominaite merchant API."""
 
+import datetime
 import hashlib
 import hmac
 import json
@@ -8,7 +9,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, Mapping, NamedTuple, Optional, Union, cast
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Union, cast
 
 from .exceptions import (
     STOREFRONT_ERROR_CODES,
@@ -24,15 +25,28 @@ from .exceptions import (
     StorefrontError,
     TransportError,
 )
-from .models import Refund
+from .models import (
+    Agreement,
+    Plan,
+    Refund,
+    RefundList,
+    Transaction,
+    TransactionPage,
+    WebhookEndpoint,
+)
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 DEFAULT_BASE_URL = "https://api.dominaite.com/payments"
 SESSIONS_PATH = "/merchant-api/checkout/sessions"
 PAYMENT_METHODS_PATH = "/merchant-api/payment-methods"
 PING_PATH = "/merchant-api/ping"
 PAYMENTS_PATH = "/merchant-api/payments"
+CONTRACT_PATH = "/merchant-api/integration/contract"
+PLANS_PATH = "/merchant-api/plans"
+AGREEMENTS_PATH = "/merchant-api/agreements"
+WEBHOOKS_PATH = "/merchant-api/webhooks"
+TRANSACTIONS_PATH = "/merchant-api/transactions"
 DEFAULT_TIMEOUT_SECONDS = 45.0  # serverless cold starts hit 10+s on dev; 15s was a coin flip
 
 #: Hosts allowed to be addressed over plain http. Everything else must be https, so the
@@ -69,7 +83,7 @@ _TRANSACTION_ID_RE = re.compile(
 _PAYMENT_METHOD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 
 #: Statuses that stay generic on the payment-method routes even when the envelope
-#: carries a code: validation (400), authentication (401, 403), unknown id (404) and
+#: carries a code: validation (400), authentication and scope (401, 403), unknown id (404) and
 #: rate limiting (429) mean the same thing on every route and keep their usual errors.
 #: Everything else with a code is the gateway telling this route something specific (a
 #: decline, an unknown outcome, a refusal) and arrives as ChargeError / RevokeError.
@@ -78,6 +92,10 @@ _GENERIC_FAILURE_STATUSES = frozenset({400, 401, 403, 404, 429})
 #: A refund id is ``re_`` + 32 hex today, but held to the same single-path-segment rule as a
 #: payment method id rather than to its current shape.
 _REFUND_ID_RE = _PAYMENT_METHOD_ID_RE
+
+#: Plan and agreement ids (``plan_...``, ``agr_...``) are signed exactly as sent and are
+#: case-sensitive, so they are never case-changed; the same single-segment rule applies.
+_RECURRING_ID_RE = _PAYMENT_METHOD_ID_RE
 
 
 class _Reply(NamedTuple):
@@ -224,13 +242,22 @@ def _require_secure_base_url(base_url: str) -> None:
     )
 
 
-def _validate_money_params(amount: Any, currency: Any, order_reference: Any) -> None:
-    """The checks shared by every request that moves money."""
+def _validate_money_params(
+    amount: Any, currency: Any, order_reference: Any, allow_zero: bool = False
+) -> None:
+    """The checks shared by every request that moves money.
+
+    ``allow_zero`` is for a verify-only session, which saves a card without a payment and
+    sends ``amount`` 0. The gateway decides on any other amount there.
+    """
     # bool is a subclass of int in Python, so True would otherwise sail through
     # and get serialized as `true`.
-    if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+    minimum = 0 if allow_zero else 1
+    if isinstance(amount, bool) or not isinstance(amount, int) or amount < minimum:
         raise ValueError(
-            "amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)"
+            "amount must be 0 or a positive integer in MINOR units on a verify_only session"
+            if allow_zero
+            else "amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)"
         )
     if not currency:
         raise ValueError("currency is required")
@@ -328,6 +355,43 @@ def _normalize_transaction_id(transaction_id: str) -> str:
             "transaction_id must be the UUID returned by create_checkout_session()"
         )
     return normalized
+
+
+def _query_instant(value: Any, name: str) -> str:
+    """A window bound for the transaction list: a string as given, a datetime as UTC."""
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            # A naive datetime has no zone, and guessing one shifts the window silently.
+            raise ValueError("{0} must be a timezone-aware datetime".format(name))
+        utc = value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        return utc.isoformat() + "Z"
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    raise ValueError("{0} must be an ISO 8601 UTC string, a datetime or a date".format(name))
+
+
+def _normalize_webhook_id(webhook_id: Any) -> str:
+    # Signed in the lowercase hyphenated form, the same rule as a transaction id.
+    normalized = str(webhook_id or "").strip().lower()
+    if not _TRANSACTION_ID_RE.match(normalized):
+        raise ValueError("webhook_id must be the endpoint id from create_webhook_endpoint()")
+    return normalized
+
+
+def _normalize_recurring_id(value: Any, name: str) -> str:
+    """A plan or agreement id for the path: one segment, its case kept as sent."""
+    normalized = str(value or "").strip()
+    if not _RECURRING_ID_RE.match(normalized):
+        raise ValueError("{0} must be the id the API returned".format(name))
+    return normalized
+
+
+def _validate_whole_number(value: Any, name: str, minimum: int) -> None:
+    """A count or an amount must go out as a JSON integer: never a bool, a float or a string."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError("{0} must be an integer of at least {1}".format(name, minimum))
 
 
 def _normalize_payment_method_id(payment_method_id: Any) -> str:
@@ -440,6 +504,24 @@ class DominaiteClient:
         # Idempotency-Key header.
         return self._request("GET", PING_PATH, None, "")
 
+    def get_integration_contract(self) -> Dict[str, Any]:
+        """Read the public integration contract of the API.
+
+        The contract lists the request fields, the statuses, the error codes, the webhook
+        events and the signing recipe that the API uses now. Use it to check what the API
+        accepts today, for example the ``recurring.consentTextVersions``.
+
+        The route is anonymous: the request goes out without a signature, so a success
+        here says nothing about your credentials. Use :meth:`ping` for that.
+
+        :returns: The contract as the API sends it, a plain dict.
+
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds`` before retrying.
+        :raises ApiError: Unexpected API response.
+        :raises TransportError: Network-level failure or a 5xx.
+        """
+        return self._request("GET", CONTRACT_PATH, None, "", signed=False)
+
     def create_checkout_session(
         self,
         amount: int,
@@ -453,11 +535,19 @@ class DominaiteClient:
         idempotency_key: Optional[str] = None,
         save_card: Optional[bool] = None,
         integration: Optional[str] = None,
+        verify_only: Optional[bool] = None,
+        agreement_id: Optional[str] = None,
+        consent: Optional[Mapping[str, Any]] = None,
+        location_id: Optional[Any] = None,
+        extra: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Create a hosted checkout session for one payment.
 
+        Returns a plain dict with the keys of :class:`CheckoutSession`.
+
         :param amount: Integer in MINOR units (2500 = 25.00 EUR, but 2500 JPY). Never a
-            float; :func:`to_minor_units` converts a decimal price exactly.
+            float; :func:`to_minor_units` converts a decimal price exactly. Send 0 on a
+            ``verify_only`` session.
         :param currency: ISO 4217 code.
         :param order_reference: Your own order id, 100 chars or fewer.
         :param customer: ``{"firstName", "lastName", "email", "phone"}``. Pass everything
@@ -465,8 +555,10 @@ class DominaiteClient:
             checkout form stays short.
         :param country: ISO 3166-1 alpha-2.
         :param language: ISO 639-1, the widget UI language.
-        :param theme: ``light``, ``dark``, or ``bright``.
-        :param description: Free-text description shown on the checkout.
+        :param theme: The checkout theme, for example ``light``, ``dark`` or ``bright``. At
+            most 20 characters.
+        :param description: Free-text description shown on the checkout, at most 500
+            characters.
         :param idempotency_key: Required. Build it with :func:`order_idempotency_key` so
             a reload or retry of the same order replays the same session; retrying with
             the same key never creates a second payment. Omitting it raises
@@ -482,17 +574,42 @@ class DominaiteClient:
             ``"fields"`` on an account without them is rejected with a 400. Part of the
             idempotency identity: replaying a key with a different integration is refused
             with ``IDEMPOTENCY_KEY_REUSED``. Left out of the body when None.
+        :param verify_only: True saves the card without a payment. The platform holds a
+            small verification amount and releases it after the card is saved. Send
+            ``amount=0``. The card is saved, ``integration`` must be ``"widget"`` or None,
+            and ``agreement_id`` is refused. Verify-only is off until we switch it on for
+            your account: before that the API answers 403, an :class:`AuthenticationError`
+            with ``error_code`` ``VERIFY_ONLY_NOT_ENABLED``.
+        :param agreement_id: The ``agr_`` id of a pending agreement (see
+            :meth:`create_agreement`). The session then takes the agreement's first payment
+            and saves the card for its later charges. Send it exactly as it was returned:
+            it is case-sensitive. The agreement's own refusals arrive as a
+            :class:`CheckoutRefusedError`, for example ``AGREEMENT_AMOUNT_MISMATCH`` or
+            ``AGREEMENT_CONSENT_REQUIRED``.
+        :param consent: Only with ``agreement_id``: ``{"textVersion", "acceptedAt", "ip"}``,
+            the customer's acceptance of the platform consent text. ``textVersion`` is one
+            of the integration contract's ``recurring.consentTextVersions``;
+            ``acceptedAt`` is ISO 8601 UTC; ``ip`` is the customer's address. Required
+            unless the agreement already carries consent in one of those versions.
+        :param location_id: The storefront (online location) to attribute the session
+            to, a UUID or its string form. A key bound to one storefront refuses another.
+        :param extra: More request fields, sent as given. Use it for a field the API
+            accepts that this version of the SDK does not model yet. A key here replaces
+            the same key set by the arguments above.
         :returns: ``{"transactionId", "orderId", "cashierKey", "cashierToken", "amount",
-            "currency", "expiresAt", "integration", "clientSecret"}``. ``integration`` is
+            "currency", "expiresAt", "integration", "clientSecret", "agreementId",
+            "verifyOnly"}``, see :class:`CheckoutSession`. ``integration`` is
             always present. ``clientSecret`` is set only for ``"fields"`` sessions (absent
             for a widget session, so read it with ``.get``): an opaque string of at most
             128 characters, the same on every replay, that the payer's page hands to
-            checkout.js. Keep it out of your logs.
+            checkout.js. Keep it out of your logs. ``agreementId`` echoes ``agreement_id``,
+            and ``verifyOnly`` is True on a verify-only session; both are absent otherwise.
 
         :raises ValueError: A missing ``idempotency_key`` or another invalid argument,
             before any request is made.
         :raises AuthenticationError: Wrong/revoked credentials or bad signature
-            (fix config; do not retry).
+            (401; fix config, do not retry), or a key without the ``payments`` scope
+            (403).
         :raises CheckoutRefusedError: The gateway refused the session (inspect
             ``error_code``).
         :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``, then retry WITH
@@ -501,7 +618,9 @@ class DominaiteClient:
         :raises TransportError: Network-level failure (safe to retry WITH the same
             ``idempotency_key``).
         """
-        _validate_money_params(amount, currency, order_reference)
+        _validate_money_params(
+            amount, currency, order_reference, allow_zero=verify_only is True
+        )
         key = _normalize_idempotency_key(idempotency_key)
 
         body: Dict[str, Any] = {
@@ -524,6 +643,17 @@ class DominaiteClient:
         if integration is not None:
             # A CheckoutIntegration member goes out as its plain value.
             body["integration"] = str(getattr(integration, "value", integration))
+        if verify_only is not None:
+            body["verifyOnly"] = bool(verify_only)
+        if agreement_id is not None:
+            body["agreementId"] = str(agreement_id)
+        if consent is not None:
+            body["consent"] = dict(consent)
+        if location_id is not None:
+            # A uuid.UUID goes out in its canonical string form.
+            body["locationId"] = str(location_id)
+        if extra is not None:
+            body.update(extra)
 
         response = self._request("POST", SESSIONS_PATH, body, key)
 
@@ -643,10 +773,22 @@ class DominaiteClient:
         reporting data and pass through as sent: a wallet payment refunds, captures and
         disputes like a card.
 
+        ``declineClass`` says what to do with a ``failed`` payment (:data:`DECLINE_CLASSES`).
+        It can be None, for example when nobody declined the payment. ``isRecurring`` is
+        True for a charge on a stored card. ``verifyOnly`` is True
+        on a verify-only session and absent otherwise: its status goes
+        ``requires_capture``, then ``cancelled``, and a ``storedPaymentMethod`` is what
+        says that the card is verified. ``agreement`` (``{"id", "status",
+        "nextChargeAt"}``) is set when the payment belongs to an agreement; its
+        ``status`` says if the subscription started. ``sequence`` orders this read
+        against the ``charge.*`` events of the same object. :class:`CheckoutStatus` names
+        every key.
+
         :param transaction_id: The ``transactionId`` from
             :meth:`create_checkout_session`.
 
-        :raises AuthenticationError: Wrong/revoked credentials or bad signature.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``payments`` scope (403).
         :raises RateLimitError: HTTP 429; polling too fast. Wait
             ``retry_after_seconds`` before the next poll.
         :raises ApiError: Unknown transaction id (HTTP 404) or unexpected response.
@@ -671,6 +813,8 @@ class DominaiteClient:
         order_reference: str,
         description: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        agreement_id: Optional[str] = None,
+        extra: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Charge a card kept on file, off-session: no widget, no payer present.
 
@@ -679,11 +823,11 @@ class DominaiteClient:
         the gateway replays its first answer.
 
         A decline is not an exception: the gateway answers HTTP 402 and this returns a
-        charge with ``status`` ``failed`` plus a ``declineClass`` telling you whether
-        to give up on the card (``hard``), wait (``soft_funds``, ``soft_other``) or
-        bring the customer back for a hosted session (``soft_sca_required``).
-        ``pending`` is not terminal - poll :meth:`get_status` with the returned
-        ``transactionId``.
+        charge with ``status`` ``failed``. Its ``declineClass`` tells you whether to give
+        up on the card (``hard``), wait (``soft_funds``, ``soft_other``) or bring the
+        customer back for a hosted session (``soft_sca_required``). It can be None, for
+        example when nobody declined the payment. ``pending`` is not terminal - poll
+        :meth:`get_status` with the returned ``transactionId``.
 
         :param payment_method_id: The ``storedPaymentMethod["id"]`` from
             :meth:`get_status` of a session created with ``save_card=True``.
@@ -695,11 +839,22 @@ class DominaiteClient:
             ``order_idempotency_key("sub-2026-10", "8817", 2500, "EUR")``, never
             mint one per attempt. Omitting it raises ``ValueError`` before anything is
             sent.
+        :param agreement_id: The ``agr_`` id of the agreement this charge bills, sent
+            exactly as returned (it is case-sensitive). The gateway then checks the charge
+            against the agreement: the card, the currency, the amount and the period.
+        :param extra: More request fields, sent as given in the signed body. A key here
+            replaces the same key set by the arguments above.
         :returns: ``{"chargeId", "status", "declineClass", "declineCode",
-            "transactionId"}``. ``status`` is ``succeeded``, ``pending`` or
-            ``cancelled`` on a 201 (200 on a replay) and ``failed`` on a 402;
-            ``declineClass`` and ``declineCode`` are None unless the charge was
-            declined (the gateway omits them on the wire; absent reads as None).
+            "transactionId", "agreementId"}``, plus ``sequence`` when the gateway sends
+            it. ``agreementId`` is None on a charge outside an agreement. ``status`` is
+            ``succeeded``, ``pending`` or ``cancelled`` on a 201 (200 on a replay) and
+            ``failed`` on a 402.
+            ``declineClass`` and ``declineCode`` can be None, for example when nobody
+            declined the payment (the gateway omits them on the wire; absent reads as
+            None). ``agreementId`` names the
+            agreement the charge was placed under. ``sequence`` orders this answer against
+            the ``charge.*`` events of the same object; it is 0 while the charge is
+            pending.
 
         :raises ChargeError: The gateway answered with a code instead of a charge:
             ``CHARGE_OUTCOME_UNKNOWN`` (502, the charge MAY have happened - poll
@@ -707,12 +862,20 @@ class DominaiteClient:
             (502, nothing charged), ``PAYMENT_METHOD_NOT_ACTIVE`` or
             ``DUPLICATE_REQUEST`` (409), ``IDEMPOTENCY_KEY_REUSED`` (422),
             ``PAYMENT_METHOD_CHARGES_DISABLED`` or ``PAYMENT_PROCESSING_UNAVAILABLE``
-            (503, retry later with the same key).
-        :raises AuthenticationError: Wrong/revoked credentials or bad signature.
+            (503, retry later with the same key). A charge with ``agreement_id`` can
+            also be refused with 422 ``AGREEMENT_METHOD_MISMATCH``,
+            ``AGREEMENT_CONSENT_MISSING``, ``AGREEMENT_CURRENCY_MISMATCH``,
+            ``CHARGE_AMOUNT_ABOVE_AGREEMENT``, ``AGREEMENT_AMOUNT_MISMATCH``,
+            ``AGREEMENT_NOT_STARTED``, ``AGREEMENT_ENDED`` or
+            ``AGREEMENT_PERIOD_ALREADY_CHARGED``. Nothing was charged on any of them.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``payments`` scope (403).
         :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``, then retry WITH
-            the same ``idempotency_key``.
-        :raises ApiError: An id that is not yours (HTTP 404), input validation (400)
-            or an unexpected response.
+            the same ``idempotency_key``. ``error_code`` is ``CHARGE_VELOCITY_EXCEEDED`` or
+            ``CHARGE_DECLINE_RATE_EXCEEDED`` for the charge route's own limits.
+        :raises ApiError: An id that is not yours (HTTP 404, ``PAYMENT_METHOD_NOT_FOUND``
+            or ``AGREEMENT_NOT_FOUND``), input validation (400) or an unexpected
+            response.
         :raises TransportError: Network-level failure (safe to retry WITH the same
             ``idempotency_key``).
         """
@@ -722,8 +885,7 @@ class DominaiteClient:
             raise ValueError("description must be a string")
         key = _normalize_idempotency_key(idempotency_key)
 
-        # Built field by field: the body is what gets signed, and the contract for this
-        # route is exactly these fields in this order.
+        # The body is what gets signed, so it is built once, here, and sent as built.
         body: Dict[str, Any] = {
             "amount": amount,
             "currency": currency,
@@ -731,6 +893,10 @@ class DominaiteClient:
         }
         if description is not None:
             body["description"] = description
+        if agreement_id is not None:
+            body["agreementId"] = str(agreement_id)
+        if extra is not None:
+            body.update(extra)
 
         reply = self._send(
             "POST", PAYMENT_METHODS_PATH + "/" + method_id + "/charges", body, key
@@ -779,7 +945,8 @@ class DominaiteClient:
             ``MERCHANT_API_UNAVAILABLE`` (503, retry later) or
             ``UPSTREAM_CONTRACT_ERROR`` (502, the provider refused for good - contact
             support with the id).
-        :raises AuthenticationError: Wrong/revoked credentials or bad signature.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``payments`` scope (403).
         :raises RateLimitError: HTTP 429.
         :raises ApiError: An id that is not yours (HTTP 404) or unexpected response.
         :raises TransportError: Network-level failure (safe to retry).
@@ -806,6 +973,7 @@ class DominaiteClient:
         amount: Optional[int] = None,
         reason: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        extra: Optional[Mapping[str, Any]] = None,
     ) -> Refund:
         """Refund a payment, in full or in part.
 
@@ -827,12 +995,15 @@ class DominaiteClient:
         :param idempotency_key: Required. Derive it from YOUR refund (the return or credit
             note id), never mint one per attempt. Omitting it raises ``ValueError`` before
             anything is sent.
+        :param extra: More request fields, sent as given in the signed body. A key here
+            replaces the same key set by the arguments above.
         :returns: The :class:`Refund`, every field present (None where the gateway sent
             none).
 
         :raises RefundError: The gateway answered with a code (see :class:`RefundError`
             for each one and whether it is ``retryable``).
-        :raises AuthenticationError: Wrong/revoked credentials or bad signature.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``payments`` scope (403).
         :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``, then retry WITH
             the same ``idempotency_key``.
         :raises ApiError: An unexpected response.
@@ -859,6 +1030,8 @@ class DominaiteClient:
             body["amount"] = amount
         if reason is not None:
             body["reason"] = reason
+        if extra is not None:
+            body.update(extra)
 
         reply = self._send("POST", PAYMENTS_PATH + "/" + normalized + "/refunds", body, key)
         return _refund_result(reply)
@@ -877,7 +1050,8 @@ class DominaiteClient:
             none).
 
         :raises RefundError: ``PAYMENT_NOT_FOUND`` or ``REFUND_NOT_FOUND`` (404).
-        :raises AuthenticationError: Wrong/revoked credentials or bad signature.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``payments`` scope (403).
         :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``.
         :raises ApiError: An unexpected response.
         :raises TransportError: Network-level failure (safe to retry).
@@ -891,31 +1065,485 @@ class DominaiteClient:
         )
         return _refund_result(reply)
 
+    def list_refunds(self, transaction_id: str) -> RefundList:
+        """List the refunds of a payment, with what is refunded and what is still refundable.
+
+        Signed with an empty idempotency key and an empty body, like :meth:`get_status`.
+        The list is not paged.
+
+        :param transaction_id: The ``transactionId`` of the payment.
+        :returns: A :class:`RefundList`: ``refunds`` (newest first, each a :class:`Refund`
+            with every field present), ``refundedAmount``, ``refundableAmount``,
+            ``currency`` and ``transactionId``. ``refunds`` holds the refunds created
+            through this API; the two amounts count every refund of the payment.
+
+        :raises RefundError: ``PAYMENT_NOT_FOUND`` (404): no payment with this id under
+            your account.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``payments`` scope (403).
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``.
+        :raises ApiError: An unexpected response.
+        :raises TransportError: Network-level failure or a 5xx, ``MERCHANT_API_UNAVAILABLE``
+            included (safe to retry).
+        """
+        normalized = _normalize_transaction_id(transaction_id)
+        reply = self._send("GET", PAYMENTS_PATH + "/" + normalized + "/refunds", None, "")
+        return _refund_list(reply)
+
+    def create_plan(
+        self,
+        name: str,
+        amount: int,
+        currency: str,
+        interval_unit: str,
+        interval_count: Optional[int] = None,
+        period_count: Optional[int] = None,
+        trial_days: Optional[int] = None,
+        cancel_url: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        extra: Optional[Mapping[str, Any]] = None,
+    ) -> Plan:
+        """Create a subscription plan: a price that agreements bill every period.
+
+        Amount, currency and interval cannot change after this. To change a price, create
+        a new plan and archive the old one with :meth:`delete_plan`.
+
+        :param name: The display name of the plan, 1 to 100 characters.
+        :param amount: The charge per period, an integer in MINOR units.
+        :param currency: ISO 4217 code in upper case, for example ``"EUR"``.
+        :param interval_unit: ``"day"``, ``"week"``, ``"month"`` or ``"year"``.
+        :param interval_count: How many units make one period: 3 with ``"month"`` bills
+            every 3 months. The API uses 1 when you leave it out. One period is at most
+            one year.
+        :param period_count: The number of periods after which agreements complete. Leave
+            it out to bill until the agreement is cancelled.
+        :param trial_days: Days between activation and the first charge, 0 to 365.
+        :param cancel_url: Your page where a customer cancels, an absolute https URL. The
+            customer gets it on every receipt and decline notice.
+        :param idempotency_key: Required. The same key with the same body answers the
+            first plan again (HTTP 200), so a create that timed out is safe to repeat.
+        :param extra: More request fields, sent as given in the signed body. A key here
+            replaces the same key set by the arguments above.
+        :returns: The :class:`Plan`.
+
+        :raises ApiError: A 4xx with ``error_code``: ``VALIDATION_ERROR`` (400; the fields
+            are in ``result["error"]["validationErrors"]``, an unsupported currency
+            included) or ``IDEMPOTENCY_KEY_REUSED`` (422).
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``payments`` scope (403).
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``, then retry WITH
+            the same ``idempotency_key``.
+        :raises TransportError: Network-level failure or a 5xx; nothing was created.
+            Retry WITH the same ``idempotency_key``.
+        """
+        if not name:
+            raise ValueError("name is required")
+        _validate_whole_number(amount, "amount", 1)
+        if not currency:
+            raise ValueError("currency is required")
+        if not interval_unit:
+            raise ValueError("interval_unit is required")
+        for value, field in ((interval_count, "interval_count"), (period_count, "period_count")):
+            if value is not None:
+                _validate_whole_number(value, field, 1)
+        if trial_days is not None:
+            _validate_whole_number(trial_days, "trial_days", 0)
+        key = _normalize_idempotency_key(idempotency_key)
+
+        body: Dict[str, Any] = {
+            "name": name,
+            "amount": amount,
+            "currency": currency,
+            "intervalUnit": str(getattr(interval_unit, "value", interval_unit)),
+        }
+        if interval_count is not None:
+            body["intervalCount"] = interval_count
+        if period_count is not None:
+            body["periodCount"] = period_count
+        if trial_days is not None:
+            body["trialDays"] = trial_days
+        if cancel_url is not None:
+            body["cancelUrl"] = cancel_url
+        if extra is not None:
+            body.update(extra)
+        return cast(Plan, self._request("POST", PLANS_PATH, body, key))
+
+    def list_plans(self) -> List[Plan]:
+        """List your plans: active ones first, the newest first within a status.
+
+        The list is not paged and holds at most 200 plans. Read one plan with
+        :meth:`get_plan` when you have more.
+
+        :returns: A list of :class:`Plan`.
+
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``payments`` scope (403).
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``.
+        :raises ApiError: An unexpected response.
+        :raises TransportError: Network-level failure or a 5xx (safe to retry).
+        """
+        return cast(List[Plan], self._request_list(PLANS_PATH, "plan list"))
+
+    def get_plan(self, plan_id: str) -> Plan:
+        """Read one of your plans.
+
+        :param plan_id: The ``plan_`` id, exactly as returned: it is case-sensitive.
+        :returns: The :class:`Plan`.
+
+        :raises ApiError: ``PLAN_NOT_FOUND`` (404), or an unexpected response.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``payments`` scope (403).
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``.
+        :raises TransportError: Network-level failure or a 5xx (safe to retry).
+        """
+        normalized = _normalize_recurring_id(plan_id, "plan_id")
+        return cast(Plan, self._request("GET", PLANS_PATH + "/" + normalized, None, ""))
+
+    def update_plan(
+        self,
+        plan_id: str,
+        name: Optional[str] = None,
+        trial_days: Optional[int] = None,
+        cancel_url: Optional[str] = None,
+        extra: Optional[Mapping[str, Any]] = None,
+    ) -> Plan:
+        """Change the name, the trial or the cancel page of a plan.
+
+        Only these fields can change. A field you leave out keeps its value. A trial change
+        applies to agreements created after it. The update sends no idempotency key: the
+        API does not replay it, and sending the same update twice gives the same plan.
+
+        :param plan_id: The ``plan_`` id, exactly as returned.
+        :param name: The new display name, 1 to 100 characters.
+        :param trial_days: The new trial in days; 0 removes the trial.
+        :param cancel_url: The new cancel page, an absolute https URL; ``""`` removes it.
+        :param extra: More request fields, sent as given in the signed body.
+        :returns: The updated :class:`Plan`.
+
+        :raises ValueError: Nothing to change, before any request is made.
+        :raises ApiError: ``PLAN_NOT_FOUND`` (404), ``VALIDATION_ERROR`` (400), or an
+            unexpected response.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``payments`` scope (403).
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``.
+        :raises TransportError: Network-level failure or a 5xx (safe to retry).
+        """
+        normalized = _normalize_recurring_id(plan_id, "plan_id")
+        if trial_days is not None:
+            _validate_whole_number(trial_days, "trial_days", 0)
+        body: Dict[str, Any] = {}
+        if name is not None:
+            body["name"] = name
+        if trial_days is not None:
+            body["trialDays"] = trial_days
+        if cancel_url is not None:
+            # An empty string is meaningful here: it removes the cancel page.
+            body["cancelUrl"] = cancel_url
+        if extra is not None:
+            body.update(extra)
+        if not body:
+            raise ValueError("update_plan needs name, trial_days, cancel_url or extra")
+        return cast(Plan, self._request("PATCH", PLANS_PATH + "/" + normalized, body, ""))
+
+    def delete_plan(self, plan_id: str) -> None:
+        """Archive a plan. No new agreement can use it; existing agreements continue.
+
+        Archiving an archived plan succeeds again, so a retry after a timeout is safe.
+
+        :param plan_id: The ``plan_`` id, exactly as returned.
+
+        :raises ApiError: ``PLAN_NOT_FOUND`` (404), or an unexpected response.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``payments`` scope (403).
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``.
+        :raises TransportError: Network-level failure or a 5xx (safe to retry).
+        """
+        normalized = _normalize_recurring_id(plan_id, "plan_id")
+        self._request("DELETE", PLANS_PATH + "/" + normalized, None, "")
+
+    def create_agreement(
+        self,
+        plan_id: str,
+        customer_reference: str,
+        stored_payment_method_id: Optional[str] = None,
+        max_amount_per_period: Optional[int] = None,
+        consent: Optional[Mapping[str, Any]] = None,
+        idempotency_key: Optional[str] = None,
+        extra: Optional[Mapping[str, Any]] = None,
+    ) -> Agreement:
+        """Subscribe a customer to a plan. The agreement starts ``pending`` and nothing is
+        charged.
+
+        To start it, call :meth:`create_checkout_session` with ``agreement_id``. That
+        payment activates the agreement and saves the card. From then on the platform
+        places the charge of each period on the saved card.
+
+        :param plan_id: The ``plan_`` id of an active plan, exactly as returned.
+        :param customer_reference: Your own stable id for the customer, 1 to 100
+            characters. Use the same value for the same customer every time.
+        :param stored_payment_method_id: The ``pm_`` id of a card that is already saved,
+            to bill that card. Needs ``consent``.
+        :param max_amount_per_period: The most one charge may be, in MINOR units, when the
+            customer agreed to a variable amount. At least the plan's amount. Needs
+            ``consent``. Leave it out for a fixed agreement.
+        :param consent: ``{"textVersion", "acceptedAt", "ip"}``: the customer's acceptance,
+            when you captured it on your own page. ``textVersion`` names the wording, 1 to
+            50 characters; ``acceptedAt`` is ISO 8601 UTC, not in the future; ``ip`` is the
+            customer's IPv4 or IPv6 address. Required with ``stored_payment_method_id`` or
+            ``max_amount_per_period``. A subscription session uses this consent only when
+            ``textVersion`` is one of ``recurring.consentTextVersions`` in
+            :meth:`get_integration_contract`.
+        :param idempotency_key: Required. The same key with the same body answers the
+            first agreement again (HTTP 200), so a create that timed out is safe to repeat.
+        :param extra: More request fields, sent as given in the signed body. A key here
+            replaces the same key set by the arguments above.
+        :returns: The :class:`Agreement`.
+
+        :raises ApiError: A 4xx with ``error_code``; nothing was created on any of them:
+            ``PLAN_NOT_FOUND`` or ``PAYMENT_METHOD_NOT_FOUND`` (404); ``PLAN_NOT_ACTIVE``
+            or ``PAYMENT_METHOD_NOT_ACTIVE`` (409); ``MAX_AMOUNT_BELOW_PLAN_AMOUNT``,
+            ``PAYMENT_METHOD_CURRENCY_MISMATCH``, ``PAYMENT_METHOD_CURRENCY_UNKNOWN``,
+            ``AGREEMENT_CONSENT_REQUIRED`` or ``IDEMPOTENCY_KEY_REUSED`` (422);
+            ``VALIDATION_ERROR`` (400). A missing ``consent`` usually arrives as a 400 on
+            the ``consent`` field: the same refusal as ``AGREEMENT_CONSENT_REQUIRED``.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``payments`` scope (403).
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``, then retry WITH
+            the same ``idempotency_key``.
+        :raises TransportError: Network-level failure or a 5xx; nothing was created.
+            Retry WITH the same ``idempotency_key``.
+        """
+        normalized_plan = _normalize_recurring_id(plan_id, "plan_id")
+        if not customer_reference:
+            raise ValueError("customer_reference is required")
+        if max_amount_per_period is not None:
+            _validate_whole_number(max_amount_per_period, "max_amount_per_period", 1)
+        key = _normalize_idempotency_key(idempotency_key)
+
+        body: Dict[str, Any] = {
+            "planId": normalized_plan,
+            "customerReference": customer_reference,
+        }
+        if stored_payment_method_id is not None:
+            body["storedPaymentMethodId"] = str(stored_payment_method_id)
+        if max_amount_per_period is not None:
+            body["maxAmountPerPeriod"] = max_amount_per_period
+        if consent is not None:
+            body["consent"] = dict(consent)
+        if extra is not None:
+            body.update(extra)
+        return cast(Agreement, self._request("POST", AGREEMENTS_PATH, body, key))
+
+    def get_agreement(self, agreement_id: str) -> Agreement:
+        """Read one of your agreements.
+
+        :param agreement_id: The ``agr_`` id, exactly as returned: it is case-sensitive.
+        :returns: The :class:`Agreement`.
+
+        :raises ApiError: ``AGREEMENT_NOT_FOUND`` (404), or an unexpected response.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``payments`` scope (403).
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``.
+        :raises TransportError: Network-level failure or a 5xx (safe to retry).
+        """
+        normalized = _normalize_recurring_id(agreement_id, "agreement_id")
+        return cast(Agreement, self._request("GET", AGREEMENTS_PATH + "/" + normalized, None, ""))
+
+    def cancel_agreement(self, agreement_id: str) -> None:
+        """Cancel an agreement: the platform schedules no further charge.
+
+        Allowed from ``pending``, ``active`` and ``past_due``. A charge already placed is
+        not reversed. Cancelling a cancelled agreement succeeds again, so a retry after a
+        timeout is safe.
+
+        :param agreement_id: The ``agr_`` id, exactly as returned.
+
+        :raises ApiError: ``AGREEMENT_NOT_FOUND`` (404), ``AGREEMENT_ENDED`` (409: it
+            already completed or failed, so there is nothing to cancel), or an
+            unexpected response.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``payments`` scope (403).
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``.
+        :raises TransportError: Network-level failure or a 5xx (safe to retry).
+        """
+        normalized = _normalize_recurring_id(agreement_id, "agreement_id")
+        self._request("DELETE", AGREEMENTS_PATH + "/" + normalized, None, "")
+
+    def create_webhook_endpoint(
+        self,
+        url: str,
+        events: Sequence[str],
+        idempotency_key: Optional[str] = None,
+        extra: Optional[Mapping[str, Any]] = None,
+    ) -> WebhookEndpoint:
+        """Register an endpoint that receives webhook deliveries.
+
+        Needs a key with the ``webhooks:manage`` scope. A key with the ``payments`` scope
+        cannot hold it, so use a separate key for this.
+
+        :param url: The HTTPS URL on a public host that receives the deliveries, at most
+            500 characters.
+        :param events: The event types to deliver, 1 to 50 of them, for example
+            ``["payment.succeeded", "payment.refunded"]``. The SDK does not check the names.
+            The API refuses an unknown type with ``VALIDATION_ERROR``.
+        :param idempotency_key: Required. The same key with the same url and events answers
+            the same endpoint again, without ``secret``. After a timeout or a 503, retry
+            with the SAME key: that replaces an endpoint the lost attempt registered.
+        :param extra: More request fields, sent as given in the signed body.
+        :returns: The :class:`WebhookEndpoint`. ``secret`` is on the first answer only.
+
+        :raises ApiError: A 4xx with ``error_code``; nothing new was registered:
+            ``WEBHOOK_URL_REJECTED`` or ``VALIDATION_ERROR`` (400);
+            ``WEBHOOK_LIMIT_REACHED`` (409, delete an endpoint first);
+            ``WEBHOOK_ALREADY_REGISTERED`` (409, the key registered an endpoint more than
+            a day ago; ``result["error"]["params"]["webhookId"]`` names it);
+            ``DUPLICATE_REQUEST`` (409, retry with the same key after a second);
+            ``IDEMPOTENCY_KEY_REUSED`` (422).
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``webhooks:manage`` scope (403).
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``, then retry WITH
+            the same ``idempotency_key``.
+        :raises TransportError: Network-level failure or a 5xx. Retry WITH the same
+            ``idempotency_key``.
+        """
+        if not url:
+            raise ValueError("url is required")
+        if isinstance(events, (str, bytes)) or not events:
+            raise ValueError("events must be a list of event types, for example ['payment.succeeded']")
+        key = _normalize_idempotency_key(idempotency_key)
+
+        body: Dict[str, Any] = {"url": url, "events": list(events)}
+        if extra is not None:
+            body.update(extra)
+        return cast(WebhookEndpoint, self._request("POST", WEBHOOKS_PATH, body, key))
+
+    def list_webhook_endpoints(self) -> List[WebhookEndpoint]:
+        """List your webhook endpoints, the newest first, never with a secret.
+
+        The list has every active endpoint and your newest 1000 inactive ones. It is not
+        paged. Needs a key with the ``webhooks:manage`` scope.
+
+        :returns: A list of :class:`WebhookEndpoint`.
+
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``webhooks:manage`` scope (403).
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``.
+        :raises ApiError: An unexpected response.
+        :raises TransportError: Network-level failure or a 5xx (safe to retry).
+        """
+        return cast(
+            List[WebhookEndpoint], self._request_list(WEBHOOKS_PATH, "webhook endpoint list")
+        )
+
+    def delete_webhook_endpoint(self, webhook_id: str) -> None:
+        """Delete a webhook endpoint. It stops receiving deliveries at once.
+
+        Needs a key with the ``webhooks:manage`` scope.
+
+        :param webhook_id: The endpoint ``id`` (a UUID). Any letter case is accepted.
+
+        :raises ApiError: ``WEBHOOK_NOT_FOUND`` (404): the id is unknown or already
+            deleted. A retry after a lost answer gets this too, so treat it as done.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``webhooks:manage`` scope (403).
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``.
+        :raises TransportError: Network-level failure or a 5xx (safe to retry).
+        """
+        normalized = _normalize_webhook_id(webhook_id)
+        self._request("DELETE", WEBHOOKS_PATH + "/" + normalized, None, "")
+
+    def list_transactions(
+        self,
+        from_: Union[str, datetime.date],
+        to: Union[str, datetime.date],
+        status: Optional[str] = None,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+    ) -> TransactionPage:
+        """List your card payments created in a window, one page at a time.
+
+        Needs a key with the ``transactions:read`` scope. A payment is listed in the window
+        of its ``createdAt``, with its status at the time of the read. A refund is not a row
+        of its own: it shows on its payment as ``refundedAmount`` and ``status``. Rows come
+        oldest first. To read every page, send ``nextCursor`` back as ``cursor`` with the
+        same window and status, until ``nextCursor`` is None::
+
+            cursor = None
+            while True:
+                page = client.list_transactions(start, end, cursor=cursor)
+                handle(page["items"])
+                cursor = page["nextCursor"]
+                if cursor is None:
+                    break
+
+        :param from_: The start of the window, inclusive: an ISO 8601 UTC string such as
+            ``"2026-10-01T00:00:00Z"``, a timezone-aware ``datetime`` (sent as UTC) or a
+            ``date`` (midnight UTC).
+        :param to: The end of the window, exclusive, in the same forms. Later than
+            ``from_`` and at most 31 days after it.
+        :param status: Only payments in this status now, for example ``"succeeded"``.
+        :param limit: Rows per page, 1 to 100. The API uses 50 when you leave it out.
+        :param cursor: The ``nextCursor`` of the previous page, unchanged. Leave it out for
+            the first page.
+        :returns: A :class:`TransactionPage`.
+
+        :raises ValueError: A naive ``datetime`` or a ``limit`` that is not an integer,
+            before any request is made.
+        :raises ApiError: ``VALIDATION_ERROR`` (400): the window, ``status``, ``limit`` or
+            ``cursor`` is not valid. The fields are in
+            ``result["error"]["validationErrors"]``.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``transactions:read`` scope (403).
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``.
+        :raises TransportError: Network-level failure or a 5xx (safe to retry).
+        """
+        query: Dict[str, str] = {
+            "from": _query_instant(from_, "from_"),
+            "to": _query_instant(to, "to"),
+        }
+        if status is not None:
+            query["status"] = str(getattr(status, "value", status))
+        if limit is not None:
+            _validate_whole_number(limit, "limit", 1)
+            query["limit"] = str(limit)
+        if cursor is not None:
+            query["cursor"] = cursor
+
+        reply = _checked(self._send("GET", TRANSACTIONS_PATH, None, "", query=query))
+        items = reply.payload.get("items")
+        if not isinstance(items, list):
+            raise ApiError(
+                reply.status,
+                "The API answered the transaction list without a list",
+                error_code="UNEXPECTED_RESPONSE",
+            )
+        page = dict(reply.payload)
+        page["items"] = [cast(Transaction, dict(item)) for item in items if isinstance(item, dict)]
+        page["nextCursor"] = reply.payload.get("nextCursor")
+        return cast(TransactionPage, page)
+
     def _request(
         self,
         method: str,
         path: str,
         body: Optional[Mapping[str, Any]],
         idempotency_key: str,
+        signed: bool = True,
     ) -> Dict[str, Any]:
         """Send and apply the generic failure rules: 5xx is transport, 4xx is ApiError."""
-        reply = self._send(method, path, body, idempotency_key)
-        if reply.status >= 400:
-            raise _rejection(reply)
-        if not 200 <= reply.status < 300:
-            # Everything above tests for a KNOWN failure, so anything left that is not a
-            # 2xx would be decoded into a session on the way out. A 300 or a 305 reaches
-            # here (no redirect handler claims those codes), and so would any status the
-            # API does not send. Not the API talking: refuse it, and do not retry it.
+        return _checked(self._send(method, path, body, idempotency_key, signed=signed)).payload
+
+    def _request_list(self, path: str, what: str) -> List[Dict[str, Any]]:
+        """GET a route whose ``data`` is a bare JSON array, and return its objects."""
+        reply = _checked(self._send("GET", path, None, ""))
+        items = reply.envelope.get("data")
+        if not isinstance(items, list):
             raise ApiError(
                 reply.status,
-                "Unexpected HTTP {0} response; the Dominaite API answers 2xx or a "
-                "documented error. Check base_url and anything proxying it.".format(
-                    reply.status
-                ),
-                error_code="UNEXPECTED_STATUS",
+                "The API answered the {0} without a list".format(what),
+                error_code="UNEXPECTED_RESPONSE",
             )
-        return reply.payload
+        return [dict(item) for item in items if isinstance(item, dict)]
 
     def _send(
         self,
@@ -923,11 +1551,15 @@ class DominaiteClient:
         path: str,
         body: Optional[Mapping[str, Any]],
         idempotency_key: str,
+        signed: bool = True,
+        query: Optional[Mapping[str, str]] = None,
     ) -> _Reply:
         """Sign, send and parse one request.
 
         ``body`` is None for GET and DELETE: an empty body (and an empty idempotency
-        key) is what gets signed.
+        key) is what gets signed. ``signed=False`` is for the one anonymous route, the
+        integration contract: no key id, timestamp or signature goes out. ``query`` goes
+        into the URL only: the gateway signs the bare path, never a query string.
 
         Transport failures, redirects, non-JSON bodies, authentication failures (401,
         403) and rate limiting (429) raise here because they mean the same thing on
@@ -941,26 +1573,28 @@ class DominaiteClient:
             # exact bytes we send, so the JSON is serialized once and reused.
             payload = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
-        timestamp = str(int(time.time()))
-        signature = sign_request(
-            self._secret.reveal(), timestamp, method, path, idempotency_key, payload
-        )
-
         headers = {
             "Content-Type": "application/json",
-            "X-Api-Key-Id": self._key_id,
-            "X-Timestamp": timestamp,
-            "X-Signature": signature,
             # Some edges block requests without a real User-Agent - always send one.
             "User-Agent": "dominaite-python/" + __version__,
         }
+        if signed:
+            timestamp = str(int(time.time()))
+            headers["X-Api-Key-Id"] = self._key_id
+            headers["X-Timestamp"] = timestamp
+            headers["X-Signature"] = sign_request(
+                self._secret.reveal(), timestamp, method, path, idempotency_key, payload
+            )
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
 
         data = payload.encode("utf-8") if body is not None else None
-        request = urllib.request.Request(
-            self._base_url + path, data=data, headers=headers, method=method
-        )
+        url = self._base_url + path
+        if query:
+            # urlencode percent-encodes "+", so an offset such as +02:00 does not arrive as
+            # a space.
+            url += "?" + urllib.parse.urlencode(query)
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
 
         headers_received: Any = None
         try:
@@ -987,7 +1621,12 @@ class DominaiteClient:
         except ValueError:
             decoded = None
         if not isinstance(decoded, dict):
-            raise ApiError(status, "The API returned a non-JSON response")
+            # A 429 is a rate limit whatever its body: something in front of the API can
+            # throttle too, with an HTML page or nothing at all. It gets the same error and
+            # the same Retry-After reading as the API's own.
+            if status != 429:
+                raise ApiError(status, "The API returned a non-JSON response")
+            decoded = {}
 
         # The gateway wraps responses as { success, data, ... }; unwrap when present.
         # Error responses carry the machine-readable code at error.code.
@@ -998,9 +1637,20 @@ class DominaiteClient:
             envelope_error = {}
 
         if status in (401, 403):
+            code = str(
+                result.get("errorCode")
+                or envelope_error.get("code")
+                or ("FORBIDDEN" if status == 403 else "UNAUTHORIZED")
+            )
             raise AuthenticationError(
-                str(result.get("errorCode") or envelope_error.get("code") or "UNAUTHORIZED"),
-                "Authentication failed - check your key id, secret, and server clock.",
+                code,
+                _auth_message(
+                    status,
+                    code,
+                    result.get("errorMessage") or envelope_error.get("message"),
+                ),
+                http_status=status,
+                result=dict(decoded),
             )
         if status == 429:
             # Deliberately not retried here, not even by
@@ -1016,9 +1666,14 @@ class DominaiteClient:
                     or "Rate limit exceeded; slow down and retry later."
                 ),
                 retry_after_seconds=retry_after,
+                # The gateway's own code for its limits. A charge-specific limit keeps its
+                # own code (CHARGE_VELOCITY_EXCEEDED, CHARGE_DECLINE_RATE_EXCEEDED).
                 error_code=str(
-                    result.get("errorCode") or envelope_error.get("code") or "RATE_LIMITED"
+                    result.get("errorCode")
+                    or envelope_error.get("code")
+                    or ErrorCode.RATE_LIMIT_EXCEEDED.value
                 ),
+                result=dict(decoded),
             )
         return _Reply(status, decoded, result, envelope_error)
 
@@ -1045,15 +1700,41 @@ def _rejection(reply: _Reply) -> DominaiteError:
             or "Request rejected"
         ),
         error_code=str(error_code) if error_code else None,
+        result=dict(reply.envelope),
+    )
+
+
+def _auth_message(status: int, code: str, server_message: Any) -> str:
+    """The message of an AuthenticationError: a credential hint on 401 only.
+
+    A 403 means the signature was good, so pointing the caller at the key id, the secret or
+    the clock would send them after the wrong problem.
+    """
+    if status == 401:
+        return "Authentication failed - check your key id, secret, and server clock."
+    if code == ErrorCode.INSUFFICIENT_SCOPE:
+        # The server names the scope the route needs; keep that, then say what to do.
+        named = str(server_message or "This API key does not hold the scope this route needs")
+        return (
+            named.rstrip(".") + ". Use a key that holds that scope; a key's scopes are "
+            "fixed when it is issued."
+        )
+    if code == ErrorCode.VERIFY_ONLY_NOT_ENABLED:
+        return (
+            "Verify-only sessions are not enabled for your account. Nothing was created. "
+            "We switch it on for your account: ask Dominaite support."
+        )
+    return "The API refused this request for this key (HTTP 403){0}".format(
+        ": " + str(server_message) if server_message else "."
     )
 
 
 def _charge(data: Dict[str, Any]) -> Dict[str, Any]:
-    """The charge body as one shape.
+    """The charge body as one shape: every contract field is a key.
 
-    The gateway omits ``declineClass`` and ``declineCode`` when they are null (every
-    201, and a 502 ``CHARGE_FAILED`` row), so absent reads as None. Anything else the
-    gateway sends is carried through.
+    The gateway omits a null key (``declineClass`` and ``declineCode`` on a 201, or
+    ``agreementId`` on a charge outside an agreement), so absent reads as None. Anything
+    else the gateway sends is carried through as sent, ``sequence`` included.
     """
     charge = dict(data)
     charge["chargeId"] = str(data.get("chargeId"))
@@ -1061,6 +1742,7 @@ def _charge(data: Dict[str, Any]) -> Dict[str, Any]:
     charge["declineClass"] = data["declineClass"] if isinstance(data.get("declineClass"), str) else None
     charge["declineCode"] = data["declineCode"] if isinstance(data.get("declineCode"), str) else None
     charge["transactionId"] = str(data.get("transactionId") or "")
+    charge["agreementId"] = data["agreementId"] if isinstance(data.get("agreementId"), str) else None
     return charge
 
 
@@ -1074,20 +1756,61 @@ def _refund_result(reply: _Reply) -> Refund:
             "The API answered the refund without a refund body",
             error_code="UNEXPECTED_RESPONSE",
         )
+    raise _refund_failure(reply)
+
+
+def _checked(reply: _Reply) -> _Reply:
+    """Apply the generic failure rules to a reply: 5xx is transport, 4xx is ApiError."""
+    if reply.status >= 400:
+        raise _rejection(reply)
+    if not 200 <= reply.status < 300:
+        # Everything above tests for a KNOWN failure, so anything left that is not a
+        # 2xx would be decoded into a session on the way out. A 300 or a 305 reaches
+        # here (no redirect handler claims those codes), and so would any status the
+        # API does not send. Not the API talking: refuse it, and do not retry it.
+        raise ApiError(
+            reply.status,
+            "Unexpected HTTP {0} response; the Dominaite API answers 2xx or a "
+            "documented error. Check base_url and anything proxying it.".format(
+                reply.status
+            ),
+            error_code="UNEXPECTED_STATUS",
+        )
+    return reply
+
+
+def _refund_list(reply: _Reply) -> RefundList:
+    """Read the refund list route's reply: every refund in the one :class:`Refund` shape."""
+    if 200 <= reply.status < 300:
+        refunds = reply.payload.get("refunds")
+        if isinstance(refunds, list):
+            listing = dict(reply.payload)
+            listing["refunds"] = [_refund(item) for item in refunds if isinstance(item, dict)]
+            return cast(RefundList, listing)
+        raise ApiError(
+            reply.status,
+            "The API answered the refund list without a list",
+            error_code="UNEXPECTED_RESPONSE",
+        )
+    raise _refund_failure(reply)
+
+
+def _refund_failure(reply: _Reply) -> DominaiteError:
+    """The error for a refund route's reply that is not a 2xx."""
     error_code = reply.error.get("code") or reply.payload.get("errorCode")
     # Every 4xx with a code is the refund route telling us something specific, 400 and 404
     # included (REFUND_NOT_FOUND is retryable, PAYMENT_NOT_FOUND is not). Auth and rate
     # limiting never get here; a 5xx stays a TransportError: nothing was queued.
     if error_code and 400 <= reply.status < 500:
-        raise RefundError(
+        return RefundError(
             reply.status,
             str(error_code),
             str(reply.error.get("message") or reply.payload.get("errorMessage") or "The refund was refused."),
             result=dict(reply.envelope),
         )
     if reply.status >= 400:
-        raise _rejection(reply)
-    raise ApiError(
+        return _rejection(reply)
+    return ApiError(
         reply.status,
         "Unexpected HTTP {0} response; the Dominaite API answers 2xx or a "
         "documented error. Check base_url and anything proxying it.".format(reply.status),

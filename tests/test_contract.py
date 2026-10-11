@@ -371,10 +371,11 @@ def test_charge_payment_method_returns_the_402_decline_as_a_charge_never_raises(
     assert example["error"]["code"] == "CHARGE_DECLINED"
 
 
-def test_charge_payment_method_reads_absent_decline_fields_as_none_like_the_wire(client, answers_with):
+def test_charge_payment_method_reads_absent_null_fields_as_none_like_the_wire(client, answers_with):
     endpoint = ENDPOINTS["chargePaymentMethod"]
     wire = _without_nulls(endpoint["successExample"])
     assert "declineClass" not in wire["data"]
+    assert "agreementId" not in wire["data"]
     answers_with(wire, endpoint["httpStatus"])
 
     assert _charge(client) == endpoint["successExample"]["data"]

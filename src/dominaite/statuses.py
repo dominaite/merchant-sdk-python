@@ -137,8 +137,12 @@ CHARGE_STATUSES: Tuple[str, ...] = tuple(member.value for member in ChargeStatus
 
 
 class DeclineClass(str, Enum):
-    """Why a charge was declined (HTTP 402), coarse enough to act on without reading
-    the issuer's code. None on every other charge, including a 502 ``CHARGE_FAILED`` row.
+    """Why a payment or a charge was declined, coarse enough to act on without reading
+    the issuer's code.
+
+    The class can be None, for example when nobody declined the payment, as on a 502
+    ``CHARGE_FAILED`` row. A value not listed here is valid as well: compare with ``==``,
+    and never parse a response value into this enum.
 
     - ``HARD``: do not retry this card, ask the customer for another one.
     - ``SOFT_FUNDS``: insufficient funds; retry later (after payday, not in a loop).

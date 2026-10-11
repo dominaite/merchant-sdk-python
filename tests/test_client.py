@@ -1,5 +1,6 @@
 """Contract tests for DominaiteClient: what it sends, and how it classifies answers."""
 
+import datetime
 import email
 import hashlib
 import io
@@ -7,23 +8,31 @@ import json
 import pickle
 import pprint
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 
 import pytest
 
 from dominaite import (
+    AGREEMENTS_PATH,
+    AUTHORIZATION_ERROR_CODES,
     CHARGE_ERROR_CODES,
+    CONTRACT_PATH,
     DEFAULT_BASE_URL,
     PAYMENT_METHODS_PATH,
     PAYMENTS_PATH,
     PING_PATH,
+    PLANS_PATH,
     REFUND_ERROR_CODES,
     REFUND_FAILURE_CODES,
     REVOKE_ERROR_CODES,
     SESSION_REFUSAL_ERROR_CODES,
     SESSIONS_PATH,
     STOREFRONT_ERROR_CODES,
+    TRANSACTIONS_PATH,
     VALIDATION_ERROR_CODES,
+    WEBHOOKS_PATH,
     ApiError,
     AuthenticationError,
     ChargeError,
@@ -31,14 +40,19 @@ from dominaite import (
     CheckoutRefusedError,
     DominaiteClient,
     ErrorCode,
+    PaymentStatus,
     RateLimitError,
     RefundError,
     RefundStatus,
     RevokeError,
     StorefrontError,
     TransportError,
+    is_paid,
+    is_terminal,
     order_idempotency_key,
     sign_request,
+    sign_webhook,
+    verify_webhook,
 )
 from dominaite.client import MAX_RESPONSE_BYTES
 
@@ -365,6 +379,110 @@ def test_ping_401_raises_authentication_with_the_error_code(client, urlopen):
         client.ping()
 
     assert caught.value.error_code == "IP_NOT_ALLOWED"
+
+
+def _gateway_error(status, code, message):
+    """An error body in the gateway's envelope shape."""
+    return {
+        "success": False,
+        "error": {"statusCode": status, "code": code, "message": message},
+        "metadata": {"requestId": "req_1"},
+    }
+
+
+def test_a_401_points_at_the_credentials(client, urlopen):
+    urlopen((401, _gateway_error(401, "INVALID_SIGNATURE", "Signature mismatch")))
+
+    with pytest.raises(AuthenticationError) as caught:
+        client.ping()
+
+    assert caught.value.http_status == 401
+    assert caught.value.error_code == "INVALID_SIGNATURE"
+    assert "check your key id, secret, and server clock" in str(caught.value)
+
+
+def test_a_missing_scope_is_a_403_that_names_the_scope_and_never_the_clock(client, urlopen):
+    """The signature was good, so a credential hint would send the caller after the wrong
+    problem. The gateway's message names the scope the route needs; it has to survive."""
+    body = _gateway_error(
+        403,
+        "INSUFFICIENT_SCOPE",
+        "This API key does not have the 'payments' scope this route requires",
+    )
+    urlopen((403, body))
+
+    with pytest.raises(AuthenticationError) as caught:
+        client.get_status(TRANSACTION_ID)
+
+    error = caught.value
+    assert error.http_status == 403
+    assert error.error_code == ErrorCode.INSUFFICIENT_SCOPE
+    assert "'payments' scope" in str(error)
+    assert "key that holds that scope" in str(error)
+    for credential_hint in ("clock", "secret", "key id"):
+        assert credential_hint not in str(error)
+    assert error.result == body
+
+
+def test_verify_only_not_enabled_is_a_403_that_says_we_switch_it_on(client, urlopen):
+    urlopen(
+        (
+            403,
+            _gateway_error(
+                403,
+                "VERIFY_ONLY_NOT_ENABLED",
+                "Verify-only sessions are not enabled for this account.",
+            ),
+        )
+    )
+
+    with pytest.raises(AuthenticationError) as caught:
+        client.create_checkout_session(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
+        )
+
+    error = caught.value
+    assert error.http_status == 403
+    assert error.error_code == ErrorCode.VERIFY_ONLY_NOT_ENABLED
+    assert "We switch it on for your account" in str(error)
+    assert "clock" not in str(error)
+
+
+@pytest.mark.parametrize(
+    "body, code, text",
+    [
+        (_gateway_error(403, "SOMETHING_NEW", "Not for this key."), "SOMETHING_NEW", "Not for this key."),
+        ({}, "FORBIDDEN", "(HTTP 403)."),
+    ],
+    ids=["unknown-code", "no-code"],
+)
+def test_any_other_403_keeps_the_server_message_and_no_credential_hint(
+    client, urlopen, body, code, text
+):
+    urlopen((403, body))
+
+    with pytest.raises(AuthenticationError) as caught:
+        client.ping()
+
+    assert caught.value.http_status == 403
+    assert caught.value.error_code == code
+    assert text in str(caught.value)
+    assert "clock" not in str(caught.value)
+
+
+def test_a_4xx_rejection_carries_the_whole_body_the_gateway_sent(client, urlopen):
+    body = _gateway_error(404, "NOT_FOUND", "Transaction not found")
+    body["error"]["validationErrors"] = [{"field": "id", "code": "NOT_FOUND"}]
+    urlopen((404, body))
+
+    with pytest.raises(ApiError) as caught:
+        client.get_status(TRANSACTION_ID)
+
+    assert caught.value.http_status == 404
+    assert caught.value.result == body
 
 
 def test_get_status_normalizes_transaction_id_casing(client, urlopen):
@@ -996,7 +1114,8 @@ def test_the_checkout_codes_are_named_constants_equal_to_the_wire_string(name):
 
 def test_every_code_the_sdk_groups_has_a_named_constant():
     grouped = (
-        SESSION_REFUSAL_ERROR_CODES
+        AUTHORIZATION_ERROR_CODES
+        + SESSION_REFUSAL_ERROR_CODES
         + VALIDATION_ERROR_CODES
         + STOREFRONT_ERROR_CODES
         + CHARGE_ERROR_CODES
@@ -1348,6 +1467,49 @@ def test_a_rate_limit_is_still_catchable_as_an_api_error(client, urlopen):
         client.get_status(TRANSACTION_ID)
 
 
+def test_a_429_without_a_code_gets_the_gateways_rate_limit_code(client, urlopen):
+    urlopen((429, {"success": False}, {"Retry-After": "7"}))
+
+    with pytest.raises(RateLimitError) as caught:
+        client.get_status(TRANSACTION_ID)
+
+    assert caught.value.error_code == ErrorCode.RATE_LIMIT_EXCEEDED
+    assert caught.value.retry_after_seconds == 7
+
+
+def test_a_429_that_is_not_json_is_still_a_rate_limit_with_its_retry_after(client, urlopen):
+    """A proxy in front of the API can throttle with an HTML page. It is still a rate limit,
+    not an unexplained failure, and its Retry-After still counts."""
+    urlopen((429, b"<html><body>Too Many Requests</body></html>", {"Retry-After": "12"}))
+
+    with pytest.raises(RateLimitError) as caught:
+        client.get_status(TRANSACTION_ID)
+
+    assert caught.value.http_status == 429
+    assert caught.value.error_code == ErrorCode.RATE_LIMIT_EXCEEDED
+    assert caught.value.retry_after_seconds == 12
+    assert caught.value.result == {}
+
+
+def test_a_charge_limit_429_keeps_its_own_code_and_the_body(client, urlopen):
+    body = _gateway_error(429, "CHARGE_VELOCITY_EXCEEDED", "Too many charges on this card")
+    body["error"]["params"] = {"windowSeconds": 86400, "limit": 10}
+    urlopen((429, body, {"Retry-After": "3600"}))
+
+    with pytest.raises(RateLimitError) as caught:
+        client.charge_payment_method(
+            "pm_0123456789abcdef0123456789abcdef",
+            amount=1000,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
+        )
+
+    assert caught.value.error_code == ErrorCode.CHARGE_VELOCITY_EXCEEDED
+    assert caught.value.retry_after_seconds == 3600
+    assert caught.value.result["error"]["params"] == {"windowSeconds": 86400, "limit": 10}
+
+
 def test_a_rate_limit_is_never_retried_automatically(client, urlopen):
     """Answering "you are sending too much" with more traffic is how a brief spike
     becomes a sustained lockout. The caller owns the backoff."""
@@ -1501,13 +1663,13 @@ CHARGE_BODY = '{"amount":2500,"currency":"EUR","orderReference":"order-1043"}'
 CHARGE_VECTOR_SIGNATURE = "9ce9f54efa2533a46aa4493b97b56aeb657f41d6a18f1c008c7fd412029aebf9"
 REVOKE_VECTOR_SIGNATURE = "9330100343c4b820504890a09829a193d5815ca39e92160fdfc13d320a802a02"
 # The wire form of a placed charge: success=true, the charge under data, and no
-# declineClass/declineCode keys at all (the gateway omits nulls).
+# declineClass/declineCode/agreementId keys at all (the gateway omits nulls).
 CHARGE = {
     "chargeId": "ch_33333333333343338333333333333333",
     "status": "succeeded",
     "transactionId": "33333333-3333-4333-8333-333333333333",
 }
-CHARGE_RESULT = dict(CHARGE, declineClass=None, declineCode=None)
+CHARGE_RESULT = dict(CHARGE, declineClass=None, declineCode=None, agreementId=None)
 
 
 def _placed(charge=None):
@@ -1582,6 +1744,156 @@ def test_integration_is_omitted_when_not_passed(client, urlopen):
     client.create_checkout_session(amount=2500, currency="EUR", order_reference="order-1042", idempotency_key=IDEMPOTENCY_KEY)
 
     assert "integration" not in json.loads(recorder.last.data)
+
+
+# --- verify-only, subscription sessions, extra fields ------------------------
+
+AGREEMENT_ID = "agr_0123456789abcdef0123456789abcdef"
+CONSENT = {"textVersion": "recurring-2026-09", "acceptedAt": "2026-10-11T09:30:00Z", "ip": "203.0.113.7"}
+
+
+def _assert_signed(request, method, path):
+    headers = _headers(request)
+    body = request.data.decode("utf-8") if request.data is not None else ""
+    assert headers["x-signature"] == sign_request(
+        SECRET, headers["x-timestamp"], method, path, headers.get("idempotency-key", ""), body,
+    )
+
+
+def test_a_verify_only_session_sends_amount_0_and_returns_the_verify_only_session(client, urlopen):
+    checkout = dict(CHECKOUT, amount=0, integration="widget", verifyOnly=True)
+    recorder = urlopen((200, {"success": True, "checkout": checkout}))
+
+    session = client.create_checkout_session(
+        amount=0, currency="EUR", order_reference="verify-cus-42", verify_only=True,
+        idempotency_key="verify-cus-42",
+    )
+
+    sent = json.loads(recorder.last.data)
+    assert sent["amount"] == 0
+    assert sent["verifyOnly"] is True
+    _assert_signed(recorder.last, "POST", SESSIONS_PATH)
+    assert session["verifyOnly"] is True
+
+
+@pytest.mark.parametrize("verify_only", [None, False])
+def test_amount_0_is_still_refused_before_sending_on_every_other_session(client, urlopen, verify_only):
+    recorder = urlopen(_ok())
+
+    with pytest.raises(ValueError):
+        client.create_checkout_session(
+            amount=0, currency="EUR", order_reference="order-1042", verify_only=verify_only,
+            idempotency_key=IDEMPOTENCY_KEY,
+        )
+
+    assert recorder.requests == []
+
+
+@pytest.mark.parametrize("amount", [-1, True, 0.0, "0"])
+def test_a_verify_only_amount_must_still_be_a_whole_number_of_minor_units(client, urlopen, amount):
+    recorder = urlopen(_ok())
+
+    with pytest.raises(ValueError):
+        client.create_checkout_session(
+            amount=amount, currency="EUR", order_reference="verify-cus-42", verify_only=True,
+            idempotency_key="verify-cus-42",
+        )
+
+    assert recorder.requests == []
+
+
+def test_a_subscription_session_sends_the_agreement_consent_and_location(client, urlopen):
+    location = uuid.UUID("6f1c2d3e-4a5b-4c6d-8e7f-901a2b3c4d5e")
+    checkout = dict(CHECKOUT, integration="widget", agreementId=AGREEMENT_ID)
+    recorder = urlopen((200, {"success": True, "checkout": checkout}))
+
+    session = client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference="order-1042",
+        agreement_id=AGREEMENT_ID, consent=CONSENT, location_id=location,
+        idempotency_key=IDEMPOTENCY_KEY,
+    )
+
+    sent = json.loads(recorder.last.data)
+    assert sent["agreementId"] == AGREEMENT_ID
+    assert sent["consent"] == CONSENT
+    assert sent["locationId"] == "6f1c2d3e-4a5b-4c6d-8e7f-901a2b3c4d5e"
+    _assert_signed(recorder.last, "POST", SESSIONS_PATH)
+    assert session["agreementId"] == AGREEMENT_ID
+
+
+def test_the_new_session_fields_are_left_out_when_not_passed(client, urlopen):
+    recorder = urlopen(_ok())
+
+    client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference="order-1042", idempotency_key=IDEMPOTENCY_KEY,
+    )
+
+    sent = json.loads(recorder.last.data)
+    for field in ("verifyOnly", "agreementId", "consent", "locationId"):
+        assert field not in sent
+
+
+def test_extra_session_fields_are_sent_signed_and_win_over_the_arguments(client, urlopen):
+    """extra is how a caller sends a field this SDK version does not model yet. It goes
+    out as given, inside the signed body, and replaces a field the arguments set."""
+    recorder = urlopen(_ok())
+
+    client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference="order-1042",
+        extra={"newField": {"nested": [1, 2]}, "orderReference": "order-1042-b"},
+        idempotency_key=IDEMPOTENCY_KEY,
+    )
+
+    sent = json.loads(recorder.last.data)
+    assert sent["newField"] == {"nested": [1, 2]}
+    assert sent["orderReference"] == "order-1042-b"
+    assert sent["amount"] == 2500
+    _assert_signed(recorder.last, "POST", SESSIONS_PATH)
+
+
+def test_the_retrying_create_forwards_the_new_session_fields(client, urlopen):
+    recorder = urlopen(_ok())
+
+    client.create_checkout_session_with_retry(
+        amount=0, currency="EUR", order_reference="verify-cus-42", verify_only=True,
+        extra={"newField": "x"}, idempotency_key="verify-cus-42", backoff_seconds=0,
+    )
+
+    sent = json.loads(recorder.last.data)
+    assert sent["verifyOnly"] is True
+    assert sent["newField"] == "x"
+
+
+def test_a_subscription_session_refusal_is_a_checkout_refusal_with_its_code(client, urlopen):
+    """The agreement codes of a subscription session come back as success=false on HTTP
+    200, like every session refusal. A code this SDK does not list is still carried."""
+    urlopen((200, {"success": True, "data": {
+        "success": False, "checkout": None, "transactionId": TRANSACTION_ID,
+        "errorCode": "AGREEMENT_SESSION_OPEN", "errorMessage": "A session for this agreement is open.",
+    }}))
+
+    with pytest.raises(CheckoutRefusedError) as caught:
+        client.create_checkout_session(
+            amount=2500, currency="EUR", order_reference="order-1042",
+            agreement_id=AGREEMENT_ID, idempotency_key=IDEMPOTENCY_KEY,
+        )
+
+    assert caught.value.error_code == "AGREEMENT_SESSION_OPEN"
+    assert caught.value.transaction_id == TRANSACTION_ID
+
+
+def test_get_status_passes_the_verify_only_and_agreement_fields_through(client, urlopen):
+    status = {
+        "transactionId": TRANSACTION_ID, "orderId": "ord_1", "status": "requires_capture",
+        "amount": 0, "currency": "EUR", "isRecurring": False, "verifyOnly": True,
+        "agreement": {"id": AGREEMENT_ID, "status": "pending"},
+        "createdAt": "2026-10-11T09:30:00Z", "sequence": 0,
+    }
+    urlopen((200, {"success": True, "data": status}))
+
+    result = client.get_status(TRANSACTION_ID)
+
+    assert result == status
 
 
 def test_get_status_passes_the_stored_payment_method_through_and_leaves_payment_method_a_string(client, urlopen):
@@ -1679,6 +1991,67 @@ def test_charge_sends_the_callers_key_and_the_description(client, urlopen):
     }
 
 
+def test_a_charge_for_an_agreement_sends_the_agreement_and_extra_fields_signed(client, urlopen):
+    recorder = urlopen(_placed(dict(CHARGE, agreementId=AGREEMENT_ID, sequence=0)))
+
+    _charge(client, agreement_id=AGREEMENT_ID, extra={"newField": True, "currency": "HUF"})
+
+    request = recorder.last
+    assert json.loads(request.data) == {
+        "amount": 2500, "currency": "HUF", "orderReference": "order-1043",
+        "agreementId": AGREEMENT_ID, "newField": True,
+    }
+    _assert_signed(request, "POST", CHARGE_PATH)
+
+
+def test_a_charge_passes_the_agreement_id_and_sequence_through(client, urlopen):
+    urlopen(_placed(dict(CHARGE, status="pending", agreementId=AGREEMENT_ID, sequence=0)))
+
+    charge = _charge(client, agreement_id=AGREEMENT_ID)
+
+    assert charge["agreementId"] == AGREEMENT_ID
+    assert charge["sequence"] == 0
+
+
+def test_a_402_without_a_decline_class_is_a_result_with_decline_class_none(client, urlopen):
+    """declineClass can be null. A 402 without one is still a result, never an error."""
+    declined = dict(CHARGE, status="failed", declineCode="05")
+    urlopen((402, {
+        "success": False, "data": declined,
+        "error": {"code": "CHARGE_DECLINED", "message": "The payment provider declined the charge.", "statusCode": 402},
+    }))
+
+    charge = _charge(client)
+
+    assert charge["status"] == "failed"
+    assert charge["declineClass"] is None
+    assert charge["declineCode"] == "05"
+
+
+def test_an_agreement_charge_refusal_is_a_charge_error_with_its_code(client, urlopen):
+    body = _gateway_error(422, "AGREEMENT_PERIOD_ALREADY_CHARGED", "This period was already charged.")
+    urlopen((422, body))
+
+    with pytest.raises(ChargeError) as caught:
+        _charge(client, agreement_id=AGREEMENT_ID)
+
+    assert caught.value.http_status == 422
+    assert caught.value.error_code == "AGREEMENT_PERIOD_ALREADY_CHARGED"
+    assert caught.value.charge is None
+    assert caught.value.result == body
+
+
+def test_a_charge_under_an_unknown_agreement_is_an_api_error_404_with_its_code(client, urlopen):
+    urlopen((404, _gateway_error(404, "AGREEMENT_NOT_FOUND", "Agreement not found.")))
+
+    with pytest.raises(ApiError) as caught:
+        _charge(client, agreement_id=AGREEMENT_ID)
+
+    assert not isinstance(caught.value, ChargeError)
+    assert caught.value.http_status == 404
+    assert caught.value.error_code == "AGREEMENT_NOT_FOUND"
+
+
 def test_a_402_decline_is_a_result_with_a_decline_class_not_an_exception(client, urlopen):
     declined = dict(CHARGE, status="failed", declineClass="soft_funds", declineCode="51")
     urlopen((402, {
@@ -1688,7 +2061,7 @@ def test_a_402_decline_is_a_result_with_a_decline_class_not_an_exception(client,
 
     charge = _charge(client)
 
-    assert charge == declined
+    assert charge == dict(declined, agreementId=None)
     assert charge["status"] == "failed"
     assert charge["declineClass"] == "soft_funds"
     assert charge["declineCode"] == "51"
@@ -1718,7 +2091,7 @@ def test_a_charge_answered_with_a_code_is_a_charge_error_keeping_code_status_and
     assert error.http_status == 502
     assert error.error_code == "CHARGE_OUTCOME_UNKNOWN"
     assert str(error) == "The payment provider gave no verdict."
-    assert error.charge == dict(unknown, declineClass=None, declineCode=None)
+    assert error.charge == dict(unknown, declineClass=None, declineCode=None, agreementId=None)
     assert error.transaction_id == CHARGE["transactionId"]
 
 
@@ -2051,3 +2424,950 @@ def test_a_2xx_without_a_refund_body_is_an_api_error_not_a_half_built_refund(cli
     with pytest.raises(ApiError) as raised:
         client.create_refund(TRANSACTION_ID, idempotency_key=REFUND_KEY)
     assert raised.value.error_code == "UNEXPECTED_RESPONSE"
+
+
+def test_create_refund_sends_extra_fields_signed(client, urlopen):
+    recorder = urlopen(_accepted())
+
+    client.create_refund(
+        TRANSACTION_ID, amount=1500, idempotency_key=REFUND_KEY, extra={"newField": "x"},
+    )
+
+    request = recorder.last
+    assert json.loads(request.data) == {"amount": 1500, "newField": "x"}
+    _assert_signed(request, "POST", REFUNDS_PATH)
+
+
+# --- refund list -------------------------------------------------------------
+
+REFUND_LIST = {
+    "transactionId": TRANSACTION_ID,
+    "currency": "HUF",
+    "refundedAmount": 2000,
+    "refundableAmount": 500,
+    "refunds": [
+        dict(QUEUED_REFUND, status="succeeded", completedAt="2026-09-26T10:05:40Z"),
+        {"refundId": "re_0123456789abcdef0123456789abcdef", "transactionId": TRANSACTION_ID,
+         "status": "failed", "currency": "HUF", "failureCode": "REFUND_FAILED"},
+    ],
+}
+
+
+def test_list_refunds_signs_an_empty_key_and_body_and_gives_every_refund_one_shape(client, urlopen):
+    recorder = urlopen((200, {"success": True, "data": REFUND_LIST}))
+
+    listing = client.list_refunds(TRANSACTION_ID.upper())
+
+    request = recorder.last
+    headers = _headers(request)
+    assert request.get_method() == "GET"
+    assert request.full_url == BASE_URL + REFUNDS_PATH
+    assert request.data is None
+    assert "idempotency-key" not in headers
+    assert headers["x-signature"] == sign_request(SECRET, headers["x-timestamp"], "GET", REFUNDS_PATH, "", "")
+    assert listing["refundedAmount"] == 2000
+    assert listing["refundableAmount"] == 500
+    assert listing["currency"] == "HUF"
+    assert listing["refunds"][0] == dict(REFUND_LIST["refunds"][0], failureCode=None, failureMessage=None)
+    assert listing["refunds"][1]["amount"] is None
+    assert listing["refunds"][1]["completedAt"] is None
+    assert listing["refunds"][1]["failureCode"] == "REFUND_FAILED"
+
+
+def test_list_refunds_of_a_payment_without_refunds_is_an_empty_list(client, urlopen):
+    urlopen((200, {"success": True, "data": dict(REFUND_LIST, refundedAmount=0, refunds=[])}))
+
+    assert client.list_refunds(TRANSACTION_ID)["refunds"] == []
+
+
+def test_list_refunds_of_an_unknown_payment_is_a_refund_error_that_is_not_retryable(client, urlopen):
+    urlopen(_refund_error(404, "PAYMENT_NOT_FOUND"))
+
+    with pytest.raises(RefundError) as caught:
+        client.list_refunds(TRANSACTION_ID)
+
+    assert caught.value.http_status == 404
+    assert caught.value.error_code == "PAYMENT_NOT_FOUND"
+    assert caught.value.retryable is False
+
+
+def test_list_refunds_on_a_503_is_a_transport_error(client, urlopen):
+    urlopen(_refund_error(503, "MERCHANT_API_UNAVAILABLE"))
+
+    with pytest.raises(TransportError):
+        client.list_refunds(TRANSACTION_ID)
+
+
+# --- integration contract ----------------------------------------------------
+
+
+def test_the_integration_contract_is_read_without_a_signature(client, urlopen):
+    """The route is anonymous. Sending no credentials keeps a success here from looking
+    like a credential check, which is ping's job."""
+    contract = {"sdks": ["python"], "recurring": {"consentTextVersions": ["recurring-2026-09"]}}
+    recorder = urlopen((200, {"success": True, "data": contract}))
+
+    result = client.get_integration_contract()
+
+    request = recorder.last
+    headers = _headers(request)
+    assert request.get_method() == "GET"
+    assert request.full_url == BASE_URL + CONTRACT_PATH
+    assert request.data is None
+    for header in ("x-api-key-id", "x-timestamp", "x-signature", "idempotency-key"):
+        assert header not in headers
+    assert result == contract
+
+
+@pytest.mark.parametrize(
+    "outcome, error",
+    [
+        ((429, RATE_LIMITED_BODY, {"Retry-After": "5"}), RateLimitError),
+        ((503, {"success": False}), TransportError),
+    ],
+    ids=["429", "503"],
+)
+def test_the_integration_contract_keeps_the_shared_failure_rules(client, urlopen, outcome, error):
+    urlopen(outcome)
+
+    with pytest.raises(error):
+        client.get_integration_contract()
+
+
+# --- plans and agreements ----------------------------------------------------
+
+PLAN_ID = "plan_0123456789abcdef0123456789abcdef"
+PLAN = {
+    "id": PLAN_ID,
+    "name": "Pro monthly",
+    "amount": 2500,
+    "currency": "EUR",
+    "intervalUnit": "month",
+    "intervalCount": 1,
+    "trialDays": 0,
+    "status": "active",
+    "createdAt": "2026-10-11T09:00:00Z",
+}
+AGREEMENT = {
+    "id": AGREEMENT_ID,
+    "planId": PLAN_ID,
+    "customerReference": "cus-42",
+    "status": "pending",
+    "amount": 2500,
+    "currency": "EUR",
+    "intervalUnit": "month",
+    "intervalCount": 1,
+    "trialDays": 0,
+    "version": 1,
+    "sequence": 0,
+    "createdAt": "2026-10-11T09:05:00Z",
+}
+#: Agreement consent names the merchant's own wording; session consent names the platform's.
+AGREEMENT_CONSENT = {"textVersion": "terms-2026-09", "acceptedAt": "2026-10-11T09:04:00Z", "ip": "203.0.113.7"}
+
+
+def _created(data):
+    return (201, {"success": True, "data": data})
+
+
+def _plan_arguments(**overrides):
+    arguments = dict(
+        name="Pro monthly", amount=2500, currency="EUR", interval_unit="month",
+        idempotency_key="plan-pro-monthly",
+    )
+    arguments.update(overrides)
+    return arguments
+
+
+def test_create_plan_signs_the_key_and_sends_only_the_fields_given(client, urlopen):
+    recorder = urlopen(_created(PLAN))
+
+    plan = client.create_plan(**_plan_arguments())
+
+    request = recorder.last
+    assert request.get_method() == "POST"
+    assert request.full_url == BASE_URL + PLANS_PATH
+    assert _headers(request)["idempotency-key"] == "plan-pro-monthly"
+    _assert_signed(request, "POST", PLANS_PATH)
+    assert json.loads(request.data) == {
+        "name": "Pro monthly", "amount": 2500, "currency": "EUR", "intervalUnit": "month",
+    }
+    assert plan == PLAN
+
+
+def test_create_plan_sends_trial_days_0_and_every_optional_field(client, urlopen):
+    recorder = urlopen(_created(PLAN))
+
+    client.create_plan(**_plan_arguments(
+        interval_count=3, period_count=4, trial_days=0, cancel_url="https://shop.example/cancel",
+    ))
+
+    assert json.loads(recorder.last.data) == {
+        "name": "Pro monthly", "amount": 2500, "currency": "EUR", "intervalUnit": "month",
+        "intervalCount": 3, "periodCount": 4, "trialDays": 0,
+        "cancelUrl": "https://shop.example/cancel",
+    }
+
+
+def test_create_plan_sends_extra_fields_in_the_signed_body_and_they_win(client, urlopen):
+    recorder = urlopen(_created(PLAN))
+
+    client.create_plan(**_plan_arguments(
+        interval_count=1, extra={"intervalCount": 2, "futureField": {"a": 1}},
+    ))
+
+    sent = json.loads(recorder.last.data)
+    assert sent["intervalCount"] == 2
+    assert sent["futureField"] == {"a": 1}
+    _assert_signed(recorder.last, "POST", PLANS_PATH)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"idempotency_key": None},
+        {"name": ""},
+        {"amount": 0},
+        {"amount": True},
+        {"amount": 25.0},
+        {"amount": "2500"},
+        {"interval_count": 0},
+        {"period_count": 1.5},
+        {"trial_days": -1},
+    ],
+    ids=["no-key", "no-name", "zero-amount", "bool-amount", "float-amount", "string-amount",
+         "zero-interval", "float-periods", "negative-trial"],
+)
+def test_create_plan_refuses_bad_input_before_any_request(client, urlopen, overrides):
+    recorder = urlopen(_created(PLAN))
+
+    with pytest.raises(ValueError):
+        client.create_plan(**_plan_arguments(**overrides))
+
+    assert recorder.requests == []
+
+
+def test_list_plans_returns_every_plan_of_the_bare_list(client, urlopen):
+    archived = dict(
+        PLAN, id="plan_fedcba9876543210fedcba9876543210", status="archived",
+        archivedAt="2026-10-01T00:00:00Z",
+    )
+    recorder = urlopen((200, {"success": True, "data": [PLAN, archived]}))
+
+    plans = client.list_plans()
+
+    request = recorder.last
+    assert request.get_method() == "GET"
+    assert request.full_url == BASE_URL + PLANS_PATH
+    assert request.data is None
+    assert "idempotency-key" not in _headers(request)
+    _assert_signed(request, "GET", PLANS_PATH)
+    assert plans == [PLAN, archived]
+
+
+def test_list_plans_with_no_plans_is_an_empty_list(client, urlopen):
+    urlopen((200, {"success": True, "data": []}))
+
+    assert client.list_plans() == []
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [{"success": True}, {"success": True, "data": PLAN}],
+    ids=["no-data", "an-object"],
+)
+def test_list_plans_without_a_list_is_an_unexpected_response(client, urlopen, envelope):
+    urlopen((200, envelope))
+
+    with pytest.raises(ApiError) as caught:
+        client.list_plans()
+
+    assert caught.value.error_code == "UNEXPECTED_RESPONSE"
+    assert caught.value.http_status == 200
+
+
+def test_get_plan_signs_the_id_exactly_as_it_was_returned(client, urlopen):
+    """Plan ids are case-sensitive, so the SDK never changes their case."""
+    mixed_case = "plan_0123456789ABCDEF0123456789abcdef"
+    recorder = urlopen((200, {"success": True, "data": dict(PLAN, id=mixed_case)}))
+
+    plan = client.get_plan(mixed_case)
+
+    path = PLANS_PATH + "/" + mixed_case
+    assert recorder.last.get_method() == "GET"
+    assert recorder.last.full_url == BASE_URL + path
+    _assert_signed(recorder.last, "GET", path)
+    assert plan["id"] == mixed_case
+
+
+@pytest.mark.parametrize(
+    "method, arguments",
+    [
+        ("get_plan", {}),
+        ("update_plan", {"name": "Pro"}),
+        ("delete_plan", {}),
+        ("get_agreement", {}),
+        ("cancel_agreement", {}),
+    ],
+)
+@pytest.mark.parametrize(
+    "bad_id",
+    [None, "", "   ", "plan_1/archive", "plan_1?status=active", "plan 1"],
+    ids=["none", "empty", "blank", "slash", "query", "space"],
+)
+def test_an_id_that_is_not_one_path_segment_is_refused_before_any_request(
+    client, urlopen, method, arguments, bad_id
+):
+    recorder = urlopen((200, {"success": True, "data": PLAN}))
+
+    with pytest.raises(ValueError):
+        getattr(client, method)(bad_id, **arguments)
+
+    assert recorder.requests == []
+
+
+def test_update_plan_sends_no_idempotency_key_and_can_clear_the_trial_and_the_cancel_page(
+    client, urlopen
+):
+    recorder = urlopen((200, {"success": True, "data": PLAN}))
+
+    plan = client.update_plan(PLAN_ID, trial_days=0, cancel_url="")
+
+    request = recorder.last
+    path = PLANS_PATH + "/" + PLAN_ID
+    assert request.get_method() == "PATCH"
+    assert request.full_url == BASE_URL + path
+    assert "idempotency-key" not in _headers(request)
+    _assert_signed(request, "PATCH", path)
+    assert json.loads(request.data) == {"trialDays": 0, "cancelUrl": ""}
+    assert plan == PLAN
+
+
+def test_update_plan_sends_only_the_fields_given(client, urlopen):
+    recorder = urlopen((200, {"success": True, "data": PLAN}))
+
+    client.update_plan(PLAN_ID, name="Pro monthly 2026", extra={"futureField": 1})
+
+    assert json.loads(recorder.last.data) == {"name": "Pro monthly 2026", "futureField": 1}
+
+
+def test_update_plan_with_nothing_to_change_is_refused_before_any_request(client, urlopen):
+    recorder = urlopen((200, {"success": True, "data": PLAN}))
+
+    with pytest.raises(ValueError):
+        client.update_plan(PLAN_ID)
+
+    assert recorder.requests == []
+
+
+@pytest.mark.parametrize(
+    "method, path",
+    [
+        ("delete_plan", PLANS_PATH + "/" + PLAN_ID),
+        ("cancel_agreement", AGREEMENTS_PATH + "/" + AGREEMENT_ID),
+    ],
+    ids=["archive-plan", "cancel-agreement"],
+)
+def test_archive_and_cancel_sign_an_empty_key_and_body_and_return_none_on_204(
+    client, urlopen, method, path
+):
+    recorder = urlopen((204, b""))
+
+    assert getattr(client, method)(path.rsplit("/", 1)[1]) is None
+
+    request = recorder.last
+    assert request.get_method() == "DELETE"
+    assert request.full_url == BASE_URL + path
+    assert request.data is None
+    assert "idempotency-key" not in _headers(request)
+    _assert_signed(request, "DELETE", path)
+
+
+def test_create_agreement_sends_the_card_the_maximum_and_the_consent_as_given(client, urlopen):
+    recorded = dict(AGREEMENT_CONSENT, receivedAt="2026-10-11T09:05:00Z")
+    recorder = urlopen(_created(dict(
+        AGREEMENT, storedPaymentMethodId=PAYMENT_METHOD_ID, maxAmountPerPeriod=5000, consent=recorded,
+    )))
+
+    agreement = client.create_agreement(
+        PLAN_ID, "cus-42", stored_payment_method_id=PAYMENT_METHOD_ID, max_amount_per_period=5000,
+        consent=AGREEMENT_CONSENT, idempotency_key="agr-cus-42",
+    )
+
+    request = recorder.last
+    assert request.get_method() == "POST"
+    assert request.full_url == BASE_URL + AGREEMENTS_PATH
+    assert _headers(request)["idempotency-key"] == "agr-cus-42"
+    _assert_signed(request, "POST", AGREEMENTS_PATH)
+    assert json.loads(request.data) == {
+        "planId": PLAN_ID,
+        "customerReference": "cus-42",
+        "storedPaymentMethodId": PAYMENT_METHOD_ID,
+        "maxAmountPerPeriod": 5000,
+        "consent": AGREEMENT_CONSENT,
+    }
+    assert agreement["consent"] == recorded
+
+
+def test_create_agreement_without_a_card_sends_only_the_plan_and_the_customer(client, urlopen):
+    recorder = urlopen(_created(AGREEMENT))
+
+    agreement = client.create_agreement(PLAN_ID, "cus-42", idempotency_key="agr-cus-42")
+
+    assert json.loads(recorder.last.data) == {"planId": PLAN_ID, "customerReference": "cus-42"}
+    assert agreement["status"] == "pending"
+    assert "nextChargeAt" not in agreement
+
+
+def test_create_agreement_sends_extra_fields_in_the_signed_body_and_they_win(client, urlopen):
+    recorder = urlopen(_created(AGREEMENT))
+
+    client.create_agreement(
+        PLAN_ID, "cus-42", idempotency_key="agr-cus-42",
+        extra={"customerReference": "cus-43", "futureField": True},
+    )
+
+    sent = json.loads(recorder.last.data)
+    assert sent["customerReference"] == "cus-43"
+    assert sent["futureField"] is True
+    _assert_signed(recorder.last, "POST", AGREEMENTS_PATH)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"idempotency_key": None},
+        {"plan_id": None},
+        {"customer_reference": ""},
+        {"max_amount_per_period": 0},
+        {"max_amount_per_period": 50.0},
+    ],
+    ids=["no-key", "no-plan", "no-customer", "zero-maximum", "float-maximum"],
+)
+def test_create_agreement_refuses_bad_input_before_any_request(client, urlopen, overrides):
+    recorder = urlopen(_created(AGREEMENT))
+    arguments = dict(plan_id=PLAN_ID, customer_reference="cus-42", idempotency_key="agr-cus-42")
+    arguments.update(overrides)
+
+    with pytest.raises(ValueError):
+        client.create_agreement(**arguments)
+
+    assert recorder.requests == []
+
+
+def test_get_agreement_returns_the_past_due_fields_the_gateway_sends(client, urlopen):
+    past_due = dict(
+        AGREEMENT, status="past_due", pastDueReason="card_expired",
+        pastDueAt="2026-11-11T09:05:00Z", sequence=3,
+    )
+    recorder = urlopen((200, {"success": True, "data": past_due}))
+
+    agreement = client.get_agreement(AGREEMENT_ID)
+
+    path = AGREEMENTS_PATH + "/" + AGREEMENT_ID
+    assert recorder.last.get_method() == "GET"
+    assert recorder.last.full_url == BASE_URL + path
+    _assert_signed(recorder.last, "GET", path)
+    assert agreement == past_due
+
+
+@pytest.mark.parametrize(
+    "call, status, code",
+    [
+        (lambda c: c.get_plan(PLAN_ID), 404, "PLAN_NOT_FOUND"),
+        (lambda c: c.delete_plan(PLAN_ID), 404, "PLAN_NOT_FOUND"),
+        (lambda c: c.create_plan(**_plan_arguments()), 422, "IDEMPOTENCY_KEY_REUSED"),
+        (lambda c: c.create_agreement(PLAN_ID, "cus-42", idempotency_key="agr-1"), 409, "PLAN_NOT_ACTIVE"),
+        (
+            lambda c: c.create_agreement(
+                PLAN_ID, "cus-42", max_amount_per_period=5000, idempotency_key="agr-1",
+            ),
+            422,
+            "AGREEMENT_CONSENT_REQUIRED",
+        ),
+        (lambda c: c.get_agreement(AGREEMENT_ID), 404, "AGREEMENT_NOT_FOUND"),
+        (lambda c: c.cancel_agreement(AGREEMENT_ID), 409, "AGREEMENT_ENDED"),
+    ],
+    ids=["plan-not-found", "archive-not-found", "key-reused", "plan-not-active",
+         "consent-required", "agreement-not-found", "agreement-ended"],
+)
+def test_a_plan_or_agreement_refusal_is_an_api_error_with_the_code_and_the_envelope(
+    client, urlopen, call, status, code
+):
+    body = _gateway_error(status, code, "Refused")
+    urlopen((status, body))
+
+    with pytest.raises(ApiError) as caught:
+        call(client)
+
+    assert caught.value.http_status == status
+    assert caught.value.error_code == code
+    assert caught.value.result == body
+
+
+def test_a_maximum_below_the_plan_amount_carries_the_minimum_in_the_result(client, urlopen):
+    body = _gateway_error(422, "MAX_AMOUNT_BELOW_PLAN_AMOUNT", "maxAmountPerPeriod 2000 is below")
+    body["error"]["validationErrors"] = [{
+        "field": "maxAmountPerPeriod", "code": "MAX_AMOUNT_BELOW_PLAN_AMOUNT",
+        "message": "maxAmountPerPeriod 2000 is below", "params": {"min": 2500},
+    }]
+    urlopen((422, body))
+
+    with pytest.raises(ApiError) as caught:
+        client.create_agreement(
+            PLAN_ID, "cus-42", max_amount_per_period=2000, consent=AGREEMENT_CONSENT,
+            idempotency_key="agr-cus-42",
+        )
+
+    assert caught.value.error_code == "MAX_AMOUNT_BELOW_PLAN_AMOUNT"
+    assert caught.value.result["error"]["validationErrors"][0]["params"]["min"] == 2500
+
+
+@pytest.mark.parametrize(
+    "outcome, error",
+    [
+        ((429, RATE_LIMITED_BODY, {"Retry-After": "5"}), RateLimitError),
+        (
+            (403, _gateway_error(403, "INSUFFICIENT_SCOPE", "This route needs the payments scope.")),
+            AuthenticationError,
+        ),
+        ((503, {"success": False}), TransportError),
+    ],
+    ids=["429", "403", "503"],
+)
+def test_the_plan_and_agreement_routes_keep_the_shared_failure_rules(client, urlopen, outcome, error):
+    urlopen(outcome)
+
+    with pytest.raises(error):
+        client.list_plans()
+
+
+# --- webhook endpoints -------------------------------------------------------
+
+WEBHOOK_ID = "0f8fad5b-d9cb-469f-a165-70867728950e"
+WEBHOOK_PATH = WEBHOOKS_PATH + "/" + WEBHOOK_ID
+WEBHOOK_ENDPOINT = {
+    "id": WEBHOOK_ID,
+    "url": "https://shop.example/webhooks/dominaite",
+    "events": ["payment.succeeded", "payment.refunded"],
+    "status": "active",
+    "createdAt": "2026-10-11T09:00:00Z",
+}
+WEBHOOK_SECRET = "whsec_" + "ab" * 32
+
+
+def _webhook_arguments(**overrides):
+    arguments = dict(
+        url=WEBHOOK_ENDPOINT["url"], events=["payment.succeeded", "payment.refunded"],
+        idempotency_key="webhook-shop-1",
+    )
+    arguments.update(overrides)
+    return arguments
+
+
+def test_create_webhook_endpoint_signs_the_key_and_returns_the_secret(client, urlopen):
+    recorder = urlopen(_created(dict(WEBHOOK_ENDPOINT, secret=WEBHOOK_SECRET)))
+
+    endpoint = client.create_webhook_endpoint(**_webhook_arguments())
+
+    request = recorder.last
+    assert request.get_method() == "POST"
+    assert request.full_url == BASE_URL + WEBHOOKS_PATH
+    assert _headers(request)["idempotency-key"] == "webhook-shop-1"
+    _assert_signed(request, "POST", WEBHOOKS_PATH)
+    assert json.loads(request.data) == {
+        "url": "https://shop.example/webhooks/dominaite",
+        "events": ["payment.succeeded", "payment.refunded"],
+    }
+    assert endpoint["secret"] == WEBHOOK_SECRET
+
+
+def test_a_replayed_create_answers_the_endpoint_without_a_secret(client, urlopen):
+    urlopen(_created(WEBHOOK_ENDPOINT))
+
+    endpoint = client.create_webhook_endpoint(**_webhook_arguments())
+
+    assert endpoint == WEBHOOK_ENDPOINT
+    assert "secret" not in endpoint
+
+
+def test_create_webhook_endpoint_sends_any_sequence_of_events_and_extra_fields(client, urlopen):
+    recorder = urlopen(_created(WEBHOOK_ENDPOINT))
+
+    client.create_webhook_endpoint(**_webhook_arguments(
+        events=("payment.succeeded", "agreement.activated"), extra={"description": "Shop"},
+    ))
+
+    sent = json.loads(recorder.last.data)
+    assert sent["events"] == ["payment.succeeded", "agreement.activated"]
+    assert sent["description"] == "Shop"
+    _assert_signed(recorder.last, "POST", WEBHOOKS_PATH)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"idempotency_key": None}, {"url": ""}, {"events": []}, {"events": "payment.succeeded"}],
+    ids=["no-key", "no-url", "no-events", "a-bare-string"],
+)
+def test_create_webhook_endpoint_refuses_bad_input_before_any_request(client, urlopen, overrides):
+    recorder = urlopen(_created(WEBHOOK_ENDPOINT))
+
+    with pytest.raises(ValueError):
+        client.create_webhook_endpoint(**_webhook_arguments(**overrides))
+
+    assert recorder.requests == []
+
+
+def test_list_webhook_endpoints_returns_every_endpoint_of_the_bare_list(client, urlopen):
+    inactive = dict(WEBHOOK_ENDPOINT, id="7c9e6679-7425-40de-944b-e07fc1f90ae7", status="inactive")
+    recorder = urlopen((200, {"success": True, "data": [WEBHOOK_ENDPOINT, inactive]}))
+
+    endpoints = client.list_webhook_endpoints()
+
+    request = recorder.last
+    assert request.get_method() == "GET"
+    assert request.full_url == BASE_URL + WEBHOOKS_PATH
+    assert request.data is None
+    assert "idempotency-key" not in _headers(request)
+    _assert_signed(request, "GET", WEBHOOKS_PATH)
+    assert endpoints == [WEBHOOK_ENDPOINT, inactive]
+
+
+@pytest.mark.parametrize(
+    "webhook_id",
+    [WEBHOOK_ID.upper(), " " + WEBHOOK_ID + " ", uuid.UUID(WEBHOOK_ID)],
+    ids=["upper-case", "padded", "uuid-object"],
+)
+def test_delete_webhook_endpoint_signs_the_lowercase_id_and_returns_none_on_204(
+    client, urlopen, webhook_id
+):
+    recorder = urlopen((204, b""))
+
+    assert client.delete_webhook_endpoint(webhook_id) is None
+
+    request = recorder.last
+    assert request.get_method() == "DELETE"
+    assert request.full_url == BASE_URL + WEBHOOK_PATH
+    assert request.data is None
+    assert "idempotency-key" not in _headers(request)
+    _assert_signed(request, "DELETE", WEBHOOK_PATH)
+
+
+@pytest.mark.parametrize(
+    "webhook_id",
+    [None, "", "whk_123", WEBHOOK_ID + "/x"],
+    ids=["none", "empty", "not-a-uuid", "two-segments"],
+)
+def test_delete_webhook_endpoint_refuses_an_id_that_is_not_a_uuid(client, urlopen, webhook_id):
+    recorder = urlopen((204, b""))
+
+    with pytest.raises(ValueError):
+        client.delete_webhook_endpoint(webhook_id)
+
+    assert recorder.requests == []
+
+
+@pytest.mark.parametrize(
+    "call, status, code",
+    [
+        (lambda c: c.create_webhook_endpoint(**_webhook_arguments()), 400, "WEBHOOK_URL_REJECTED"),
+        (lambda c: c.create_webhook_endpoint(**_webhook_arguments()), 400, "VALIDATION_ERROR"),
+        (lambda c: c.create_webhook_endpoint(**_webhook_arguments()), 409, "WEBHOOK_LIMIT_REACHED"),
+        (lambda c: c.create_webhook_endpoint(**_webhook_arguments()), 409, "DUPLICATE_REQUEST"),
+        (lambda c: c.create_webhook_endpoint(**_webhook_arguments()), 422, "IDEMPOTENCY_KEY_REUSED"),
+        (lambda c: c.delete_webhook_endpoint(WEBHOOK_ID), 404, "WEBHOOK_NOT_FOUND"),
+    ],
+    ids=["url-rejected", "unknown-event", "limit", "in-flight", "key-reused", "not-found"],
+)
+def test_a_webhook_endpoint_refusal_is_an_api_error_with_the_code_and_the_envelope(
+    client, urlopen, call, status, code
+):
+    body = _gateway_error(status, code, "Refused")
+    urlopen((status, body))
+
+    with pytest.raises(ApiError) as caught:
+        call(client)
+
+    assert caught.value.http_status == status
+    assert caught.value.error_code == code
+    assert caught.value.result == body
+
+
+def test_an_endpoint_the_key_already_registered_is_named_in_the_result(client, urlopen):
+    body = _gateway_error(409, "WEBHOOK_ALREADY_REGISTERED", "This key already registered an endpoint.")
+    body["error"]["params"] = {"webhookId": WEBHOOK_ID}
+    urlopen((409, body))
+
+    with pytest.raises(ApiError) as caught:
+        client.create_webhook_endpoint(**_webhook_arguments())
+
+    assert caught.value.error_code == "WEBHOOK_ALREADY_REGISTERED"
+    assert caught.value.result["error"]["params"]["webhookId"] == WEBHOOK_ID
+
+
+def test_a_key_without_the_webhooks_scope_gets_the_scope_named(client, urlopen):
+    message = "This API key does not hold the webhooks:manage scope."
+    urlopen((403, _gateway_error(403, "INSUFFICIENT_SCOPE", message)))
+
+    with pytest.raises(AuthenticationError) as caught:
+        client.list_webhook_endpoints()
+
+    assert caught.value.http_status == 403
+    assert caught.value.error_code == "INSUFFICIENT_SCOPE"
+    assert "webhooks:manage" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "outcome, error",
+    [
+        ((429, RATE_LIMITED_BODY, {"Retry-After": "5"}), RateLimitError),
+        ((503, {"success": False}), TransportError),
+    ],
+    ids=["429", "503"],
+)
+def test_the_webhook_endpoint_routes_keep_the_shared_failure_rules(client, urlopen, outcome, error):
+    urlopen(outcome)
+
+    with pytest.raises(error):
+        client.create_webhook_endpoint(**_webhook_arguments())
+
+
+# --- transactions ------------------------------------------------------------
+
+TRANSACTION_ROW = {
+    "transactionId": TRANSACTION_ID,
+    "orderReference": "order-1042",
+    "type": "payment",
+    "status": "succeeded",
+    "amount": 2500,
+    "currency": "EUR",
+    "createdAt": "2026-10-01T08:00:00Z",
+    "completedAt": "2026-10-01T08:01:00Z",
+}
+
+
+def _page(items, next_cursor=None):
+    return (200, {"success": True, "data": {"items": items, "nextCursor": next_cursor}})
+
+
+def _query(request):
+    return urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
+
+
+def test_list_transactions_signs_the_bare_path_and_sends_the_query_in_the_url(client, urlopen):
+    recorder = urlopen(_page([TRANSACTION_ROW], "cur_2"))
+
+    page = client.list_transactions(
+        "2026-10-01T00:00:00Z", "2026-10-08T00:00:00+02:00", status="succeeded", limit=2,
+        cursor="cur_1",
+    )
+
+    request = recorder.last
+    url = urllib.parse.urlsplit(request.full_url)
+    assert request.get_method() == "GET"
+    assert request.data is None
+    assert "idempotency-key" not in _headers(request)
+    assert "{0}://{1}{2}".format(url.scheme, url.netloc, url.path) == BASE_URL + TRANSACTIONS_PATH
+    _assert_signed(request, "GET", TRANSACTIONS_PATH)
+    assert _query(request) == {
+        "from": ["2026-10-01T00:00:00Z"],
+        "to": ["2026-10-08T00:00:00+02:00"],
+        "status": ["succeeded"],
+        "limit": ["2"],
+        "cursor": ["cur_1"],
+    }
+    # A raw "+" would reach the API as a space and move the window.
+    assert "%2B02%3A00" in url.query
+    assert page == {"items": [TRANSACTION_ROW], "nextCursor": "cur_2"}
+
+
+def test_list_transactions_sends_only_the_window_when_nothing_else_is_given(client, urlopen):
+    recorder = urlopen(_page([]))
+
+    page = client.list_transactions("2026-10-01", "2026-10-08")
+
+    assert _query(recorder.last) == {"from": ["2026-10-01"], "to": ["2026-10-08"]}
+    assert page == {"items": [], "nextCursor": None}
+
+
+def test_list_transactions_sends_datetimes_as_utc_dates_as_days_and_enum_statuses_as_values(
+    client, urlopen
+):
+    recorder = urlopen(_page([]))
+    plus_two = datetime.timezone(datetime.timedelta(hours=2))
+
+    client.list_transactions(
+        datetime.datetime(2026, 10, 1, 2, 0, tzinfo=plus_two), datetime.date(2026, 10, 8),
+        status=PaymentStatus.REFUNDED,
+    )
+
+    assert _query(recorder.last) == {
+        "from": ["2026-10-01T00:00:00Z"], "to": ["2026-10-08"], "status": ["refunded"],
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"from_": datetime.datetime(2026, 10, 1)},
+        {"from_": ""},
+        {"to": None},
+        {"limit": 0},
+        {"limit": "50"},
+        {"limit": True},
+    ],
+    ids=["naive-datetime", "empty-from", "no-to", "zero-limit", "string-limit", "bool-limit"],
+)
+def test_list_transactions_refuses_bad_input_before_any_request(client, urlopen, overrides):
+    recorder = urlopen(_page([]))
+    arguments = dict(from_="2026-10-01T00:00:00Z", to="2026-10-08T00:00:00Z")
+    arguments.update(overrides)
+
+    with pytest.raises(ValueError):
+        client.list_transactions(**arguments)
+
+    assert recorder.requests == []
+
+
+def test_list_transactions_reads_every_page_with_the_cursor(client, urlopen):
+    charge = dict(
+        TRANSACTION_ROW, transactionId=LETTERED_TRANSACTION_ID, type="charge",
+        storedPaymentMethodId=PAYMENT_METHOD_ID,
+    )
+    recorder = urlopen(_page([TRANSACTION_ROW], "cur_2"), _page([charge]))
+
+    rows, cursor = [], None
+    while True:
+        page = client.list_transactions("2026-10-01T00:00:00Z", "2026-10-08T00:00:00Z", cursor=cursor)
+        rows.extend(page["items"])
+        cursor = page["nextCursor"]
+        if cursor is None:
+            break
+
+    assert rows == [TRANSACTION_ROW, charge]
+    assert "cursor" not in _query(recorder.requests[0])
+    assert _query(recorder.requests[1])["cursor"] == ["cur_2"]
+    for request in recorder.requests:
+        _assert_signed(request, "GET", TRANSACTIONS_PATH)
+
+
+def test_a_page_without_a_next_cursor_is_the_last_page(client, urlopen):
+    urlopen((200, {"success": True, "data": {"items": [TRANSACTION_ROW]}}))
+
+    assert client.list_transactions("2026-10-01", "2026-10-08")["nextCursor"] is None
+
+
+def test_a_page_without_items_is_an_unexpected_response(client, urlopen):
+    urlopen((200, {"success": True, "data": {"nextCursor": None}}))
+
+    with pytest.raises(ApiError) as caught:
+        client.list_transactions("2026-10-01", "2026-10-08")
+
+    assert caught.value.error_code == "UNEXPECTED_RESPONSE"
+    assert caught.value.http_status == 200
+
+
+def test_an_invalid_window_is_an_api_error_with_the_whole_envelope(client, urlopen):
+    body = _gateway_error(400, "VALIDATION_ERROR", "from and to may be at most 31 days apart")
+    urlopen((400, body))
+
+    with pytest.raises(ApiError) as caught:
+        client.list_transactions("2026-09-01", "2026-10-08")
+
+    assert caught.value.http_status == 400
+    assert caught.value.error_code == "VALIDATION_ERROR"
+    assert caught.value.result == body
+
+
+def test_a_key_without_the_transactions_scope_gets_the_scope_named(client, urlopen):
+    message = "This API key does not hold the transactions:read scope."
+    urlopen((403, _gateway_error(403, "INSUFFICIENT_SCOPE", message)))
+
+    with pytest.raises(AuthenticationError) as caught:
+        client.list_transactions("2026-10-01", "2026-10-08")
+
+    assert caught.value.http_status == 403
+    assert "transactions:read" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "outcome, error",
+    [
+        ((429, RATE_LIMITED_BODY, {"Retry-After": "5"}), RateLimitError),
+        ((503, {"success": False}), TransportError),
+    ],
+    ids=["429", "503"],
+)
+def test_the_transaction_list_keeps_the_shared_failure_rules(client, urlopen, outcome, error):
+    urlopen(outcome)
+
+    with pytest.raises(error):
+        client.list_transactions("2026-10-01", "2026-10-08")
+
+
+# --- values the SDK has never seen -------------------------------------------
+
+
+def test_values_the_sdk_has_never_seen_pass_through_and_never_throw(client, urlopen):
+    """Every status, reason, class and type is a plain string. A value the API adds later
+    reaches the caller as sent, and the SDK never raises on it."""
+    stored = {"id": PAYMENT_METHOD_ID, "status": "suspended_v9", "retiredReason": "issuer_recall_v9"}
+    urlopen((200, {"success": True, "data": {
+        "transactionId": TRANSACTION_ID, "status": "settling_v9", "declineClass": "soft_issuer_v9",
+        "paymentMethod": "crypto_v9", "walletType": "mind_pay_v9", "storedPaymentMethod": stored,
+        "agreement": {"id": AGREEMENT_ID, "status": "paused_v9"},
+    }}))
+    status = client.get_status(TRANSACTION_ID)
+    assert status["status"] == "settling_v9"
+    assert status["declineClass"] == "soft_issuer_v9"
+    assert status["paymentMethod"] == "crypto_v9"
+    assert status["walletType"] == "mind_pay_v9"
+    assert status["storedPaymentMethod"]["status"] == "suspended_v9"
+    assert status["storedPaymentMethod"]["retiredReason"] == "issuer_recall_v9"
+    assert status["agreement"]["status"] == "paused_v9"
+    assert is_terminal(status["status"]) is False
+    assert is_paid(status["status"]) is False
+
+    urlopen(_placed(dict(CHARGE, status="under_review_v9", declineClass="soft_issuer_v9")))
+    charge = _charge(client)
+    assert charge["status"] == "under_review_v9"
+    assert charge["declineClass"] == "soft_issuer_v9"
+
+    urlopen(_accepted(dict(QUEUED_REFUND, status="reversed_v9", failureCode="REFUND_NEW_V9")))
+    refund = client.create_refund(TRANSACTION_ID, amount=1500, idempotency_key=REFUND_KEY)
+    assert refund["status"] == "reversed_v9"
+    assert refund["failureCode"] == "REFUND_NEW_V9"
+
+    urlopen((200, {"success": True, "data": dict(PLAN, status="paused_v9", intervalUnit="fortnight_v9")}))
+    plan = client.get_plan(PLAN_ID)
+    assert plan["status"] == "paused_v9"
+    assert plan["intervalUnit"] == "fortnight_v9"
+
+    urlopen((200, {"success": True, "data": dict(
+        AGREEMENT, status="on_hold_v9", pastDueReason="issuer_freeze_v9",
+    )}))
+    agreement = client.get_agreement(AGREEMENT_ID)
+    assert agreement["status"] == "on_hold_v9"
+    assert agreement["pastDueReason"] == "issuer_freeze_v9"
+
+    urlopen((200, {"success": True, "data": [dict(WEBHOOK_ENDPOINT, status="quarantined_v9")]}))
+    assert client.list_webhook_endpoints()[0]["status"] == "quarantined_v9"
+
+    urlopen(_page([dict(TRANSACTION_ROW, type="payout_v9", status="settling_v9")]))
+    row = client.list_transactions("2026-10-01", "2026-10-08")["items"][0]
+    assert row["type"] == "payout_v9"
+    assert row["status"] == "settling_v9"
+
+    recorder = urlopen(_created(WEBHOOK_ENDPOINT))
+    client.create_webhook_endpoint(**_webhook_arguments(events=["payment.settled_v9"]))
+    assert json.loads(recorder.last.data)["events"] == ["payment.settled_v9"]
+
+    body = json.dumps({
+        "id": "evt_1", "type": "payment.settled_v9", "createdAt": "2026-10-11T09:00:00Z",
+        "data": {"transactionId": TRANSACTION_ID, "status": "settling_v9"},
+    })
+    timestamp = "1760173200"
+    header = "t=" + timestamp + ",v1=" + sign_webhook(WEBHOOK_SECRET, timestamp, body)
+    event = verify_webhook(body, header, WEBHOOK_SECRET, now=int(timestamp))
+    assert event["type"] == "payment.settled_v9"
+    assert event["data"]["status"] == "settling_v9"
