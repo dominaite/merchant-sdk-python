@@ -415,6 +415,38 @@ Revoking signs an empty key and an empty body, like `get_status()`. A revoke tha
 `storedPaymentMethod` with `status` `revoked`, and a charge against it is refused with
 `PAYMENT_METHOD_NOT_ACTIVE`.
 
+### Save a card without a payment (verify-only)
+
+A verify-only session saves the card and takes no payment. The checkout places a small
+authorization to check the card. The platform releases it within about 15 minutes. Nobody is
+charged. We switch it on for your account. Until then, the API refuses the session with a 403:
+an `AuthenticationError` with `error_code` `VERIFY_ONLY_NOT_ENABLED`.
+
+```python
+session = client.create_checkout_session(
+    amount=0,
+    currency="EUR",
+    order_reference="verify-cus-42",
+    verify_only=True,
+    idempotency_key="verify-cus-42",
+)
+# ... the customer completes the hosted checkout ...
+status = client.get_status(session["transactionId"])
+stored = status.get("storedPaymentMethod")
+if stored and stored["status"] == StoredPaymentMethodStatus.ACTIVE:
+    db.save_card(customer_id, stored["id"])  # pm_...
+```
+
+1. Send `amount=0`. The API refuses every other amount on a verify-only session.
+2. Do not send `save_card=False`, `integration="fields"` or `agreement_id`. The API refuses
+   them on a verify-only session.
+3. Read the result from `storedPaymentMethod`, not from `status`. The status of a checked card
+   is `requires_capture`, then `cancelled` when the authorization is released.
+4. `verifyOnly` is `True` on the returned session and on the status read.
+5. `order_idempotency_key()` refuses an amount of 0. Use your own key, unique per check.
+6. The webhook events are `verification.succeeded` and `verification.failed`. A verify-only
+   session fires no `payment.*` events.
+
 ## Refunds
 
 Refund a paid payment in full or in part with `create_refund`. The amount is minor units of the
@@ -925,6 +957,19 @@ on your order timeout, and let webhooks do the rest.
 visible ASCII: letters, digits and punctuation, no spaces, no accented or non-Latin letters.
 Anything else raises `ValueError` before the request is sent. If your order ids are not ASCII,
 derive the key from something that is (your numeric order id, or a hash of the reference).
+
+## Fields the SDK does not model yet
+
+The API can accept a request field before this SDK has an argument for it. Send it in `extra`:
+
+```python
+session = client.create_checkout_session(..., extra={"newField": "value"})
+```
+
+1. `create_checkout_session` takes `extra`. It sends each key as given, in the signed body.
+2. A key in `extra` replaces the same field that an argument set.
+3. The API ignores a field that it does not know, so a misspelled name is not an error. Check
+   the name in the API reference.
 
 ## Running the tests
 

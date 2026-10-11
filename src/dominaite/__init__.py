@@ -35,7 +35,13 @@ from .exceptions import (
     TransportError,
     WebhookVerificationError,
 )
-from .models import Refund, StoredPaymentMethod
+from .models import (
+    CheckoutAgreement,
+    CheckoutSession,
+    CheckoutStatus,
+    Refund,
+    StoredPaymentMethod,
+)
 from .statuses import (
     CHARGE_STATUSES,
     CHECKOUT_INTEGRATIONS,
@@ -107,8 +113,11 @@ __all__ = [
     "ChargeEventData",
     "ChargeEventPaymentMethod",
     "ChargeStatus",
+    "CheckoutAgreement",
     "CheckoutIntegration",
     "CheckoutRefusedError",
+    "CheckoutSession",
+    "CheckoutStatus",
     "DeclineClass",
     "DominaiteClient",
     "DominaiteError",

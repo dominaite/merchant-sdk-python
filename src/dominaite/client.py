@@ -224,13 +224,22 @@ def _require_secure_base_url(base_url: str) -> None:
     )
 
 
-def _validate_money_params(amount: Any, currency: Any, order_reference: Any) -> None:
-    """The checks shared by every request that moves money."""
+def _validate_money_params(
+    amount: Any, currency: Any, order_reference: Any, allow_zero: bool = False
+) -> None:
+    """The checks shared by every request that moves money.
+
+    ``allow_zero`` is for a verify-only session, which saves a card without a payment and
+    sends ``amount`` 0. The gateway decides on any other amount there.
+    """
     # bool is a subclass of int in Python, so True would otherwise sail through
     # and get serialized as `true`.
-    if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+    minimum = 0 if allow_zero else 1
+    if isinstance(amount, bool) or not isinstance(amount, int) or amount < minimum:
         raise ValueError(
-            "amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)"
+            "amount must be 0 or a positive integer in MINOR units on a verify_only session"
+            if allow_zero
+            else "amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)"
         )
     if not currency:
         raise ValueError("currency is required")
@@ -453,11 +462,19 @@ class DominaiteClient:
         idempotency_key: Optional[str] = None,
         save_card: Optional[bool] = None,
         integration: Optional[str] = None,
+        verify_only: Optional[bool] = None,
+        agreement_id: Optional[str] = None,
+        consent: Optional[Mapping[str, Any]] = None,
+        location_id: Optional[Any] = None,
+        extra: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Create a hosted checkout session for one payment.
 
+        Returns a plain dict with the keys of :class:`CheckoutSession`.
+
         :param amount: Integer in MINOR units (2500 = 25.00 EUR, but 2500 JPY). Never a
-            float; :func:`to_minor_units` converts a decimal price exactly.
+            float; :func:`to_minor_units` converts a decimal price exactly. Send 0 on a
+            ``verify_only`` session.
         :param currency: ISO 4217 code.
         :param order_reference: Your own order id, 100 chars or fewer.
         :param customer: ``{"firstName", "lastName", "email", "phone"}``. Pass everything
@@ -465,8 +482,10 @@ class DominaiteClient:
             checkout form stays short.
         :param country: ISO 3166-1 alpha-2.
         :param language: ISO 639-1, the widget UI language.
-        :param theme: ``light``, ``dark``, or ``bright``.
-        :param description: Free-text description shown on the checkout.
+        :param theme: The checkout theme, for example ``light``, ``dark`` or ``bright``. At
+            most 20 characters.
+        :param description: Free-text description shown on the checkout, at most 500
+            characters.
         :param idempotency_key: Required. Build it with :func:`order_idempotency_key` so
             a reload or retry of the same order replays the same session; retrying with
             the same key never creates a second payment. Omitting it raises
@@ -482,12 +501,36 @@ class DominaiteClient:
             ``"fields"`` on an account without them is rejected with a 400. Part of the
             idempotency identity: replaying a key with a different integration is refused
             with ``IDEMPOTENCY_KEY_REUSED``. Left out of the body when None.
+        :param verify_only: True saves the card without a payment. The platform holds a
+            small verification amount and releases it after the card is saved. Send
+            ``amount=0``. The card is saved, ``integration`` must be ``"widget"`` or None,
+            and ``agreement_id`` is refused. Verify-only is off until we switch it on for
+            your account: before that the API answers 403, an :class:`AuthenticationError`
+            with ``error_code`` ``VERIFY_ONLY_NOT_ENABLED``.
+        :param agreement_id: The ``agr_`` id of a pending agreement (see
+            :meth:`create_agreement`). The session then takes the agreement's first payment
+            and saves the card for its later charges. Send it exactly as it was returned:
+            it is case-sensitive. The agreement's own refusals arrive as a
+            :class:`CheckoutRefusedError`, for example ``AGREEMENT_AMOUNT_MISMATCH`` or
+            ``AGREEMENT_CONSENT_REQUIRED``.
+        :param consent: Only with ``agreement_id``: ``{"textVersion", "acceptedAt", "ip"}``,
+            the customer's acceptance of the platform consent text. ``textVersion`` is one
+            of the integration contract's ``recurring.consentTextVersions``;
+            ``acceptedAt`` is ISO 8601 UTC; ``ip`` is the customer's address. Required
+            unless the agreement already carries consent in one of those versions.
+        :param location_id: The storefront (online location) to attribute the session
+            to, a UUID or its string form. A key bound to one storefront refuses another.
+        :param extra: More request fields, sent as given. Use it for a field the API
+            accepts that this version of the SDK does not model yet. A key here replaces
+            the same key set by the arguments above.
         :returns: ``{"transactionId", "orderId", "cashierKey", "cashierToken", "amount",
-            "currency", "expiresAt", "integration", "clientSecret"}``. ``integration`` is
+            "currency", "expiresAt", "integration", "clientSecret", "agreementId",
+            "verifyOnly"}``, see :class:`CheckoutSession`. ``integration`` is
             always present. ``clientSecret`` is set only for ``"fields"`` sessions (absent
             for a widget session, so read it with ``.get``): an opaque string of at most
             128 characters, the same on every replay, that the payer's page hands to
-            checkout.js. Keep it out of your logs.
+            checkout.js. Keep it out of your logs. ``agreementId`` echoes ``agreement_id``,
+            and ``verifyOnly`` is True on a verify-only session; both are absent otherwise.
 
         :raises ValueError: A missing ``idempotency_key`` or another invalid argument,
             before any request is made.
@@ -502,7 +545,9 @@ class DominaiteClient:
         :raises TransportError: Network-level failure (safe to retry WITH the same
             ``idempotency_key``).
         """
-        _validate_money_params(amount, currency, order_reference)
+        _validate_money_params(
+            amount, currency, order_reference, allow_zero=verify_only is True
+        )
         key = _normalize_idempotency_key(idempotency_key)
 
         body: Dict[str, Any] = {
@@ -525,6 +570,17 @@ class DominaiteClient:
         if integration is not None:
             # A CheckoutIntegration member goes out as its plain value.
             body["integration"] = str(getattr(integration, "value", integration))
+        if verify_only is not None:
+            body["verifyOnly"] = bool(verify_only)
+        if agreement_id is not None:
+            body["agreementId"] = str(agreement_id)
+        if consent is not None:
+            body["consent"] = dict(consent)
+        if location_id is not None:
+            # A uuid.UUID goes out in its canonical string form.
+            body["locationId"] = str(location_id)
+        if extra is not None:
+            body.update(extra)
 
         response = self._request("POST", SESSIONS_PATH, body, key)
 
@@ -643,6 +699,17 @@ class DominaiteClient:
         lower-cased value not in that list yet is a valid wallet, not an error. Both are
         reporting data and pass through as sent: a wallet payment refunds, captures and
         disputes like a card.
+
+        ``declineClass`` says what to do with a ``failed`` payment (:data:`DECLINE_CLASSES`).
+        It can be None or absent on a failure too, when the decline cannot be classified
+        yet. ``isRecurring`` is True for a charge on a stored card. ``verifyOnly`` is True
+        on a verify-only session and absent otherwise: its status goes
+        ``requires_capture``, then ``cancelled``, and a ``storedPaymentMethod`` is what
+        says that the card is verified. ``agreement`` (``{"id", "status",
+        "nextChargeAt"}``) is set when the payment belongs to an agreement; its
+        ``status`` says if the subscription started. ``sequence`` orders this read
+        against the ``charge.*`` events of the same object. :class:`CheckoutStatus` names
+        every key.
 
         :param transaction_id: The ``transactionId`` from
             :meth:`create_checkout_session`.

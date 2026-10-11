@@ -8,6 +8,7 @@ import pickle
 import pprint
 import urllib.error
 import urllib.request
+import uuid
 
 import pytest
 
@@ -1731,6 +1732,156 @@ def test_integration_is_omitted_when_not_passed(client, urlopen):
     client.create_checkout_session(amount=2500, currency="EUR", order_reference="order-1042", idempotency_key=IDEMPOTENCY_KEY)
 
     assert "integration" not in json.loads(recorder.last.data)
+
+
+# --- verify-only, subscription sessions, extra fields ------------------------
+
+AGREEMENT_ID = "agr_0123456789abcdef0123456789abcdef"
+CONSENT = {"textVersion": "recurring-2026-09", "acceptedAt": "2026-10-11T09:30:00Z", "ip": "203.0.113.7"}
+
+
+def _assert_signed(request, method, path):
+    headers = _headers(request)
+    body = request.data.decode("utf-8") if request.data is not None else ""
+    assert headers["x-signature"] == sign_request(
+        SECRET, headers["x-timestamp"], method, path, headers.get("idempotency-key", ""), body,
+    )
+
+
+def test_a_verify_only_session_sends_amount_0_and_returns_the_verify_only_session(client, urlopen):
+    checkout = dict(CHECKOUT, amount=0, integration="widget", verifyOnly=True)
+    recorder = urlopen((200, {"success": True, "checkout": checkout}))
+
+    session = client.create_checkout_session(
+        amount=0, currency="EUR", order_reference="verify-cus-42", verify_only=True,
+        idempotency_key="verify-cus-42",
+    )
+
+    sent = json.loads(recorder.last.data)
+    assert sent["amount"] == 0
+    assert sent["verifyOnly"] is True
+    _assert_signed(recorder.last, "POST", SESSIONS_PATH)
+    assert session["verifyOnly"] is True
+
+
+@pytest.mark.parametrize("verify_only", [None, False])
+def test_amount_0_is_still_refused_before_sending_on_every_other_session(client, urlopen, verify_only):
+    recorder = urlopen(_ok())
+
+    with pytest.raises(ValueError):
+        client.create_checkout_session(
+            amount=0, currency="EUR", order_reference="order-1042", verify_only=verify_only,
+            idempotency_key=IDEMPOTENCY_KEY,
+        )
+
+    assert recorder.requests == []
+
+
+@pytest.mark.parametrize("amount", [-1, True, 0.0, "0"])
+def test_a_verify_only_amount_must_still_be_a_whole_number_of_minor_units(client, urlopen, amount):
+    recorder = urlopen(_ok())
+
+    with pytest.raises(ValueError):
+        client.create_checkout_session(
+            amount=amount, currency="EUR", order_reference="verify-cus-42", verify_only=True,
+            idempotency_key="verify-cus-42",
+        )
+
+    assert recorder.requests == []
+
+
+def test_a_subscription_session_sends_the_agreement_consent_and_location(client, urlopen):
+    location = uuid.UUID("6f1c2d3e-4a5b-4c6d-8e7f-901a2b3c4d5e")
+    checkout = dict(CHECKOUT, integration="widget", agreementId=AGREEMENT_ID)
+    recorder = urlopen((200, {"success": True, "checkout": checkout}))
+
+    session = client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference="order-1042",
+        agreement_id=AGREEMENT_ID, consent=CONSENT, location_id=location,
+        idempotency_key=IDEMPOTENCY_KEY,
+    )
+
+    sent = json.loads(recorder.last.data)
+    assert sent["agreementId"] == AGREEMENT_ID
+    assert sent["consent"] == CONSENT
+    assert sent["locationId"] == "6f1c2d3e-4a5b-4c6d-8e7f-901a2b3c4d5e"
+    _assert_signed(recorder.last, "POST", SESSIONS_PATH)
+    assert session["agreementId"] == AGREEMENT_ID
+
+
+def test_the_new_session_fields_are_left_out_when_not_passed(client, urlopen):
+    recorder = urlopen(_ok())
+
+    client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference="order-1042", idempotency_key=IDEMPOTENCY_KEY,
+    )
+
+    sent = json.loads(recorder.last.data)
+    for field in ("verifyOnly", "agreementId", "consent", "locationId"):
+        assert field not in sent
+
+
+def test_extra_session_fields_are_sent_signed_and_win_over_the_arguments(client, urlopen):
+    """extra is how a caller sends a field this SDK version does not model yet. It goes
+    out as given, inside the signed body, and replaces a field the arguments set."""
+    recorder = urlopen(_ok())
+
+    client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference="order-1042",
+        extra={"newField": {"nested": [1, 2]}, "orderReference": "order-1042-b"},
+        idempotency_key=IDEMPOTENCY_KEY,
+    )
+
+    sent = json.loads(recorder.last.data)
+    assert sent["newField"] == {"nested": [1, 2]}
+    assert sent["orderReference"] == "order-1042-b"
+    assert sent["amount"] == 2500
+    _assert_signed(recorder.last, "POST", SESSIONS_PATH)
+
+
+def test_the_retrying_create_forwards_the_new_session_fields(client, urlopen):
+    recorder = urlopen(_ok())
+
+    client.create_checkout_session_with_retry(
+        amount=0, currency="EUR", order_reference="verify-cus-42", verify_only=True,
+        extra={"newField": "x"}, idempotency_key="verify-cus-42", backoff_seconds=0,
+    )
+
+    sent = json.loads(recorder.last.data)
+    assert sent["verifyOnly"] is True
+    assert sent["newField"] == "x"
+
+
+def test_a_subscription_session_refusal_is_a_checkout_refusal_with_its_code(client, urlopen):
+    """The agreement codes of a subscription session come back as success=false on HTTP
+    200, like every session refusal. A code this SDK does not list is still carried."""
+    urlopen((200, {"success": True, "data": {
+        "success": False, "checkout": None, "transactionId": TRANSACTION_ID,
+        "errorCode": "AGREEMENT_SESSION_OPEN", "errorMessage": "A session for this agreement is open.",
+    }}))
+
+    with pytest.raises(CheckoutRefusedError) as caught:
+        client.create_checkout_session(
+            amount=2500, currency="EUR", order_reference="order-1042",
+            agreement_id=AGREEMENT_ID, idempotency_key=IDEMPOTENCY_KEY,
+        )
+
+    assert caught.value.error_code == "AGREEMENT_SESSION_OPEN"
+    assert caught.value.transaction_id == TRANSACTION_ID
+
+
+def test_get_status_passes_the_verify_only_and_agreement_fields_through(client, urlopen):
+    status = {
+        "transactionId": TRANSACTION_ID, "orderId": "ord_1", "status": "requires_capture",
+        "amount": 0, "currency": "EUR", "isRecurring": False, "verifyOnly": True,
+        "agreement": {"id": AGREEMENT_ID, "status": "pending"},
+        "createdAt": "2026-10-11T09:30:00Z", "sequence": 0,
+    }
+    urlopen((200, {"success": True, "data": status}))
+
+    result = client.get_status(TRANSACTION_ID)
+
+    assert result == status
 
 
 def test_get_status_passes_the_stored_payment_method_through_and_leaves_payment_method_a_string(client, urlopen):

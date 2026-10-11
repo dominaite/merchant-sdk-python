@@ -20,6 +20,14 @@
   `CHARGE_DECLINE_RATE_EXCEEDED`.
 - Wire contract fixture: the `authorization` error group (`INSUFFICIENT_SCOPE`, HTTP 403), pinned
   against `AUTHORIZATION_ERROR_CODES`.
+- `create_checkout_session` takes `verify_only`, `agreement_id`, `consent`, `location_id` and
+  `extra`. `verify_only=True` saves a card without a payment and sends `amount` 0; we switch it
+  on for your account. Every other session still refuses an amount below 1 before sending.
+  `agreement_id` with `consent` makes a subscription session. `extra` sends request fields that
+  this version does not model, inside the signed body.
+- `CheckoutSession`, `CheckoutStatus` and `CheckoutAgreement` `TypedDict`s. They name the keys
+  of the session and of the status read, `verifyOnly`, `agreementId`, `declineClass`,
+  `isRecurring`, `agreement` and `sequence` included. The methods still return plain dicts.
 
 ### Changed
 
