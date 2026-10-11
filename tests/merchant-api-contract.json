@@ -75,7 +75,9 @@
         "currency",
         "expiresAt",
         "integration",
-        "clientSecret"
+        "clientSecret",
+        "verifyOnly",
+        "agreementId"
       ],
       "successExample": {
         "success": true,
@@ -87,7 +89,9 @@
           "amount": 8440,
           "currency": "EUR",
           "expiresAt": "2026-08-21T11:15:30.000Z",
-          "integration": "widget"
+          "integration": "widget",
+          "verifyOnly": null,
+          "agreementId": null
         },
         "transactionId": null,
         "errorCode": null,
@@ -104,7 +108,9 @@
           "currency": "EUR",
           "expiresAt": "2026-08-21T11:15:30.000Z",
           "integration": "fields",
-          "clientSecret": "cs_4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c"
+          "clientSecret": "cs_4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c",
+          "verifyOnly": null,
+          "agreementId": null
         },
         "transactionId": null,
         "errorCode": null,
@@ -121,7 +127,7 @@
     "getStatus": {
       "method": "GET",
       "path": "/merchant-api/checkout/sessions/{transactionId}",
-      "note": "status carries a statusVocabulary value. expiresAt answers only 'until when can the payer act' - null once the payer's part is over, which is NOT the same as terminal (requires_capture is non-terminal with no window). Branch on status for liveness. storedPaymentMethod is the card kept on file by a session created with saveCard: present once the payment is approved, and it stays present after a revoke with status revoked; null (absent on the wire) until then, for sessions without saveCard, and for declined or abandoned ones. It is NOT the gateway's paymentMethod field, which is the string category of how the payer paid (card, wallet, bank_transfer, sepa), listed in fields below with walletType.",
+      "note": "status carries a statusVocabulary value. expiresAt answers only 'until when can the payer act' - null once the payer's part is over, which is NOT the same as terminal (requires_capture is non-terminal with no window). Branch on status for liveness. storedPaymentMethod is the card kept on file by a session created with saveCard: present once the payment is approved, and it stays present after a revoke with status revoked; null (absent on the wire) until then, for sessions without saveCard, and for declined or abandoned ones. It is NOT the gateway's paymentMethod field, which is the string category of how the payer paid (card, wallet, bank_transfer, sepa), listed in fields below with walletType. verifyOnly is true on a verify-only session and null (absent) on every other one. declineClass is set only on a failed payment, and can be null there too. isRecurring is true for a charge you initiated on a stored card. agreement is the agreement the session or charge was made under: id, status and nextChargeAt; null on a one-off. sequence orders the read against the charge.* webhook events of the same transaction; 0 on a checkout payment.",
       "fields": [
         "transactionId",
         "orderId",
@@ -136,7 +142,12 @@
         "storedPaymentMethod",
         "pspReference",
         "paymentMethod",
-        "walletType"
+        "walletType",
+        "verifyOnly",
+        "declineClass",
+        "isRecurring",
+        "agreement",
+        "sequence"
       ],
       "example": {
         "transactionId": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
@@ -152,7 +163,12 @@
         "createdAt": "2026-08-21T09:15:30.000Z",
         "updatedAt": "2026-08-21T09:16:05.000Z",
         "expiresAt": null,
-        "storedPaymentMethod": null
+        "storedPaymentMethod": null,
+        "verifyOnly": null,
+        "declineClass": null,
+        "isRecurring": false,
+        "agreement": null,
+        "sequence": 0
       },
       "savedCardExample": {
         "transactionId": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
@@ -176,7 +192,12 @@
           "expiryYear": 2029,
           "status": "active",
           "retiredReason": null
-        }
+        },
+        "verifyOnly": null,
+        "declineClass": null,
+        "isRecurring": false,
+        "agreement": null,
+        "sequence": 0
       },
       "retiredCardExample": {
         "transactionId": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
@@ -200,7 +221,12 @@
           "expiryYear": 2029,
           "status": "retired",
           "retiredReason": "source_sale_reversed"
-        }
+        },
+        "verifyOnly": null,
+        "declineClass": null,
+        "isRecurring": false,
+        "agreement": null,
+        "sequence": 0
       },
       "storedPaymentMethodFields": [
         "id",
@@ -218,13 +244,15 @@
       "path": "/merchant-api/payment-methods/{paymentMethodId}/charges",
       "httpStatus": 201,
       "declinedHttpStatus": 402,
-      "note": "Off-session charge of a stored card. Idempotency-Key is required and signed, exactly like create; the same key replays the first answer, HTTP status included. Every reply is the standard envelope { success, data?, error?, metadata }. 201 (200 on a durable replay): success=true and data is the charge, status succeeded, pending or cancelled, declineClass and declineCode absent. 402: the provider declined; success=false, error.code CHARGE_DECLINED, and data is the SAME charge body with status failed plus declineClass and declineCode. An SDK returns the 402 as a charge result, never as an exception. 502 CHARGE_OUTCOME_UNKNOWN carries data too (the charge row and its transactionId): the outcome is unknown, poll getStatus(transactionId) or wait for the webhook, never retry under a new key. 502 CHARGE_FAILED means nothing was charged, with data when a row exists (declineClass and declineCode null) and without when the provider refused before one. 503, 409 and 422 carry no data. Every code in chargeErrorCodes reaches the caller as a typed charge error with error.code, error.message, the HTTP status and data intact; only transport failures and 400, 401, 403, 404 and 429 are generic. pending is not terminal: poll getStatus(transactionId). chargeId is ch_ followed by 32 hex characters.",
+      "note": "Off-session charge of a stored card. Idempotency-Key is required and signed, exactly like create; the same key replays the first answer, HTTP status included. Every reply is the standard envelope { success, data?, error?, metadata }. 201 (200 on a durable replay): success=true and data is the charge, status succeeded, pending or cancelled, declineClass and declineCode absent. 402: the provider declined; success=false, error.code CHARGE_DECLINED, and data is the SAME charge body with status failed, declineCode and declineClass. declineClass can be null, for example when nobody declined the payment; the status read carries the latest class. An SDK returns the 402 as a charge result, never as an exception. 502 CHARGE_OUTCOME_UNKNOWN carries data too (the charge row and its transactionId): the outcome is unknown, poll getStatus(transactionId) or wait for the webhook, never retry under a new key. 502 CHARGE_FAILED means nothing was charged, with data when a row exists (declineClass and declineCode null) and without when the provider refused before one. 503, 409 and 422 carry no data. Every code in chargeErrorCodes reaches the caller as a typed charge error with error.code, error.message, the HTTP status and data intact; only transport failures and 400, 401, 403, 404 and 429 are generic. pending is not terminal: poll getStatus(transactionId). chargeId is ch_ followed by 32 hex characters. agreementId is the agr_ handle the charge was made under, null without one. sequence is the outcome counter: the data.sequence of the charge.succeeded or charge.failed webhook for a charge decided at once, 0 while pending.",
       "fields": [
         "chargeId",
         "status",
         "declineClass",
         "declineCode",
-        "transactionId"
+        "transactionId",
+        "agreementId",
+        "sequence"
       ],
       "successExample": {
         "success": true,
@@ -233,7 +261,9 @@
           "status": "succeeded",
           "declineClass": null,
           "declineCode": null,
-          "transactionId": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+          "transactionId": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+          "agreementId": null,
+          "sequence": 1
         },
         "metadata": {
           "requestId": "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a",
@@ -249,7 +279,9 @@
           "status": "failed",
           "declineClass": "soft_funds",
           "declineCode": "51",
-          "transactionId": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5e"
+          "transactionId": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5e",
+          "agreementId": null,
+          "sequence": 1
         },
         "error": {
           "message": "The payment provider declined the charge.",
@@ -275,7 +307,9 @@
               "status": "pending",
               "declineClass": null,
               "declineCode": null,
-              "transactionId": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5f"
+              "transactionId": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5f",
+              "agreementId": null,
+              "sequence": 0
             },
             "error": {
               "message": "The payment provider gave no verdict. The charge may have happened: poll the transaction status or wait for the webhook, and do not retry with a new key.",
@@ -301,7 +335,9 @@
               "status": "failed",
               "declineClass": null,
               "declineCode": null,
-              "transactionId": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c60"
+              "transactionId": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c60",
+              "agreementId": null,
+              "sequence": 0
             },
             "error": {
               "message": "The charge could not be placed with the payment provider. Nothing was charged.",
@@ -742,14 +778,14 @@
     "pending",
     "cancelled"
   ],
-  "$chargeStatusNote": "succeeded: the money moved. failed: it did not, and on a 402 declineClass says why. pending: the provider has not answered yet, poll getStatus(transactionId). cancelled: an authorization that was voided before capture, no money moved. Treat an unknown value as still open.",
+  "$chargeStatusNote": "succeeded: the money moved. failed: it did not, and on a 402 declineClass, when set, says why. pending: the provider has not answered yet, poll getStatus(transactionId). cancelled: an authorization that was voided before capture, no money moved. Treat an unknown value as still open.",
   "declineClassVocabulary": [
     "hard",
     "soft_funds",
     "soft_sca_required",
     "soft_other"
   ],
-  "$declineClassNote": "Present on a failed charge answered with 402. hard = do not retry this card; soft_funds = insufficient funds, retry later; soft_sca_required = the issuer wants the customer present, send them through a hosted session with saveCard; soft_other = transient, one retry later is reasonable. Null (absent) on every other charge, including a 502 CHARGE_FAILED row.",
+  "$declineClassNote": "Set on a failed charge answered with 402. declineClass can be null, for example when nobody declined the payment; the status read carries the latest class. A null class is never hard. hard = do not retry this card; soft_funds = insufficient funds, retry later; soft_sca_required = the issuer wants the customer present, send them through a hosted session with saveCard; soft_other = transient, one retry later is reasonable. Null (absent) on every other charge, including a 502 CHARGE_FAILED row.",
   "chargeErrorCodes": [
     "PAYMENT_METHOD_NOT_ACTIVE",
     "DUPLICATE_REQUEST",

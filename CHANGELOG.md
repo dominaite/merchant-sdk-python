@@ -18,6 +18,7 @@
 - `AUTHORIZATION_ERROR_CODES`, and the `ErrorCode` members `INSUFFICIENT_SCOPE`,
   `VERIFY_ONLY_NOT_ENABLED`, `RATE_LIMIT_EXCEEDED`, `CHARGE_VELOCITY_EXCEEDED` and
   `CHARGE_DECLINE_RATE_EXCEEDED`.
+- Contract fixture: the new status read, checkout session and charge fields, with examples.
 - Wire contract fixture: the `authorization` error group (`INSUFFICIENT_SCOPE`, HTTP 403), pinned
   against `AUTHORIZATION_ERROR_CODES`.
 - `create_checkout_session` takes `verify_only`, `agreement_id`, `consent`, `location_id` and
@@ -34,7 +35,8 @@
 - `charge_payment_method` takes `agreement_id` and `extra`. A charge with `agreement_id` bills
   that agreement. The gateway checks the charge against it and refuses one that does not fit
   with a 422 `ChargeError`, for example `AGREEMENT_PERIOD_ALREADY_CHARGED`. The returned charge
-  carries `agreementId` and `sequence` as the gateway sends them.
+  carries `agreementId`, `None` on a charge outside an agreement, and `sequence` as the gateway
+  sends it.
 - `list_refunds(transaction_id)` returns a `RefundList`: the refunds of a payment made through
   this API, newest first, each a `Refund` with every key, plus `refundedAmount` and
   `refundableAmount`. `create_refund` takes `extra`.

@@ -845,9 +845,10 @@ class DominaiteClient:
         :param extra: More request fields, sent as given in the signed body. A key here
             replaces the same key set by the arguments above.
         :returns: ``{"chargeId", "status", "declineClass", "declineCode",
-            "transactionId"}``, plus ``agreementId`` and ``sequence`` when the gateway
-            sends them. ``status`` is ``succeeded``, ``pending`` or
-            ``cancelled`` on a 201 (200 on a replay) and ``failed`` on a 402.
+            "transactionId", "agreementId"}``, plus ``sequence`` when the gateway sends
+            it. ``agreementId`` is None on a charge outside an agreement. ``status`` is
+            ``succeeded``, ``pending`` or ``cancelled`` on a 201 (200 on a replay) and
+            ``failed`` on a 402.
             ``declineClass`` and ``declineCode`` can be None, for example when nobody
             declined the payment (the gateway omits them on the wire; absent reads as
             None). ``agreementId`` names the
@@ -1729,11 +1730,11 @@ def _auth_message(status: int, code: str, server_message: Any) -> str:
 
 
 def _charge(data: Dict[str, Any]) -> Dict[str, Any]:
-    """The charge body as one shape.
+    """The charge body as one shape: every contract field is a key.
 
-    The gateway omits ``declineClass`` and ``declineCode`` when they are null (a 201 or a
-    502 ``CHARGE_FAILED`` row, for example), so absent reads as None. Anything else the gateway sends is carried through as sent,
-    ``agreementId`` and ``sequence`` included.
+    The gateway omits a null key (``declineClass`` and ``declineCode`` on a 201, or
+    ``agreementId`` on a charge outside an agreement), so absent reads as None. Anything
+    else the gateway sends is carried through as sent, ``sequence`` included.
     """
     charge = dict(data)
     charge["chargeId"] = str(data.get("chargeId"))
@@ -1741,6 +1742,7 @@ def _charge(data: Dict[str, Any]) -> Dict[str, Any]:
     charge["declineClass"] = data["declineClass"] if isinstance(data.get("declineClass"), str) else None
     charge["declineCode"] = data["declineCode"] if isinstance(data.get("declineCode"), str) else None
     charge["transactionId"] = str(data.get("transactionId") or "")
+    charge["agreementId"] = data["agreementId"] if isinstance(data.get("agreementId"), str) else None
     return charge
 
 

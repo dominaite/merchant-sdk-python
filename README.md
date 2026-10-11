@@ -429,7 +429,8 @@ To bill an agreement, pass `agreement_id`. The gateway then checks the charge ag
 agreement: the card, the currency, the amount and the period. A charge that does not fit is
 refused with a 422 `ChargeError`, for example `AGREEMENT_PERIOD_ALREADY_CHARGED` or
 `CHARGE_AMOUNT_ABOVE_AGREEMENT`, and nothing is charged. The returned charge has `agreementId`
-and `sequence`, which orders it against the `charge.*` events of the same object.
+(`None` outside an agreement) and `sequence`, which orders it against the `charge.*` events of
+the same object.
 
 Revoking signs an empty key and an empty body, like `get_status()`. A revoke that fails with
 `RevokeError` changed nothing: `MERCHANT_API_UNAVAILABLE` (503) is retryable,

@@ -1663,13 +1663,13 @@ CHARGE_BODY = '{"amount":2500,"currency":"EUR","orderReference":"order-1043"}'
 CHARGE_VECTOR_SIGNATURE = "9ce9f54efa2533a46aa4493b97b56aeb657f41d6a18f1c008c7fd412029aebf9"
 REVOKE_VECTOR_SIGNATURE = "9330100343c4b820504890a09829a193d5815ca39e92160fdfc13d320a802a02"
 # The wire form of a placed charge: success=true, the charge under data, and no
-# declineClass/declineCode keys at all (the gateway omits nulls).
+# declineClass/declineCode/agreementId keys at all (the gateway omits nulls).
 CHARGE = {
     "chargeId": "ch_33333333333343338333333333333333",
     "status": "succeeded",
     "transactionId": "33333333-3333-4333-8333-333333333333",
 }
-CHARGE_RESULT = dict(CHARGE, declineClass=None, declineCode=None)
+CHARGE_RESULT = dict(CHARGE, declineClass=None, declineCode=None, agreementId=None)
 
 
 def _placed(charge=None):
@@ -2061,7 +2061,7 @@ def test_a_402_decline_is_a_result_with_a_decline_class_not_an_exception(client,
 
     charge = _charge(client)
 
-    assert charge == declined
+    assert charge == dict(declined, agreementId=None)
     assert charge["status"] == "failed"
     assert charge["declineClass"] == "soft_funds"
     assert charge["declineCode"] == "51"
@@ -2091,7 +2091,7 @@ def test_a_charge_answered_with_a_code_is_a_charge_error_keeping_code_status_and
     assert error.http_status == 502
     assert error.error_code == "CHARGE_OUTCOME_UNKNOWN"
     assert str(error) == "The payment provider gave no verdict."
-    assert error.charge == dict(unknown, declineClass=None, declineCode=None)
+    assert error.charge == dict(unknown, declineClass=None, declineCode=None, agreementId=None)
     assert error.transaction_id == CHARGE["transactionId"]
 
 
