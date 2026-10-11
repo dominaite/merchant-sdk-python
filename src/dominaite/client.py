@@ -24,7 +24,7 @@ from .exceptions import (
     StorefrontError,
     TransportError,
 )
-from .models import Refund
+from .models import Refund, RefundList
 
 __version__ = "0.4.0"
 
@@ -902,6 +902,7 @@ class DominaiteClient:
         amount: Optional[int] = None,
         reason: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        extra: Optional[Mapping[str, Any]] = None,
     ) -> Refund:
         """Refund a payment, in full or in part.
 
@@ -923,6 +924,8 @@ class DominaiteClient:
         :param idempotency_key: Required. Derive it from YOUR refund (the return or credit
             note id), never mint one per attempt. Omitting it raises ``ValueError`` before
             anything is sent.
+        :param extra: More request fields, sent as given in the signed body. A key here
+            replaces the same key set by the arguments above.
         :returns: The :class:`Refund`, every field present (None where the gateway sent
             none).
 
@@ -956,6 +959,8 @@ class DominaiteClient:
             body["amount"] = amount
         if reason is not None:
             body["reason"] = reason
+        if extra is not None:
+            body.update(extra)
 
         reply = self._send("POST", PAYMENTS_PATH + "/" + normalized + "/refunds", body, key)
         return _refund_result(reply)
@@ -988,6 +993,31 @@ class DominaiteClient:
             "GET", PAYMENTS_PATH + "/" + normalized + "/refunds/" + refund, None, ""
         )
         return _refund_result(reply)
+
+    def list_refunds(self, transaction_id: str) -> RefundList:
+        """List the refunds of a payment, with what is refunded and what is still refundable.
+
+        Signed with an empty idempotency key and an empty body, like :meth:`get_status`.
+        The list is not paged.
+
+        :param transaction_id: The ``transactionId`` of the payment.
+        :returns: A :class:`RefundList`: ``refunds`` (newest first, each a :class:`Refund`
+            with every field present), ``refundedAmount``, ``refundableAmount``,
+            ``currency`` and ``transactionId``. ``refunds`` holds the refunds created
+            through this API; the two amounts count every refund of the payment.
+
+        :raises RefundError: ``PAYMENT_NOT_FOUND`` (404): no payment with this id under
+            your account.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``payments`` scope (403).
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``.
+        :raises ApiError: An unexpected response.
+        :raises TransportError: Network-level failure or a 5xx, ``MERCHANT_API_UNAVAILABLE``
+            included (safe to retry).
+        """
+        normalized = _normalize_transaction_id(transaction_id)
+        reply = self._send("GET", PAYMENTS_PATH + "/" + normalized + "/refunds", None, "")
+        return _refund_list(reply)
 
     def _request(
         self,
@@ -1220,20 +1250,41 @@ def _refund_result(reply: _Reply) -> Refund:
             "The API answered the refund without a refund body",
             error_code="UNEXPECTED_RESPONSE",
         )
+    raise _refund_failure(reply)
+
+
+def _refund_list(reply: _Reply) -> RefundList:
+    """Read the refund list route's reply: every refund in the one :class:`Refund` shape."""
+    if 200 <= reply.status < 300:
+        refunds = reply.payload.get("refunds")
+        if isinstance(refunds, list):
+            listing = dict(reply.payload)
+            listing["refunds"] = [_refund(item) for item in refunds if isinstance(item, dict)]
+            return cast(RefundList, listing)
+        raise ApiError(
+            reply.status,
+            "The API answered the refund list without a list",
+            error_code="UNEXPECTED_RESPONSE",
+        )
+    raise _refund_failure(reply)
+
+
+def _refund_failure(reply: _Reply) -> DominaiteError:
+    """The error for a refund route's reply that is not a 2xx."""
     error_code = reply.error.get("code") or reply.payload.get("errorCode")
     # Every 4xx with a code is the refund route telling us something specific, 400 and 404
     # included (REFUND_NOT_FOUND is retryable, PAYMENT_NOT_FOUND is not). Auth and rate
     # limiting never get here; a 5xx stays a TransportError: nothing was queued.
     if error_code and 400 <= reply.status < 500:
-        raise RefundError(
+        return RefundError(
             reply.status,
             str(error_code),
             str(reply.error.get("message") or reply.payload.get("errorMessage") or "The refund was refused."),
             result=dict(reply.envelope),
         )
     if reply.status >= 400:
-        raise _rejection(reply)
-    raise ApiError(
+        return _rejection(reply)
+    return ApiError(
         reply.status,
         "Unexpected HTTP {0} response; the Dominaite API answers 2xx or a "
         "documented error. Check base_url and anything proxying it.".format(reply.status),

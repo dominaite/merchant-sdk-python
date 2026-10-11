@@ -2413,3 +2413,75 @@ def test_a_2xx_without_a_refund_body_is_an_api_error_not_a_half_built_refund(cli
     with pytest.raises(ApiError) as raised:
         client.create_refund(TRANSACTION_ID, idempotency_key=REFUND_KEY)
     assert raised.value.error_code == "UNEXPECTED_RESPONSE"
+
+
+def test_create_refund_sends_extra_fields_signed(client, urlopen):
+    recorder = urlopen(_accepted())
+
+    client.create_refund(
+        TRANSACTION_ID, amount=1500, idempotency_key=REFUND_KEY, extra={"newField": "x"},
+    )
+
+    request = recorder.last
+    assert json.loads(request.data) == {"amount": 1500, "newField": "x"}
+    _assert_signed(request, "POST", REFUNDS_PATH)
+
+
+# --- refund list -------------------------------------------------------------
+
+REFUND_LIST = {
+    "transactionId": TRANSACTION_ID,
+    "currency": "HUF",
+    "refundedAmount": 2000,
+    "refundableAmount": 500,
+    "refunds": [
+        dict(QUEUED_REFUND, status="succeeded", completedAt="2026-09-26T10:05:40Z"),
+        {"refundId": "re_0123456789abcdef0123456789abcdef", "transactionId": TRANSACTION_ID,
+         "status": "failed", "currency": "HUF", "failureCode": "REFUND_FAILED"},
+    ],
+}
+
+
+def test_list_refunds_signs_an_empty_key_and_body_and_gives_every_refund_one_shape(client, urlopen):
+    recorder = urlopen((200, {"success": True, "data": REFUND_LIST}))
+
+    listing = client.list_refunds(TRANSACTION_ID.upper())
+
+    request = recorder.last
+    headers = _headers(request)
+    assert request.get_method() == "GET"
+    assert request.full_url == BASE_URL + REFUNDS_PATH
+    assert request.data is None
+    assert "idempotency-key" not in headers
+    assert headers["x-signature"] == sign_request(SECRET, headers["x-timestamp"], "GET", REFUNDS_PATH, "", "")
+    assert listing["refundedAmount"] == 2000
+    assert listing["refundableAmount"] == 500
+    assert listing["currency"] == "HUF"
+    assert listing["refunds"][0] == dict(REFUND_LIST["refunds"][0], failureCode=None, failureMessage=None)
+    assert listing["refunds"][1]["amount"] is None
+    assert listing["refunds"][1]["completedAt"] is None
+    assert listing["refunds"][1]["failureCode"] == "REFUND_FAILED"
+
+
+def test_list_refunds_of_a_payment_without_refunds_is_an_empty_list(client, urlopen):
+    urlopen((200, {"success": True, "data": dict(REFUND_LIST, refundedAmount=0, refunds=[])}))
+
+    assert client.list_refunds(TRANSACTION_ID)["refunds"] == []
+
+
+def test_list_refunds_of_an_unknown_payment_is_a_refund_error_that_is_not_retryable(client, urlopen):
+    urlopen(_refund_error(404, "PAYMENT_NOT_FOUND"))
+
+    with pytest.raises(RefundError) as caught:
+        client.list_refunds(TRANSACTION_ID)
+
+    assert caught.value.http_status == 404
+    assert caught.value.error_code == "PAYMENT_NOT_FOUND"
+    assert caught.value.retryable is False
+
+
+def test_list_refunds_on_a_503_is_a_transport_error(client, urlopen):
+    urlopen(_refund_error(503, "MERCHANT_API_UNAVAILABLE"))
+
+    with pytest.raises(TransportError):
+        client.list_refunds(TRANSACTION_ID)

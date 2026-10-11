@@ -32,6 +32,9 @@
   that agreement. The gateway checks the charge against it and refuses one that does not fit
   with a 422 `ChargeError`, for example `AGREEMENT_PERIOD_ALREADY_CHARGED`. The returned charge
   carries `agreementId` and `sequence` as the gateway sends them.
+- `list_refunds(transaction_id)` returns a `RefundList`: the refunds of a payment made through
+  this API, newest first, each a `Refund` with every key, plus `refundedAmount` and
+  `refundableAmount`. `create_refund` takes `extra`.
 
 ### Changed
 

@@ -528,6 +528,24 @@ except RefundError as error:
         ...  # error.error_code says why; nothing was refunded
 ```
 
+### List the refunds of a payment
+
+`list_refunds` returns every refund of a payment and the amounts that are still open:
+
+```python
+listing = client.list_refunds(transaction_id)
+listing["refundableAmount"]  # minor units a new refund can take now
+listing["refundedAmount"]    # minor units refunded so far, from every source
+for refund in listing["refunds"]:  # newest first, each with every Refund key
+    print(refund["refundId"], refund["status"])
+```
+
+1. `refunds` holds the refunds made through this API. The two amounts also count refunds made
+   in the dashboard.
+2. `refundableAmount` leaves out refunds still in progress. It is 0 when the payment cannot be
+   refunded.
+3. The list is not paged. An unknown payment is a `RefundError` with `PAYMENT_NOT_FOUND`.
+
 ## Webhooks
 
 Webhooks are how you find out what happened to a payment. Create an endpoint in the Dominaite
@@ -975,7 +993,8 @@ The API can accept a request field before this SDK has an argument for it. Send 
 session = client.create_checkout_session(..., extra={"newField": "value"})
 ```
 
-1. `create_checkout_session` takes `extra`. It sends each key as given, in the signed body.
+1. `create_checkout_session`, `charge_payment_method` and `create_refund` take `extra`. They
+   send each key as given, in the signed body.
 2. A key in `extra` replaces the same field that an argument set.
 3. The API ignores a field that it does not know, so a misspelled name is not an error. Check
    the name in the API reference.

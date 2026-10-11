@@ -4,7 +4,7 @@ These are ``TypedDict``s: at runtime every one is a plain dict, so indexing and 
 work as usual and nothing is parsed or validated on the way in.
 """
 
-from typing import Optional, TypedDict
+from typing import List, Optional, TypedDict
 
 
 class StoredPaymentMethod(TypedDict):
@@ -57,6 +57,26 @@ class Refund(TypedDict):
     failureCode: Optional[str]
     failureMessage: Optional[str]
     completedAt: Optional[str]
+
+
+class RefundList(TypedDict):
+    """The refunds of one payment, as :meth:`DominaiteClient.list_refunds` returns them.
+
+    - ``refunds``: the refunds created through this API, newest first, each a
+      :class:`Refund` with every field present.
+    - ``refundedAmount``: minor units refunded so far, counting every refund of the
+      payment, the ones made in the dashboard included.
+    - ``refundableAmount``: minor units a new refund could take now: what is not refunded
+      yet, minus refunds still in progress. 0 when the payment cannot be refunded.
+
+    Both amounts are in ``currency``, the payment's currency.
+    """
+
+    transactionId: str
+    currency: str
+    refundedAmount: int
+    refundableAmount: int
+    refunds: List[Refund]
 
 
 class _CheckoutSessionRequired(TypedDict):
