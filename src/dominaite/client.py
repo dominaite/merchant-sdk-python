@@ -35,7 +35,7 @@ from .models import (
     WebhookEndpoint,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 DEFAULT_BASE_URL = "https://api.dominaite.com/payments"
 SESSIONS_PATH = "/merchant-api/checkout/sessions"
