@@ -168,3 +168,101 @@ class CheckoutStatus(_CheckoutStatusRequired, total=False):
     updatedAt: Optional[str]
     expiresAt: Optional[str]
     sequence: int
+
+
+class _PlanRequired(TypedDict):
+    id: str
+    name: str
+    amount: int
+    currency: str
+    intervalUnit: str
+    intervalCount: int
+    trialDays: int
+    status: str
+    createdAt: str
+
+
+class Plan(_PlanRequired, total=False):
+    """A subscription plan, as the plan methods of :class:`DominaiteClient` return it.
+
+    ``id`` is ``plan_`` + 32 hex characters. It is case-sensitive: send it exactly as it
+    was returned. ``amount`` is the charge per period in MINOR units of ``currency``. One
+    period is ``intervalCount`` times ``intervalUnit`` (``day``, ``week``, ``month`` or
+    ``year``). ``status`` is ``active`` or ``archived``, a plain string. The gateway leaves
+    out a key whose value is null, so read these with ``.get``:
+
+    - ``periodCount``: the number of periods after which an agreement completes. Absent
+      when agreements bill until they are cancelled.
+    - ``cancelUrl``: your page where a customer cancels, printed on customer emails.
+    - ``archivedAt``: when the plan was archived.
+    """
+
+    periodCount: Optional[int]
+    cancelUrl: Optional[str]
+    archivedAt: Optional[str]
+
+
+class _AgreementConsentRequired(TypedDict):
+    textVersion: str
+    acceptedAt: str
+    ip: str
+
+
+class AgreementConsent(_AgreementConsentRequired, total=False):
+    """``consent`` on an :class:`Agreement`: the customer's acceptance as you sent it, plus
+    the platform's receipt of it.
+
+    ``textVersion``, ``acceptedAt`` and ``ip`` are what you sent, on
+    :meth:`DominaiteClient.create_agreement` or on the subscription session. ``receivedAt``
+    is when the platform received the consent. ``receivedFromIp`` is the address of your
+    server that sent it, not the customer's. It is absent unless the platform recorded it.
+    """
+
+    receivedAt: Optional[str]
+    receivedFromIp: Optional[str]
+
+
+class _AgreementRequired(TypedDict):
+    id: str
+    planId: str
+    customerReference: str
+    status: str
+    amount: int
+    currency: str
+    intervalUnit: str
+    intervalCount: int
+    trialDays: int
+    version: int
+    sequence: int
+    createdAt: str
+
+
+class Agreement(_AgreementRequired, total=False):
+    """A customer's subscription to a plan, as the agreement methods of
+    :class:`DominaiteClient` return it.
+
+    ``id`` is ``agr_`` + 32 hex characters, case-sensitive. ``status`` is a plain string:
+    ``pending``, ``active``, ``past_due``, ``cancelled``, ``completed`` or ``failed`` today.
+    A value the SDK does not know yet is valid. ``version`` starts at 1 and goes up when
+    the price changes for a future period. ``sequence`` is the number the latest
+    ``agreement.*`` webhook carried, 0 before the first change. The gateway leaves out a
+    key whose value is null, so read these with ``.get``:
+
+    - ``storedPaymentMethodId``: the ``pm_`` id of the card on file, absent until saved.
+    - ``maxAmountPerPeriod``: the most one charge may be on a variable agreement.
+    - ``nextChargeAt``: the next scheduled charge, absent while pending and once ended.
+    - ``pastDueReason``: why the agreement is ``past_due``: ``card_expired`` and
+      ``card_revoked`` you fix with a new card; ``hard_decline`` and ``dunning_exhausted``
+      are the issuer's.
+    - ``consent``: an :class:`AgreementConsent`, absent until consent is recorded.
+    """
+
+    storedPaymentMethodId: Optional[str]
+    maxAmountPerPeriod: Optional[int]
+    periodCount: Optional[int]
+    nextChargeAt: Optional[str]
+    pastDueReason: Optional[str]
+    pastDueAt: Optional[str]
+    consent: Optional[AgreementConsent]
+    activatedAt: Optional[str]
+    cancelledAt: Optional[str]

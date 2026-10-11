@@ -456,6 +456,81 @@ if stored and stored["status"] == StoredPaymentMethodStatus.ACTIVE:
 6. The webhook events are `verification.succeeded` and `verification.failed`. A verify-only
    session fires no `payment.*` events.
 
+## Subscriptions (plans and agreements)
+
+A plan is a price that you bill every period. An agreement subscribes one of your customers to a
+plan. After the first payment, the platform places the charge of each period on the saved card.
+We switch subscriptions on for your account. Until then, you can create plans and agreements, but
+the subscription session is refused with `SUBSCRIPTIONS_NOT_ENABLED`.
+
+```python
+plan = client.create_plan(
+    name="Pro monthly",
+    amount=2500,
+    currency="EUR",
+    interval_unit="month",
+    cancel_url="https://shop.example/account/cancel",
+    idempotency_key="plan-pro-monthly-2500-eur",
+)
+db.save_plan(plan["id"])  # plan_...
+
+agreement = client.create_agreement(
+    plan_id=plan["id"],
+    customer_reference="cus-42",  # your own stable id for the customer
+    idempotency_key="agreement-cus-42-pro-monthly",
+)
+
+session = client.create_checkout_session(
+    amount=agreement["amount"],
+    currency=agreement["currency"],
+    order_reference="sub-cus-42-first",
+    agreement_id=agreement["id"],
+    consent={
+        "textVersion": "recurring-2026-09",  # one of recurring.consentTextVersions
+        "acceptedAt": "2026-10-11T09:30:00Z",
+        "ip": customer_ip,
+    },
+    idempotency_key="sub-cus-42-first",
+)
+# ... the customer completes the hosted checkout ...
+agreement = client.get_agreement(agreement["id"])
+# "active" after the first payment is approved, still "pending" after a decline
+```
+
+1. Create a plan once for each price. Amount, currency and interval cannot change after that.
+   To change a price, create a new plan and archive the old one with `delete_plan()`. Existing
+   agreements keep their terms.
+2. Create one agreement for each customer and plan. It starts `pending` and charges nothing.
+3. Take the first payment with a subscription session: `create_checkout_session()` with
+   `agreement_id` and `consent`. Send the agreement's amount and currency. On a plan with a
+   trial, the session charges the amount you send, and the first scheduled charge comes when
+   the trial ends.
+4. `consent` names the consent text that your page showed the customer. Use one of
+   `recurring.consentTextVersions` from `get_integration_contract()`, and send all three fields.
+5. A session that does not fit the agreement raises `CheckoutRefusedError`, and nothing is
+   created. Read `error_code`, for example `AGREEMENT_AMOUNT_MISMATCH`, `AGREEMENT_SESSION_OPEN`
+   or `AGREEMENT_NOT_PENDING`.
+6. Follow the agreement with the `agreement.*` and `charge.*` webhooks, or read it with
+   `get_agreement()`. See "Ordering agreement and charge events" below.
+7. `cancel_agreement()` stops the charges that are not placed yet. It does not reverse a charge.
+   If the agreement is already cancelled, the call succeeds again. A retry is safe.
+
+To bill a card that the customer saved before, pass `stored_payment_method_id` and `consent` to
+`create_agreement()`. For a variable amount, pass `max_amount_per_period` and `consent`. A
+subscription session refuses an agreement with a maximum (`AGREEMENT_VARIABLE_AMOUNT_UNSUPPORTED`).
+
+`update_plan()` changes only `name`, `trial_days` and `cancel_url`. `trial_days=0` removes the
+trial and `cancel_url=""` removes the cancel page. A trial change applies to agreements created
+after it. The update sends no idempotency key. `list_plans()` returns at most 200 plans, active
+plans first, and has no paging.
+
+Plan and agreement ids are case-sensitive. Store them and send them exactly as returned. A
+refusal raises `ApiError` with `error_code`, for example `PLAN_NOT_FOUND` (404),
+`PLAN_NOT_ACTIVE` (409) or `AGREEMENT_ENDED` (409). `result` holds the whole answer:
+`MAX_AMOUNT_BELOW_PLAN_AMOUNT` carries the plan's amount in
+`result["error"]["validationErrors"][0]["params"]["min"]`. The methods return plain dicts,
+described by the `Plan` and `Agreement` `TypedDict`s. A status value not listed there is valid.
+
 ## Refunds
 
 Refund a paid payment in full or in part with `create_refund`. The amount is minor units of the
@@ -1002,8 +1077,9 @@ The API can accept a request field before this SDK has an argument for it. Send 
 session = client.create_checkout_session(..., extra={"newField": "value"})
 ```
 
-1. `create_checkout_session`, `charge_payment_method` and `create_refund` take `extra`. They
-   send each key as given, in the signed body.
+1. `create_checkout_session`, `charge_payment_method`, `create_refund`, `create_plan`,
+   `update_plan` and `create_agreement` take `extra`. They send each key as given, in the
+   signed body.
 2. A key in `extra` replaces the same field that an argument set.
 3. The API ignores a field that it does not know, so a misspelled name is not an error. Check
    the name in the API reference.

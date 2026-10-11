@@ -2,11 +2,13 @@
 
 from .amounts import CURRENCY_EXPONENTS, UNSUPPORTED_CURRENCIES, to_minor_units
 from .client import (
+    AGREEMENTS_PATH,
     CONTRACT_PATH,
     DEFAULT_BASE_URL,
     PAYMENT_METHODS_PATH,
     PAYMENTS_PATH,
     PING_PATH,
+    PLANS_PATH,
     SESSIONS_PATH,
     DominaiteClient,
     __version__,
@@ -37,9 +39,12 @@ from .exceptions import (
     WebhookVerificationError,
 )
 from .models import (
+    Agreement,
+    AgreementConsent,
     CheckoutAgreement,
     CheckoutSession,
     CheckoutStatus,
+    Plan,
     Refund,
     RefundList,
     StoredPaymentMethod,
@@ -80,6 +85,7 @@ from .webhooks import (
 )
 
 __all__ = [
+    "AGREEMENTS_PATH",
     "AUTHORIZATION_ERROR_CODES",
     "CHARGE_ERROR_CODES",
     "CHARGE_STATUSES",
@@ -94,6 +100,7 @@ __all__ = [
     "PAYMENT_METHOD_CATEGORIES",
     "PAYMENT_STATUSES",
     "PING_PATH",
+    "PLANS_PATH",
     "REFUND_ERROR_CODES",
     "REFUND_FAILURE_CODES",
     "REFUND_RETRY_WINDOWS_SECONDS",
@@ -109,6 +116,8 @@ __all__ = [
     "VALIDATION_ERROR_CODES",
     "WALLET_TYPES",
     "WEBHOOK_SIGNATURE_HEADER",
+    "Agreement",
+    "AgreementConsent",
     "AgreementEventData",
     "ApiError",
     "AuthenticationError",
@@ -128,6 +137,7 @@ __all__ = [
     "PaymentEventData",
     "PaymentMethodCategory",
     "PaymentStatus",
+    "Plan",
     "RateLimitError",
     "Refund",
     "RefundError",

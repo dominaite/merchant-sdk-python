@@ -37,6 +37,11 @@
   `refundableAmount`. `create_refund` takes `extra`.
 - `get_integration_contract()` reads the public integration contract of the API. The route is
   anonymous, so the request goes out without a signature. `CONTRACT_PATH` is exported.
+- Subscriptions: `create_plan`, `list_plans`, `get_plan`, `update_plan` and `delete_plan` (which
+  archives the plan), and `create_agreement`, `get_agreement` and `cancel_agreement`. They
+  return the `Plan` and `Agreement` `TypedDict`s. A create needs an idempotency key and takes
+  `extra`. `update_plan` sends no key, and `trial_days=0` and `cancel_url=""` reach the API.
+  Plan and agreement ids keep their case. `PLANS_PATH` and `AGREEMENTS_PATH` are exported.
 
 ### Changed
 

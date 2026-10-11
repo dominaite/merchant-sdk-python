@@ -13,6 +13,7 @@ import uuid
 import pytest
 
 from dominaite import (
+    AGREEMENTS_PATH,
     AUTHORIZATION_ERROR_CODES,
     CHARGE_ERROR_CODES,
     CONTRACT_PATH,
@@ -20,6 +21,7 @@ from dominaite import (
     PAYMENT_METHODS_PATH,
     PAYMENTS_PATH,
     PING_PATH,
+    PLANS_PATH,
     REFUND_ERROR_CODES,
     REFUND_FAILURE_CODES,
     REVOKE_ERROR_CODES,
@@ -2522,3 +2524,411 @@ def test_the_integration_contract_keeps_the_shared_failure_rules(client, urlopen
 
     with pytest.raises(error):
         client.get_integration_contract()
+
+
+# --- plans and agreements ----------------------------------------------------
+
+PLAN_ID = "plan_0123456789abcdef0123456789abcdef"
+PLAN = {
+    "id": PLAN_ID,
+    "name": "Pro monthly",
+    "amount": 2500,
+    "currency": "EUR",
+    "intervalUnit": "month",
+    "intervalCount": 1,
+    "trialDays": 0,
+    "status": "active",
+    "createdAt": "2026-10-11T09:00:00Z",
+}
+AGREEMENT = {
+    "id": AGREEMENT_ID,
+    "planId": PLAN_ID,
+    "customerReference": "cus-42",
+    "status": "pending",
+    "amount": 2500,
+    "currency": "EUR",
+    "intervalUnit": "month",
+    "intervalCount": 1,
+    "trialDays": 0,
+    "version": 1,
+    "sequence": 0,
+    "createdAt": "2026-10-11T09:05:00Z",
+}
+#: Agreement consent names the merchant's own wording; session consent names the platform's.
+AGREEMENT_CONSENT = {"textVersion": "terms-2026-09", "acceptedAt": "2026-10-11T09:04:00Z", "ip": "203.0.113.7"}
+
+
+def _created(data):
+    return (201, {"success": True, "data": data})
+
+
+def _plan_arguments(**overrides):
+    arguments = dict(
+        name="Pro monthly", amount=2500, currency="EUR", interval_unit="month",
+        idempotency_key="plan-pro-monthly",
+    )
+    arguments.update(overrides)
+    return arguments
+
+
+def test_create_plan_signs_the_key_and_sends_only_the_fields_given(client, urlopen):
+    recorder = urlopen(_created(PLAN))
+
+    plan = client.create_plan(**_plan_arguments())
+
+    request = recorder.last
+    assert request.get_method() == "POST"
+    assert request.full_url == BASE_URL + PLANS_PATH
+    assert _headers(request)["idempotency-key"] == "plan-pro-monthly"
+    _assert_signed(request, "POST", PLANS_PATH)
+    assert json.loads(request.data) == {
+        "name": "Pro monthly", "amount": 2500, "currency": "EUR", "intervalUnit": "month",
+    }
+    assert plan == PLAN
+
+
+def test_create_plan_sends_trial_days_0_and_every_optional_field(client, urlopen):
+    recorder = urlopen(_created(PLAN))
+
+    client.create_plan(**_plan_arguments(
+        interval_count=3, period_count=4, trial_days=0, cancel_url="https://shop.example/cancel",
+    ))
+
+    assert json.loads(recorder.last.data) == {
+        "name": "Pro monthly", "amount": 2500, "currency": "EUR", "intervalUnit": "month",
+        "intervalCount": 3, "periodCount": 4, "trialDays": 0,
+        "cancelUrl": "https://shop.example/cancel",
+    }
+
+
+def test_create_plan_sends_extra_fields_in_the_signed_body_and_they_win(client, urlopen):
+    recorder = urlopen(_created(PLAN))
+
+    client.create_plan(**_plan_arguments(
+        interval_count=1, extra={"intervalCount": 2, "futureField": {"a": 1}},
+    ))
+
+    sent = json.loads(recorder.last.data)
+    assert sent["intervalCount"] == 2
+    assert sent["futureField"] == {"a": 1}
+    _assert_signed(recorder.last, "POST", PLANS_PATH)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"idempotency_key": None},
+        {"name": ""},
+        {"amount": 0},
+        {"amount": True},
+        {"amount": 25.0},
+        {"amount": "2500"},
+        {"interval_count": 0},
+        {"period_count": 1.5},
+        {"trial_days": -1},
+    ],
+    ids=["no-key", "no-name", "zero-amount", "bool-amount", "float-amount", "string-amount",
+         "zero-interval", "float-periods", "negative-trial"],
+)
+def test_create_plan_refuses_bad_input_before_any_request(client, urlopen, overrides):
+    recorder = urlopen(_created(PLAN))
+
+    with pytest.raises(ValueError):
+        client.create_plan(**_plan_arguments(**overrides))
+
+    assert recorder.requests == []
+
+
+def test_list_plans_returns_every_plan_of_the_bare_list(client, urlopen):
+    archived = dict(
+        PLAN, id="plan_fedcba9876543210fedcba9876543210", status="archived",
+        archivedAt="2026-10-01T00:00:00Z",
+    )
+    recorder = urlopen((200, {"success": True, "data": [PLAN, archived]}))
+
+    plans = client.list_plans()
+
+    request = recorder.last
+    assert request.get_method() == "GET"
+    assert request.full_url == BASE_URL + PLANS_PATH
+    assert request.data is None
+    assert "idempotency-key" not in _headers(request)
+    _assert_signed(request, "GET", PLANS_PATH)
+    assert plans == [PLAN, archived]
+
+
+def test_list_plans_with_no_plans_is_an_empty_list(client, urlopen):
+    urlopen((200, {"success": True, "data": []}))
+
+    assert client.list_plans() == []
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [{"success": True}, {"success": True, "data": PLAN}],
+    ids=["no-data", "an-object"],
+)
+def test_list_plans_without_a_list_is_an_unexpected_response(client, urlopen, envelope):
+    urlopen((200, envelope))
+
+    with pytest.raises(ApiError) as caught:
+        client.list_plans()
+
+    assert caught.value.error_code == "UNEXPECTED_RESPONSE"
+    assert caught.value.http_status == 200
+
+
+def test_get_plan_signs_the_id_exactly_as_it_was_returned(client, urlopen):
+    """Plan ids are case-sensitive, so the SDK never changes their case."""
+    mixed_case = "plan_0123456789ABCDEF0123456789abcdef"
+    recorder = urlopen((200, {"success": True, "data": dict(PLAN, id=mixed_case)}))
+
+    plan = client.get_plan(mixed_case)
+
+    path = PLANS_PATH + "/" + mixed_case
+    assert recorder.last.get_method() == "GET"
+    assert recorder.last.full_url == BASE_URL + path
+    _assert_signed(recorder.last, "GET", path)
+    assert plan["id"] == mixed_case
+
+
+@pytest.mark.parametrize(
+    "method, arguments",
+    [
+        ("get_plan", {}),
+        ("update_plan", {"name": "Pro"}),
+        ("delete_plan", {}),
+        ("get_agreement", {}),
+        ("cancel_agreement", {}),
+    ],
+)
+@pytest.mark.parametrize(
+    "bad_id",
+    [None, "", "   ", "plan_1/archive", "plan_1?status=active", "plan 1"],
+    ids=["none", "empty", "blank", "slash", "query", "space"],
+)
+def test_an_id_that_is_not_one_path_segment_is_refused_before_any_request(
+    client, urlopen, method, arguments, bad_id
+):
+    recorder = urlopen((200, {"success": True, "data": PLAN}))
+
+    with pytest.raises(ValueError):
+        getattr(client, method)(bad_id, **arguments)
+
+    assert recorder.requests == []
+
+
+def test_update_plan_sends_no_idempotency_key_and_can_clear_the_trial_and_the_cancel_page(
+    client, urlopen
+):
+    recorder = urlopen((200, {"success": True, "data": PLAN}))
+
+    plan = client.update_plan(PLAN_ID, trial_days=0, cancel_url="")
+
+    request = recorder.last
+    path = PLANS_PATH + "/" + PLAN_ID
+    assert request.get_method() == "PATCH"
+    assert request.full_url == BASE_URL + path
+    assert "idempotency-key" not in _headers(request)
+    _assert_signed(request, "PATCH", path)
+    assert json.loads(request.data) == {"trialDays": 0, "cancelUrl": ""}
+    assert plan == PLAN
+
+
+def test_update_plan_sends_only_the_fields_given(client, urlopen):
+    recorder = urlopen((200, {"success": True, "data": PLAN}))
+
+    client.update_plan(PLAN_ID, name="Pro monthly 2026", extra={"futureField": 1})
+
+    assert json.loads(recorder.last.data) == {"name": "Pro monthly 2026", "futureField": 1}
+
+
+def test_update_plan_with_nothing_to_change_is_refused_before_any_request(client, urlopen):
+    recorder = urlopen((200, {"success": True, "data": PLAN}))
+
+    with pytest.raises(ValueError):
+        client.update_plan(PLAN_ID)
+
+    assert recorder.requests == []
+
+
+@pytest.mark.parametrize(
+    "method, path",
+    [
+        ("delete_plan", PLANS_PATH + "/" + PLAN_ID),
+        ("cancel_agreement", AGREEMENTS_PATH + "/" + AGREEMENT_ID),
+    ],
+    ids=["archive-plan", "cancel-agreement"],
+)
+def test_archive_and_cancel_sign_an_empty_key_and_body_and_return_none_on_204(
+    client, urlopen, method, path
+):
+    recorder = urlopen((204, b""))
+
+    assert getattr(client, method)(path.rsplit("/", 1)[1]) is None
+
+    request = recorder.last
+    assert request.get_method() == "DELETE"
+    assert request.full_url == BASE_URL + path
+    assert request.data is None
+    assert "idempotency-key" not in _headers(request)
+    _assert_signed(request, "DELETE", path)
+
+
+def test_create_agreement_sends_the_card_the_maximum_and_the_consent_as_given(client, urlopen):
+    recorded = dict(AGREEMENT_CONSENT, receivedAt="2026-10-11T09:05:00Z")
+    recorder = urlopen(_created(dict(
+        AGREEMENT, storedPaymentMethodId=PAYMENT_METHOD_ID, maxAmountPerPeriod=5000, consent=recorded,
+    )))
+
+    agreement = client.create_agreement(
+        PLAN_ID, "cus-42", stored_payment_method_id=PAYMENT_METHOD_ID, max_amount_per_period=5000,
+        consent=AGREEMENT_CONSENT, idempotency_key="agr-cus-42",
+    )
+
+    request = recorder.last
+    assert request.get_method() == "POST"
+    assert request.full_url == BASE_URL + AGREEMENTS_PATH
+    assert _headers(request)["idempotency-key"] == "agr-cus-42"
+    _assert_signed(request, "POST", AGREEMENTS_PATH)
+    assert json.loads(request.data) == {
+        "planId": PLAN_ID,
+        "customerReference": "cus-42",
+        "storedPaymentMethodId": PAYMENT_METHOD_ID,
+        "maxAmountPerPeriod": 5000,
+        "consent": AGREEMENT_CONSENT,
+    }
+    assert agreement["consent"] == recorded
+
+
+def test_create_agreement_without_a_card_sends_only_the_plan_and_the_customer(client, urlopen):
+    recorder = urlopen(_created(AGREEMENT))
+
+    agreement = client.create_agreement(PLAN_ID, "cus-42", idempotency_key="agr-cus-42")
+
+    assert json.loads(recorder.last.data) == {"planId": PLAN_ID, "customerReference": "cus-42"}
+    assert agreement["status"] == "pending"
+    assert "nextChargeAt" not in agreement
+
+
+def test_create_agreement_sends_extra_fields_in_the_signed_body_and_they_win(client, urlopen):
+    recorder = urlopen(_created(AGREEMENT))
+
+    client.create_agreement(
+        PLAN_ID, "cus-42", idempotency_key="agr-cus-42",
+        extra={"customerReference": "cus-43", "futureField": True},
+    )
+
+    sent = json.loads(recorder.last.data)
+    assert sent["customerReference"] == "cus-43"
+    assert sent["futureField"] is True
+    _assert_signed(recorder.last, "POST", AGREEMENTS_PATH)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"idempotency_key": None},
+        {"plan_id": None},
+        {"customer_reference": ""},
+        {"max_amount_per_period": 0},
+        {"max_amount_per_period": 50.0},
+    ],
+    ids=["no-key", "no-plan", "no-customer", "zero-maximum", "float-maximum"],
+)
+def test_create_agreement_refuses_bad_input_before_any_request(client, urlopen, overrides):
+    recorder = urlopen(_created(AGREEMENT))
+    arguments = dict(plan_id=PLAN_ID, customer_reference="cus-42", idempotency_key="agr-cus-42")
+    arguments.update(overrides)
+
+    with pytest.raises(ValueError):
+        client.create_agreement(**arguments)
+
+    assert recorder.requests == []
+
+
+def test_get_agreement_returns_the_past_due_fields_the_gateway_sends(client, urlopen):
+    past_due = dict(
+        AGREEMENT, status="past_due", pastDueReason="card_expired",
+        pastDueAt="2026-11-11T09:05:00Z", sequence=3,
+    )
+    recorder = urlopen((200, {"success": True, "data": past_due}))
+
+    agreement = client.get_agreement(AGREEMENT_ID)
+
+    path = AGREEMENTS_PATH + "/" + AGREEMENT_ID
+    assert recorder.last.get_method() == "GET"
+    assert recorder.last.full_url == BASE_URL + path
+    _assert_signed(recorder.last, "GET", path)
+    assert agreement == past_due
+
+
+@pytest.mark.parametrize(
+    "call, status, code",
+    [
+        (lambda c: c.get_plan(PLAN_ID), 404, "PLAN_NOT_FOUND"),
+        (lambda c: c.delete_plan(PLAN_ID), 404, "PLAN_NOT_FOUND"),
+        (lambda c: c.create_plan(**_plan_arguments()), 422, "IDEMPOTENCY_KEY_REUSED"),
+        (lambda c: c.create_agreement(PLAN_ID, "cus-42", idempotency_key="agr-1"), 409, "PLAN_NOT_ACTIVE"),
+        (
+            lambda c: c.create_agreement(
+                PLAN_ID, "cus-42", max_amount_per_period=5000, idempotency_key="agr-1",
+            ),
+            422,
+            "AGREEMENT_CONSENT_REQUIRED",
+        ),
+        (lambda c: c.get_agreement(AGREEMENT_ID), 404, "AGREEMENT_NOT_FOUND"),
+        (lambda c: c.cancel_agreement(AGREEMENT_ID), 409, "AGREEMENT_ENDED"),
+    ],
+    ids=["plan-not-found", "archive-not-found", "key-reused", "plan-not-active",
+         "consent-required", "agreement-not-found", "agreement-ended"],
+)
+def test_a_plan_or_agreement_refusal_is_an_api_error_with_the_code_and_the_envelope(
+    client, urlopen, call, status, code
+):
+    body = _gateway_error(status, code, "Refused")
+    urlopen((status, body))
+
+    with pytest.raises(ApiError) as caught:
+        call(client)
+
+    assert caught.value.http_status == status
+    assert caught.value.error_code == code
+    assert caught.value.result == body
+
+
+def test_a_maximum_below_the_plan_amount_carries_the_minimum_in_the_result(client, urlopen):
+    body = _gateway_error(422, "MAX_AMOUNT_BELOW_PLAN_AMOUNT", "maxAmountPerPeriod 2000 is below")
+    body["error"]["validationErrors"] = [{
+        "field": "maxAmountPerPeriod", "code": "MAX_AMOUNT_BELOW_PLAN_AMOUNT",
+        "message": "maxAmountPerPeriod 2000 is below", "params": {"min": 2500},
+    }]
+    urlopen((422, body))
+
+    with pytest.raises(ApiError) as caught:
+        client.create_agreement(
+            PLAN_ID, "cus-42", max_amount_per_period=2000, consent=AGREEMENT_CONSENT,
+            idempotency_key="agr-cus-42",
+        )
+
+    assert caught.value.error_code == "MAX_AMOUNT_BELOW_PLAN_AMOUNT"
+    assert caught.value.result["error"]["validationErrors"][0]["params"]["min"] == 2500
+
+
+@pytest.mark.parametrize(
+    "outcome, error",
+    [
+        ((429, RATE_LIMITED_BODY, {"Retry-After": "5"}), RateLimitError),
+        (
+            (403, _gateway_error(403, "INSUFFICIENT_SCOPE", "This route needs the payments scope.")),
+            AuthenticationError,
+        ),
+        ((503, {"success": False}), TransportError),
+    ],
+    ids=["429", "403", "503"],
+)
+def test_the_plan_and_agreement_routes_keep_the_shared_failure_rules(client, urlopen, outcome, error):
+    urlopen(outcome)
+
+    with pytest.raises(error):
+        client.list_plans()
