@@ -8,7 +8,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Union, cast
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Union, cast
 
 from .exceptions import (
     STOREFRONT_ERROR_CODES,
@@ -24,7 +24,7 @@ from .exceptions import (
     StorefrontError,
     TransportError,
 )
-from .models import Agreement, Plan, Refund, RefundList
+from .models import Agreement, Plan, Refund, RefundList, WebhookEndpoint
 
 __version__ = "0.4.0"
 
@@ -36,6 +36,7 @@ PAYMENTS_PATH = "/merchant-api/payments"
 CONTRACT_PATH = "/merchant-api/integration/contract"
 PLANS_PATH = "/merchant-api/plans"
 AGREEMENTS_PATH = "/merchant-api/agreements"
+WEBHOOKS_PATH = "/merchant-api/webhooks"
 DEFAULT_TIMEOUT_SECONDS = 45.0  # serverless cold starts hit 10+s on dev; 15s was a coin flip
 
 #: Hosts allowed to be addressed over plain http. Everything else must be https, so the
@@ -343,6 +344,14 @@ def _normalize_transaction_id(transaction_id: str) -> str:
         raise ValueError(
             "transaction_id must be the UUID returned by create_checkout_session()"
         )
+    return normalized
+
+
+def _normalize_webhook_id(webhook_id: Any) -> str:
+    # Signed in the lowercase hyphenated form, the same rule as a transaction id.
+    normalized = str(webhook_id or "").strip().lower()
+    if not _TRANSACTION_ID_RE.match(normalized):
+        raise ValueError("webhook_id must be the endpoint id from create_webhook_endpoint()")
     return normalized
 
 
@@ -1336,6 +1345,89 @@ class DominaiteClient:
         """
         normalized = _normalize_recurring_id(agreement_id, "agreement_id")
         self._request("DELETE", AGREEMENTS_PATH + "/" + normalized, None, "")
+
+    def create_webhook_endpoint(
+        self,
+        url: str,
+        events: Sequence[str],
+        idempotency_key: Optional[str] = None,
+        extra: Optional[Mapping[str, Any]] = None,
+    ) -> WebhookEndpoint:
+        """Register an endpoint that receives webhook deliveries.
+
+        Needs a key with the ``webhooks:manage`` scope. A key with the ``payments`` scope
+        cannot hold it, so use a separate key for this.
+
+        :param url: The HTTPS URL on a public host that receives the deliveries, at most
+            500 characters.
+        :param events: The event types to deliver, 1 to 50 of them, for example
+            ``["payment.succeeded", "payment.refunded"]``. The SDK does not check the names.
+            The API refuses an unknown type with ``VALIDATION_ERROR``.
+        :param idempotency_key: Required. The same key with the same url and events answers
+            the same endpoint again, without ``secret``. After a timeout or a 503, retry
+            with the SAME key: that replaces an endpoint the lost attempt registered.
+        :param extra: More request fields, sent as given in the signed body.
+        :returns: The :class:`WebhookEndpoint`. ``secret`` is on the first answer only.
+
+        :raises ApiError: A 4xx with ``error_code``; nothing new was registered:
+            ``WEBHOOK_URL_REJECTED`` or ``VALIDATION_ERROR`` (400);
+            ``WEBHOOK_LIMIT_REACHED`` (409, delete an endpoint first);
+            ``WEBHOOK_ALREADY_REGISTERED`` (409, the key registered an endpoint more than
+            a day ago; ``result["error"]["params"]["webhookId"]`` names it);
+            ``DUPLICATE_REQUEST`` (409, retry with the same key after a second);
+            ``IDEMPOTENCY_KEY_REUSED`` (422).
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``webhooks:manage`` scope (403).
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``, then retry WITH
+            the same ``idempotency_key``.
+        :raises TransportError: Network-level failure or a 5xx. Retry WITH the same
+            ``idempotency_key``.
+        """
+        if not url:
+            raise ValueError("url is required")
+        if isinstance(events, (str, bytes)) or not events:
+            raise ValueError("events must be a list of event types, for example ['payment.succeeded']")
+        key = _normalize_idempotency_key(idempotency_key)
+
+        body: Dict[str, Any] = {"url": url, "events": list(events)}
+        if extra is not None:
+            body.update(extra)
+        return cast(WebhookEndpoint, self._request("POST", WEBHOOKS_PATH, body, key))
+
+    def list_webhook_endpoints(self) -> List[WebhookEndpoint]:
+        """List your webhook endpoints, the newest first, never with a secret.
+
+        The list has every active endpoint and your newest 1000 inactive ones. It is not
+        paged. Needs a key with the ``webhooks:manage`` scope.
+
+        :returns: A list of :class:`WebhookEndpoint`.
+
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``webhooks:manage`` scope (403).
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``.
+        :raises ApiError: An unexpected response.
+        :raises TransportError: Network-level failure or a 5xx (safe to retry).
+        """
+        return cast(
+            List[WebhookEndpoint], self._request_list(WEBHOOKS_PATH, "webhook endpoint list")
+        )
+
+    def delete_webhook_endpoint(self, webhook_id: str) -> None:
+        """Delete a webhook endpoint. It stops receiving deliveries at once.
+
+        Needs a key with the ``webhooks:manage`` scope.
+
+        :param webhook_id: The endpoint ``id`` (a UUID). Any letter case is accepted.
+
+        :raises ApiError: ``WEBHOOK_NOT_FOUND`` (404): the id is unknown or already
+            deleted. A retry after a lost answer gets this too, so treat it as done.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``webhooks:manage`` scope (403).
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``.
+        :raises TransportError: Network-level failure or a 5xx (safe to retry).
+        """
+        normalized = _normalize_webhook_id(webhook_id)
+        self._request("DELETE", WEBHOOKS_PATH + "/" + normalized, None, "")
 
     def _request(
         self,

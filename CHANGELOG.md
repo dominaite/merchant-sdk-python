@@ -42,6 +42,10 @@
   return the `Plan` and `Agreement` `TypedDict`s. A create needs an idempotency key and takes
   `extra`. `update_plan` sends no key, and `trial_days=0` and `cancel_url=""` reach the API.
   Plan and agreement ids keep their case. `PLANS_PATH` and `AGREEMENTS_PATH` are exported.
+- Webhook endpoints: `create_webhook_endpoint`, `list_webhook_endpoints` and
+  `delete_webhook_endpoint`, with the `WebhookEndpoint` `TypedDict`. They need a key with the
+  `webhooks:manage` scope. `secret` is in the first answer of a create only. The SDK sends event
+  names as given. `WEBHOOKS_PATH` is exported.
 
 ### Changed
 

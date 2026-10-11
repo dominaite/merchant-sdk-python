@@ -29,6 +29,7 @@ from dominaite import (
     SESSIONS_PATH,
     STOREFRONT_ERROR_CODES,
     VALIDATION_ERROR_CODES,
+    WEBHOOKS_PATH,
     ApiError,
     AuthenticationError,
     ChargeError,
@@ -2932,3 +2933,193 @@ def test_the_plan_and_agreement_routes_keep_the_shared_failure_rules(client, url
 
     with pytest.raises(error):
         client.list_plans()
+
+
+# --- webhook endpoints -------------------------------------------------------
+
+WEBHOOK_ID = "0f8fad5b-d9cb-469f-a165-70867728950e"
+WEBHOOK_PATH = WEBHOOKS_PATH + "/" + WEBHOOK_ID
+WEBHOOK_ENDPOINT = {
+    "id": WEBHOOK_ID,
+    "url": "https://shop.example/webhooks/dominaite",
+    "events": ["payment.succeeded", "payment.refunded"],
+    "status": "active",
+    "createdAt": "2026-10-11T09:00:00Z",
+}
+WEBHOOK_SECRET = "whsec_" + "ab" * 32
+
+
+def _webhook_arguments(**overrides):
+    arguments = dict(
+        url=WEBHOOK_ENDPOINT["url"], events=["payment.succeeded", "payment.refunded"],
+        idempotency_key="webhook-shop-1",
+    )
+    arguments.update(overrides)
+    return arguments
+
+
+def test_create_webhook_endpoint_signs_the_key_and_returns_the_secret(client, urlopen):
+    recorder = urlopen(_created(dict(WEBHOOK_ENDPOINT, secret=WEBHOOK_SECRET)))
+
+    endpoint = client.create_webhook_endpoint(**_webhook_arguments())
+
+    request = recorder.last
+    assert request.get_method() == "POST"
+    assert request.full_url == BASE_URL + WEBHOOKS_PATH
+    assert _headers(request)["idempotency-key"] == "webhook-shop-1"
+    _assert_signed(request, "POST", WEBHOOKS_PATH)
+    assert json.loads(request.data) == {
+        "url": "https://shop.example/webhooks/dominaite",
+        "events": ["payment.succeeded", "payment.refunded"],
+    }
+    assert endpoint["secret"] == WEBHOOK_SECRET
+
+
+def test_a_replayed_create_answers_the_endpoint_without_a_secret(client, urlopen):
+    urlopen(_created(WEBHOOK_ENDPOINT))
+
+    endpoint = client.create_webhook_endpoint(**_webhook_arguments())
+
+    assert endpoint == WEBHOOK_ENDPOINT
+    assert "secret" not in endpoint
+
+
+def test_create_webhook_endpoint_sends_any_sequence_of_events_and_extra_fields(client, urlopen):
+    recorder = urlopen(_created(WEBHOOK_ENDPOINT))
+
+    client.create_webhook_endpoint(**_webhook_arguments(
+        events=("payment.succeeded", "agreement.activated"), extra={"description": "Shop"},
+    ))
+
+    sent = json.loads(recorder.last.data)
+    assert sent["events"] == ["payment.succeeded", "agreement.activated"]
+    assert sent["description"] == "Shop"
+    _assert_signed(recorder.last, "POST", WEBHOOKS_PATH)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"idempotency_key": None}, {"url": ""}, {"events": []}, {"events": "payment.succeeded"}],
+    ids=["no-key", "no-url", "no-events", "a-bare-string"],
+)
+def test_create_webhook_endpoint_refuses_bad_input_before_any_request(client, urlopen, overrides):
+    recorder = urlopen(_created(WEBHOOK_ENDPOINT))
+
+    with pytest.raises(ValueError):
+        client.create_webhook_endpoint(**_webhook_arguments(**overrides))
+
+    assert recorder.requests == []
+
+
+def test_list_webhook_endpoints_returns_every_endpoint_of_the_bare_list(client, urlopen):
+    inactive = dict(WEBHOOK_ENDPOINT, id="7c9e6679-7425-40de-944b-e07fc1f90ae7", status="inactive")
+    recorder = urlopen((200, {"success": True, "data": [WEBHOOK_ENDPOINT, inactive]}))
+
+    endpoints = client.list_webhook_endpoints()
+
+    request = recorder.last
+    assert request.get_method() == "GET"
+    assert request.full_url == BASE_URL + WEBHOOKS_PATH
+    assert request.data is None
+    assert "idempotency-key" not in _headers(request)
+    _assert_signed(request, "GET", WEBHOOKS_PATH)
+    assert endpoints == [WEBHOOK_ENDPOINT, inactive]
+
+
+@pytest.mark.parametrize(
+    "webhook_id",
+    [WEBHOOK_ID.upper(), " " + WEBHOOK_ID + " ", uuid.UUID(WEBHOOK_ID)],
+    ids=["upper-case", "padded", "uuid-object"],
+)
+def test_delete_webhook_endpoint_signs_the_lowercase_id_and_returns_none_on_204(
+    client, urlopen, webhook_id
+):
+    recorder = urlopen((204, b""))
+
+    assert client.delete_webhook_endpoint(webhook_id) is None
+
+    request = recorder.last
+    assert request.get_method() == "DELETE"
+    assert request.full_url == BASE_URL + WEBHOOK_PATH
+    assert request.data is None
+    assert "idempotency-key" not in _headers(request)
+    _assert_signed(request, "DELETE", WEBHOOK_PATH)
+
+
+@pytest.mark.parametrize(
+    "webhook_id",
+    [None, "", "whk_123", WEBHOOK_ID + "/x"],
+    ids=["none", "empty", "not-a-uuid", "two-segments"],
+)
+def test_delete_webhook_endpoint_refuses_an_id_that_is_not_a_uuid(client, urlopen, webhook_id):
+    recorder = urlopen((204, b""))
+
+    with pytest.raises(ValueError):
+        client.delete_webhook_endpoint(webhook_id)
+
+    assert recorder.requests == []
+
+
+@pytest.mark.parametrize(
+    "call, status, code",
+    [
+        (lambda c: c.create_webhook_endpoint(**_webhook_arguments()), 400, "WEBHOOK_URL_REJECTED"),
+        (lambda c: c.create_webhook_endpoint(**_webhook_arguments()), 400, "VALIDATION_ERROR"),
+        (lambda c: c.create_webhook_endpoint(**_webhook_arguments()), 409, "WEBHOOK_LIMIT_REACHED"),
+        (lambda c: c.create_webhook_endpoint(**_webhook_arguments()), 409, "DUPLICATE_REQUEST"),
+        (lambda c: c.create_webhook_endpoint(**_webhook_arguments()), 422, "IDEMPOTENCY_KEY_REUSED"),
+        (lambda c: c.delete_webhook_endpoint(WEBHOOK_ID), 404, "WEBHOOK_NOT_FOUND"),
+    ],
+    ids=["url-rejected", "unknown-event", "limit", "in-flight", "key-reused", "not-found"],
+)
+def test_a_webhook_endpoint_refusal_is_an_api_error_with_the_code_and_the_envelope(
+    client, urlopen, call, status, code
+):
+    body = _gateway_error(status, code, "Refused")
+    urlopen((status, body))
+
+    with pytest.raises(ApiError) as caught:
+        call(client)
+
+    assert caught.value.http_status == status
+    assert caught.value.error_code == code
+    assert caught.value.result == body
+
+
+def test_an_endpoint_the_key_already_registered_is_named_in_the_result(client, urlopen):
+    body = _gateway_error(409, "WEBHOOK_ALREADY_REGISTERED", "This key already registered an endpoint.")
+    body["error"]["params"] = {"webhookId": WEBHOOK_ID}
+    urlopen((409, body))
+
+    with pytest.raises(ApiError) as caught:
+        client.create_webhook_endpoint(**_webhook_arguments())
+
+    assert caught.value.error_code == "WEBHOOK_ALREADY_REGISTERED"
+    assert caught.value.result["error"]["params"]["webhookId"] == WEBHOOK_ID
+
+
+def test_a_key_without_the_webhooks_scope_gets_the_scope_named(client, urlopen):
+    message = "This API key does not hold the webhooks:manage scope."
+    urlopen((403, _gateway_error(403, "INSUFFICIENT_SCOPE", message)))
+
+    with pytest.raises(AuthenticationError) as caught:
+        client.list_webhook_endpoints()
+
+    assert caught.value.http_status == 403
+    assert caught.value.error_code == "INSUFFICIENT_SCOPE"
+    assert "webhooks:manage" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "outcome, error",
+    [
+        ((429, RATE_LIMITED_BODY, {"Retry-After": "5"}), RateLimitError),
+        ((503, {"success": False}), TransportError),
+    ],
+    ids=["429", "503"],
+)
+def test_the_webhook_endpoint_routes_keep_the_shared_failure_rules(client, urlopen, outcome, error):
+    urlopen(outcome)
+
+    with pytest.raises(error):
+        client.create_webhook_endpoint(**_webhook_arguments())

@@ -266,3 +266,25 @@ class Agreement(_AgreementRequired, total=False):
     consent: Optional[AgreementConsent]
     activatedAt: Optional[str]
     cancelledAt: Optional[str]
+
+
+class _WebhookEndpointRequired(TypedDict):
+    id: str
+    url: str
+    events: List[str]
+    status: str
+    createdAt: str
+
+
+class WebhookEndpoint(_WebhookEndpointRequired, total=False):
+    """A webhook endpoint, as the webhook endpoint methods of :class:`DominaiteClient`
+    return it.
+
+    ``id`` is a UUID. ``status`` is a plain string: ``active`` (deliveries are sent) or
+    ``inactive`` (deliveries are paused, in the dashboard or after repeated failed
+    deliveries). ``secret`` is the ``whsec_`` signing secret for :func:`verify_webhook`. It
+    is only on the first answer of :meth:`DominaiteClient.create_webhook_endpoint`, so store
+    it when you get it.
+    """
+
+    secret: str

@@ -10,6 +10,7 @@ from .client import (
     PING_PATH,
     PLANS_PATH,
     SESSIONS_PATH,
+    WEBHOOKS_PATH,
     DominaiteClient,
     __version__,
     order_idempotency_key,
@@ -48,6 +49,7 @@ from .models import (
     Refund,
     RefundList,
     StoredPaymentMethod,
+    WebhookEndpoint,
 )
 from .statuses import (
     CHARGE_STATUSES,
@@ -115,6 +117,7 @@ __all__ = [
     "UNSUPPORTED_CURRENCIES",
     "VALIDATION_ERROR_CODES",
     "WALLET_TYPES",
+    "WEBHOOKS_PATH",
     "WEBHOOK_SIGNATURE_HEADER",
     "Agreement",
     "AgreementConsent",
@@ -150,6 +153,7 @@ __all__ = [
     "StoredPaymentMethodStatus",
     "TransportError",
     "WalletType",
+    "WebhookEndpoint",
     "WebhookEvent",
     "WebhookVerificationError",
     "__version__",

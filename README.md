@@ -624,8 +624,9 @@ for refund in listing["refunds"]:  # newest first, each with every Refund key
 ## Webhooks
 
 Webhooks are how you find out what happened to a payment. Create an endpoint in the Dominaite
-dashboard, pick the events you care about, and store the `whsec_...` secret it shows you - like
-the API secret, it is shown **once**.
+dashboard or with `create_webhook_endpoint()` (see "Manage endpoints with the API" below), pick
+the events you care about, and store the `whsec_...` secret it shows you - like the API secret,
+it is shown **once**.
 
 Dominaite POSTs each event to your URL with an `X-Webhook-Signature` header:
 
@@ -672,6 +673,42 @@ most common webhook integration bug.
 stranger POSTed at you. Do not branch on `event["type"]` or trust an amount from an unverified
 payload.
 
+### Manage endpoints with the API
+
+You can also register, list and delete endpoints from your server. These calls need a key with
+the `webhooks:manage` scope. A key with the `payments` scope cannot hold it, so use a separate
+key.
+
+```python
+admin = DominaiteClient(webhooks_key_id, webhooks_key_secret)
+
+endpoint = admin.create_webhook_endpoint(
+    url="https://shop.example/webhooks/dominaite",
+    events=["payment.succeeded", "payment.failed", "payment.refunded"],
+    idempotency_key="webhook-shop-main",
+)
+save_secret(endpoint["id"], endpoint["secret"])  # whsec_..., in this answer only
+
+for item in admin.list_webhook_endpoints():  # newest first, never with a secret
+    print(item["id"], item["url"], item["status"])
+
+admin.delete_webhook_endpoint(endpoint["id"])
+```
+
+1. `secret` is in the first answer only. A replay with the same key and the list leave it out.
+   If you lose the secret, delete the endpoint and create it again.
+2. After a timeout or a 503, retry with the same `idempotency_key`. The retry replaces an
+   endpoint that the lost attempt registered. A new key cannot do this.
+3. A key used again more than a day later raises `WEBHOOK_ALREADY_REGISTERED`.
+   `result["error"]["params"]["webhookId"]` names the endpoint. Use a fresh key for a new
+   endpoint.
+4. `events` takes the types listed under "The events" below. The SDK sends the names as given.
+   The API refuses an unknown type with `VALIDATION_ERROR`.
+5. The URL must be HTTPS on a public host, or the API refuses it with `WEBHOOK_URL_REJECTED`.
+   You can have 25 active endpoints. One more raises `WEBHOOK_LIMIT_REACHED`.
+6. `delete_webhook_endpoint()` on an unknown or deleted id raises `WEBHOOK_NOT_FOUND`. After a
+   lost answer, treat that as done.
+
 ### The events
 
 `payment.succeeded`, `payment.failed`, `payment.requires_capture`, `payment.cancelled`,
@@ -679,6 +716,8 @@ payload.
 
 Recurring agreements add `agreement.activated`, `agreement.past_due`, `agreement.cancelled`,
 `charge.succeeded`, `charge.failed` and `charge.retrying`. They ride the same signed envelope.
+A verify-only session sends `verification.succeeded` or `verification.failed`, and no
+`payment.*` event.
 
 `payment.succeeded` is the only one that means money in hand. `requires_capture` is an approved
 hold, not a payment. `pending` and `processing` are never webhooked - if you want to show an
@@ -1078,8 +1117,8 @@ session = client.create_checkout_session(..., extra={"newField": "value"})
 ```
 
 1. `create_checkout_session`, `charge_payment_method`, `create_refund`, `create_plan`,
-   `update_plan` and `create_agreement` take `extra`. They send each key as given, in the
-   signed body.
+   `update_plan`, `create_agreement` and `create_webhook_endpoint` take `extra`. They send each
+   key as given, in the signed body.
 2. A key in `extra` replaces the same field that an argument set.
 3. The API ignores a field that it does not know, so a misspelled name is not an error. Check
    the name in the API reference.
