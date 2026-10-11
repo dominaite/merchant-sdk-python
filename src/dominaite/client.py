@@ -1,5 +1,6 @@
 """Server-side client for the Dominaite merchant API."""
 
+import datetime
 import hashlib
 import hmac
 import json
@@ -24,7 +25,15 @@ from .exceptions import (
     StorefrontError,
     TransportError,
 )
-from .models import Agreement, Plan, Refund, RefundList, WebhookEndpoint
+from .models import (
+    Agreement,
+    Plan,
+    Refund,
+    RefundList,
+    Transaction,
+    TransactionPage,
+    WebhookEndpoint,
+)
 
 __version__ = "0.4.0"
 
@@ -37,6 +46,7 @@ CONTRACT_PATH = "/merchant-api/integration/contract"
 PLANS_PATH = "/merchant-api/plans"
 AGREEMENTS_PATH = "/merchant-api/agreements"
 WEBHOOKS_PATH = "/merchant-api/webhooks"
+TRANSACTIONS_PATH = "/merchant-api/transactions"
 DEFAULT_TIMEOUT_SECONDS = 45.0  # serverless cold starts hit 10+s on dev; 15s was a coin flip
 
 #: Hosts allowed to be addressed over plain http. Everything else must be https, so the
@@ -345,6 +355,21 @@ def _normalize_transaction_id(transaction_id: str) -> str:
             "transaction_id must be the UUID returned by create_checkout_session()"
         )
     return normalized
+
+
+def _query_instant(value: Any, name: str) -> str:
+    """A window bound for the transaction list: a string as given, a datetime as UTC."""
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            # A naive datetime has no zone, and guessing one shifts the window silently.
+            raise ValueError("{0} must be a timezone-aware datetime".format(name))
+        utc = value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        return utc.isoformat() + "Z"
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    raise ValueError("{0} must be an ISO 8601 UTC string, a datetime or a date".format(name))
 
 
 def _normalize_webhook_id(webhook_id: Any) -> str:
@@ -1429,6 +1454,76 @@ class DominaiteClient:
         normalized = _normalize_webhook_id(webhook_id)
         self._request("DELETE", WEBHOOKS_PATH + "/" + normalized, None, "")
 
+    def list_transactions(
+        self,
+        from_: Union[str, datetime.date],
+        to: Union[str, datetime.date],
+        status: Optional[str] = None,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+    ) -> TransactionPage:
+        """List your card payments created in a window, one page at a time.
+
+        Needs a key with the ``transactions:read`` scope. A payment is listed in the window
+        of its ``createdAt``, with its status at the time of the read. A refund is not a row
+        of its own: it shows on its payment as ``refundedAmount`` and ``status``. Rows come
+        oldest first. To read every page, send ``nextCursor`` back as ``cursor`` with the
+        same window and status, until ``nextCursor`` is None::
+
+            cursor = None
+            while True:
+                page = client.list_transactions(start, end, cursor=cursor)
+                handle(page["items"])
+                cursor = page["nextCursor"]
+                if cursor is None:
+                    break
+
+        :param from_: The start of the window, inclusive: an ISO 8601 UTC string such as
+            ``"2026-10-01T00:00:00Z"``, a timezone-aware ``datetime`` (sent as UTC) or a
+            ``date`` (midnight UTC).
+        :param to: The end of the window, exclusive, in the same forms. Later than
+            ``from_`` and at most 31 days after it.
+        :param status: Only payments in this status now, for example ``"succeeded"``.
+        :param limit: Rows per page, 1 to 100. The API uses 50 when you leave it out.
+        :param cursor: The ``nextCursor`` of the previous page, unchanged. Leave it out for
+            the first page.
+        :returns: A :class:`TransactionPage`.
+
+        :raises ValueError: A naive ``datetime`` or a ``limit`` that is not an integer,
+            before any request is made.
+        :raises ApiError: ``VALIDATION_ERROR`` (400): the window, ``status``, ``limit`` or
+            ``cursor`` is not valid. The fields are in
+            ``result["error"]["validationErrors"]``.
+        :raises AuthenticationError: Wrong/revoked credentials or bad signature
+            (401), or a key without the ``transactions:read`` scope (403).
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``.
+        :raises TransportError: Network-level failure or a 5xx (safe to retry).
+        """
+        query: Dict[str, str] = {
+            "from": _query_instant(from_, "from_"),
+            "to": _query_instant(to, "to"),
+        }
+        if status is not None:
+            query["status"] = str(getattr(status, "value", status))
+        if limit is not None:
+            _validate_whole_number(limit, "limit", 1)
+            query["limit"] = str(limit)
+        if cursor is not None:
+            query["cursor"] = cursor
+
+        reply = _checked(self._send("GET", TRANSACTIONS_PATH, None, "", query=query))
+        items = reply.payload.get("items")
+        if not isinstance(items, list):
+            raise ApiError(
+                reply.status,
+                "The API answered the transaction list without a list",
+                error_code="UNEXPECTED_RESPONSE",
+            )
+        page = dict(reply.payload)
+        page["items"] = [cast(Transaction, dict(item)) for item in items if isinstance(item, dict)]
+        page["nextCursor"] = reply.payload.get("nextCursor")
+        return cast(TransactionPage, page)
+
     def _request(
         self,
         method: str,
@@ -1459,12 +1554,14 @@ class DominaiteClient:
         body: Optional[Mapping[str, Any]],
         idempotency_key: str,
         signed: bool = True,
+        query: Optional[Mapping[str, str]] = None,
     ) -> _Reply:
         """Sign, send and parse one request.
 
         ``body`` is None for GET and DELETE: an empty body (and an empty idempotency
         key) is what gets signed. ``signed=False`` is for the one anonymous route, the
-        integration contract: no key id, timestamp or signature goes out.
+        integration contract: no key id, timestamp or signature goes out. ``query`` goes
+        into the URL only: the gateway signs the bare path, never a query string.
 
         Transport failures, redirects, non-JSON bodies, authentication failures (401,
         403) and rate limiting (429) raise here because they mean the same thing on
@@ -1494,9 +1591,12 @@ class DominaiteClient:
             headers["Idempotency-Key"] = idempotency_key
 
         data = payload.encode("utf-8") if body is not None else None
-        request = urllib.request.Request(
-            self._base_url + path, data=data, headers=headers, method=method
-        )
+        url = self._base_url + path
+        if query:
+            # urlencode percent-encodes "+", so an offset such as +02:00 does not arrive as
+            # a space.
+            url += "?" + urllib.parse.urlencode(query)
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
 
         headers_received: Any = None
         try:

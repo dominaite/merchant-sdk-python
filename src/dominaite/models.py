@@ -288,3 +288,44 @@ class WebhookEndpoint(_WebhookEndpointRequired, total=False):
     """
 
     secret: str
+
+
+class _TransactionRequired(TypedDict):
+    transactionId: str
+    type: str
+    status: str
+    amount: int
+    currency: str
+    createdAt: str
+
+
+class Transaction(_TransactionRequired, total=False):
+    """One row of :meth:`DominaiteClient.list_transactions`: a card payment.
+
+    ``type`` is ``payment`` (the payer paid on the checkout), ``charge`` (a saved card was
+    charged) or ``verification`` (a verify-only session saved a card; not a purchase).
+    ``status`` is the same value :meth:`DominaiteClient.get_status` answers. Both are plain
+    strings, and a value the SDK does not know yet is valid. The gateway leaves out a key
+    whose value is null, so read these with ``.get``:
+
+    - ``orderReference``: your own order id, absent when you sent none.
+    - ``completedAt``: when the payment first succeeded.
+    - ``storedPaymentMethodId``: on a ``charge``, the ``pm_`` id of the card charged.
+    - ``refundedAmount``: the total refunded so far in MINOR units, absent when nothing was.
+    """
+
+    orderReference: Optional[str]
+    completedAt: Optional[str]
+    storedPaymentMethodId: Optional[str]
+    refundedAmount: Optional[int]
+
+
+class TransactionPage(TypedDict):
+    """One page of :meth:`DominaiteClient.list_transactions`.
+
+    ``items`` holds the rows of this page, oldest first, and is empty when the window has
+    none. ``nextCursor`` is the ``cursor`` of the next page, and None on the last page.
+    """
+
+    items: List[Transaction]
+    nextCursor: Optional[str]

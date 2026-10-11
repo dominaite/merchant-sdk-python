@@ -31,6 +31,19 @@ passwords:
 Every request is signed with the secret (HMAC-SHA256) and timestamped. Keep your server clock
 on NTP - signatures older than 5 minutes are rejected.
 
+The scopes of a key decide which methods it can call:
+
+| Scope | Methods |
+|---|---|
+| `payments` | Sessions, `get_status`, charges, revokes, refunds, plans and agreements |
+| `transactions:read` | `list_transactions` |
+| `webhooks:manage` | `create_webhook_endpoint`, `list_webhook_endpoints`, `delete_webhook_endpoint` |
+
+A key with `payments` holds no other scope, so use a separate reporting key for the other two.
+A key issued before scopes existed holds `payments`. Every key can call `ping()`. A method that
+the key's scopes do not cover raises a 403 `AuthenticationError` with `error_code`
+`INSUFFICIENT_SCOPE`.
+
 ## Quickstart against dev
 
 Everything you need to go from nothing to a live session on the dev environment.
@@ -979,6 +992,38 @@ session (new transaction id, same key), so a customer who comes back late just p
 order-derived key for the life of the order to keep that path open. The band is not endless -
 once the platform has independently closed the attempt (about an hour past expiry), the replay
 answers `PRIOR_ATTEMPT_FAILED` and the key is spent; reconcile and use a fresh key.
+
+## Transactions
+
+`list_transactions()` lists your card payments created in a time window, one page at a time. Use
+it to reconcile and to build statements. It needs a key with the `transactions:read` scope.
+
+```python
+import datetime
+
+start = datetime.datetime(2026, 10, 1, tzinfo=datetime.timezone.utc)
+end = datetime.datetime(2026, 10, 8, tzinfo=datetime.timezone.utc)
+
+cursor = None
+while True:
+    page = client.list_transactions(start, end, status="succeeded", cursor=cursor)
+    for row in page["items"]:
+        record(row["transactionId"], row["type"], row["amount"], row.get("refundedAmount"))
+    cursor = page["nextCursor"]
+    if cursor is None:
+        break
+```
+
+1. The window is `from_` included, `to` not included, and at most 31 days long.
+2. Send an ISO 8601 UTC string, a timezone-aware `datetime` or a `date`. The SDK refuses a
+   naive `datetime`, because its zone is unknown.
+3. Rows come oldest first. Send `nextCursor` back as `cursor` with the same window and status,
+   until it is `None`. Paging never repeats or skips a row.
+4. A payment is in the window of its `createdAt`, with its status at the time of the read. A
+   refund is not a row of its own. It shows on its payment as `refundedAmount` and `status`.
+5. `type` is `payment`, `charge` or `verification`. A `verification` row is not a purchase.
+6. For a statement, end the window a few minutes in the past. Read again later to get changes
+   such as refunds. Fees are not in this list.
 
 ## Errors
 

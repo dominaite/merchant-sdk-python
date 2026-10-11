@@ -1,5 +1,6 @@
 """Contract tests for DominaiteClient: what it sends, and how it classifies answers."""
 
+import datetime
 import email
 import hashlib
 import io
@@ -7,6 +8,7 @@ import json
 import pickle
 import pprint
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -28,6 +30,7 @@ from dominaite import (
     SESSION_REFUSAL_ERROR_CODES,
     SESSIONS_PATH,
     STOREFRONT_ERROR_CODES,
+    TRANSACTIONS_PATH,
     VALIDATION_ERROR_CODES,
     WEBHOOKS_PATH,
     ApiError,
@@ -37,6 +40,7 @@ from dominaite import (
     CheckoutRefusedError,
     DominaiteClient,
     ErrorCode,
+    PaymentStatus,
     RateLimitError,
     RefundError,
     RefundStatus,
@@ -3123,3 +3127,176 @@ def test_the_webhook_endpoint_routes_keep_the_shared_failure_rules(client, urlop
 
     with pytest.raises(error):
         client.create_webhook_endpoint(**_webhook_arguments())
+
+
+# --- transactions ------------------------------------------------------------
+
+TRANSACTION_ROW = {
+    "transactionId": TRANSACTION_ID,
+    "orderReference": "order-1042",
+    "type": "payment",
+    "status": "succeeded",
+    "amount": 2500,
+    "currency": "EUR",
+    "createdAt": "2026-10-01T08:00:00Z",
+    "completedAt": "2026-10-01T08:01:00Z",
+}
+
+
+def _page(items, next_cursor=None):
+    return (200, {"success": True, "data": {"items": items, "nextCursor": next_cursor}})
+
+
+def _query(request):
+    return urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
+
+
+def test_list_transactions_signs_the_bare_path_and_sends_the_query_in_the_url(client, urlopen):
+    recorder = urlopen(_page([TRANSACTION_ROW], "cur_2"))
+
+    page = client.list_transactions(
+        "2026-10-01T00:00:00Z", "2026-10-08T00:00:00+02:00", status="succeeded", limit=2,
+        cursor="cur_1",
+    )
+
+    request = recorder.last
+    url = urllib.parse.urlsplit(request.full_url)
+    assert request.get_method() == "GET"
+    assert request.data is None
+    assert "idempotency-key" not in _headers(request)
+    assert "{0}://{1}{2}".format(url.scheme, url.netloc, url.path) == BASE_URL + TRANSACTIONS_PATH
+    _assert_signed(request, "GET", TRANSACTIONS_PATH)
+    assert _query(request) == {
+        "from": ["2026-10-01T00:00:00Z"],
+        "to": ["2026-10-08T00:00:00+02:00"],
+        "status": ["succeeded"],
+        "limit": ["2"],
+        "cursor": ["cur_1"],
+    }
+    # A raw "+" would reach the API as a space and move the window.
+    assert "%2B02%3A00" in url.query
+    assert page == {"items": [TRANSACTION_ROW], "nextCursor": "cur_2"}
+
+
+def test_list_transactions_sends_only_the_window_when_nothing_else_is_given(client, urlopen):
+    recorder = urlopen(_page([]))
+
+    page = client.list_transactions("2026-10-01", "2026-10-08")
+
+    assert _query(recorder.last) == {"from": ["2026-10-01"], "to": ["2026-10-08"]}
+    assert page == {"items": [], "nextCursor": None}
+
+
+def test_list_transactions_sends_datetimes_as_utc_dates_as_days_and_enum_statuses_as_values(
+    client, urlopen
+):
+    recorder = urlopen(_page([]))
+    plus_two = datetime.timezone(datetime.timedelta(hours=2))
+
+    client.list_transactions(
+        datetime.datetime(2026, 10, 1, 2, 0, tzinfo=plus_two), datetime.date(2026, 10, 8),
+        status=PaymentStatus.REFUNDED,
+    )
+
+    assert _query(recorder.last) == {
+        "from": ["2026-10-01T00:00:00Z"], "to": ["2026-10-08"], "status": ["refunded"],
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"from_": datetime.datetime(2026, 10, 1)},
+        {"from_": ""},
+        {"to": None},
+        {"limit": 0},
+        {"limit": "50"},
+        {"limit": True},
+    ],
+    ids=["naive-datetime", "empty-from", "no-to", "zero-limit", "string-limit", "bool-limit"],
+)
+def test_list_transactions_refuses_bad_input_before_any_request(client, urlopen, overrides):
+    recorder = urlopen(_page([]))
+    arguments = dict(from_="2026-10-01T00:00:00Z", to="2026-10-08T00:00:00Z")
+    arguments.update(overrides)
+
+    with pytest.raises(ValueError):
+        client.list_transactions(**arguments)
+
+    assert recorder.requests == []
+
+
+def test_list_transactions_reads_every_page_with_the_cursor(client, urlopen):
+    charge = dict(
+        TRANSACTION_ROW, transactionId=LETTERED_TRANSACTION_ID, type="charge",
+        storedPaymentMethodId=PAYMENT_METHOD_ID,
+    )
+    recorder = urlopen(_page([TRANSACTION_ROW], "cur_2"), _page([charge]))
+
+    rows, cursor = [], None
+    while True:
+        page = client.list_transactions("2026-10-01T00:00:00Z", "2026-10-08T00:00:00Z", cursor=cursor)
+        rows.extend(page["items"])
+        cursor = page["nextCursor"]
+        if cursor is None:
+            break
+
+    assert rows == [TRANSACTION_ROW, charge]
+    assert "cursor" not in _query(recorder.requests[0])
+    assert _query(recorder.requests[1])["cursor"] == ["cur_2"]
+    for request in recorder.requests:
+        _assert_signed(request, "GET", TRANSACTIONS_PATH)
+
+
+def test_a_page_without_a_next_cursor_is_the_last_page(client, urlopen):
+    urlopen((200, {"success": True, "data": {"items": [TRANSACTION_ROW]}}))
+
+    assert client.list_transactions("2026-10-01", "2026-10-08")["nextCursor"] is None
+
+
+def test_a_page_without_items_is_an_unexpected_response(client, urlopen):
+    urlopen((200, {"success": True, "data": {"nextCursor": None}}))
+
+    with pytest.raises(ApiError) as caught:
+        client.list_transactions("2026-10-01", "2026-10-08")
+
+    assert caught.value.error_code == "UNEXPECTED_RESPONSE"
+    assert caught.value.http_status == 200
+
+
+def test_an_invalid_window_is_an_api_error_with_the_whole_envelope(client, urlopen):
+    body = _gateway_error(400, "VALIDATION_ERROR", "from and to may be at most 31 days apart")
+    urlopen((400, body))
+
+    with pytest.raises(ApiError) as caught:
+        client.list_transactions("2026-09-01", "2026-10-08")
+
+    assert caught.value.http_status == 400
+    assert caught.value.error_code == "VALIDATION_ERROR"
+    assert caught.value.result == body
+
+
+def test_a_key_without_the_transactions_scope_gets_the_scope_named(client, urlopen):
+    message = "This API key does not hold the transactions:read scope."
+    urlopen((403, _gateway_error(403, "INSUFFICIENT_SCOPE", message)))
+
+    with pytest.raises(AuthenticationError) as caught:
+        client.list_transactions("2026-10-01", "2026-10-08")
+
+    assert caught.value.http_status == 403
+    assert "transactions:read" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "outcome, error",
+    [
+        ((429, RATE_LIMITED_BODY, {"Retry-After": "5"}), RateLimitError),
+        ((503, {"success": False}), TransportError),
+    ],
+    ids=["429", "503"],
+)
+def test_the_transaction_list_keeps_the_shared_failure_rules(client, urlopen, outcome, error):
+    urlopen(outcome)
+
+    with pytest.raises(error):
+        client.list_transactions("2026-10-01", "2026-10-08")

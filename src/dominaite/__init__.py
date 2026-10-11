@@ -10,6 +10,7 @@ from .client import (
     PING_PATH,
     PLANS_PATH,
     SESSIONS_PATH,
+    TRANSACTIONS_PATH,
     WEBHOOKS_PATH,
     DominaiteClient,
     __version__,
@@ -49,6 +50,8 @@ from .models import (
     Refund,
     RefundList,
     StoredPaymentMethod,
+    Transaction,
+    TransactionPage,
     WebhookEndpoint,
 )
 from .statuses import (
@@ -114,6 +117,7 @@ __all__ = [
     "STORED_PAYMENT_METHOD_RETIRED_REASONS",
     "STORED_PAYMENT_METHOD_STATUSES",
     "TERMINAL_PAYMENT_STATUSES",
+    "TRANSACTIONS_PATH",
     "UNSUPPORTED_CURRENCIES",
     "VALIDATION_ERROR_CODES",
     "WALLET_TYPES",
@@ -151,6 +155,8 @@ __all__ = [
     "StoredPaymentMethod",
     "StoredPaymentMethodRetiredReason",
     "StoredPaymentMethodStatus",
+    "Transaction",
+    "TransactionPage",
     "TransportError",
     "WalletType",
     "WebhookEndpoint",

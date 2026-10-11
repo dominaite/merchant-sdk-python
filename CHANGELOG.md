@@ -46,6 +46,10 @@
   `delete_webhook_endpoint`, with the `WebhookEndpoint` `TypedDict`. They need a key with the
   `webhooks:manage` scope. `secret` is in the first answer of a create only. The SDK sends event
   names as given. `WEBHOOKS_PATH` is exported.
+- `list_transactions(from_, to, status, limit, cursor)` returns a `TransactionPage`: the card
+  payments created in a window, oldest first, and `nextCursor` for the next page. It needs a key
+  with the `transactions:read` scope. The query goes in the URL, and the signature covers the
+  path only. `Transaction`, `TransactionPage` and `TRANSACTIONS_PATH` are exported.
 
 ### Changed
 
