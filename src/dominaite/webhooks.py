@@ -194,7 +194,8 @@ def verify_webhook(
         reorders keys or drops a space changes the bytes and the signature will not
         match.
     :param signature_header: The ``X-Webhook-Signature`` value, ``t=...,v1=...``.
-    :param secret: The endpoint secret from the dashboard, shown once at creation.
+    :param secret: The endpoint secret (``whsec_...``). It is shown once: in the dashboard,
+        or in the answer of :meth:`DominaiteClient.create_webhook_endpoint`.
     :param tolerance_seconds: How far the delivery timestamp may sit from ``now``.
     :param now: Unix seconds to check the timestamp against. Defaults to the system
         clock; pass it to keep your own tests deterministic.

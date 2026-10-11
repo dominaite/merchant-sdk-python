@@ -9,12 +9,14 @@ Python 3.9+, standard library only. No `requests`, no framework, nothing to vend
 
 ## Install
 
-The package name is `dominaite` on PyPI (verified free 2026-08-17; matches `import dominaite`,
-the same pattern Stripe uses). It is **not published yet** - until it is, install from a checkout:
+```bash
+pip install dominaite
+```
+
+The package name on PyPI is `dominaite`, the same as `import dominaite`. To work on the SDK
+itself, install it from a checkout:
 
 ```bash
-pip install /path/to/dominaite-python-sdk
-# or, while you are working on the SDK itself:
 pip install -e /path/to/dominaite-python-sdk
 ```
 
@@ -961,6 +963,19 @@ for non-wallet payments) say how the payer paid. They are reporting data, not a 
 switch: a wallet payment refunds, captures and disputes like a card. `walletType` can carry a
 lower-cased wallet not in that list yet; treat it as a valid wallet, not an error. The known
 values are exported as `PAYMENT_METHOD_CATEGORIES` and `WALLET_TYPES`.
+
+The status read has more keys. The API leaves out a key whose value is null, so read them with
+`.get`. The `CheckoutStatus` `TypedDict` names every key.
+
+- `declineClass`: on a `failed` payment, what to do next: `hard`, `soft_funds`,
+  `soft_sca_required` or `soft_other`. It can be `None` until the decline is classified.
+- `isRecurring`: `True` for a charge on a stored card, `False` for a checkout session.
+- `verifyOnly`: `True` on a verify-only session.
+- `agreement`: on a subscription session, the agreement `id` and its current `status`. Read
+  `agreement["status"]`, not the payment status, to know if the subscription started.
+- `pspReference`: the payment processor's reference, for documents such as a receipt. It is
+  `None` until the processor reports it.
+- `sequence`: orders this read against the `charge.*` events of the same object.
 
 Poll after the payer returns to you, or on your order timeout - not in a tight loop; the
 endpoint is rate limited per key.
