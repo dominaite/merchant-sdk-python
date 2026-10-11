@@ -985,6 +985,15 @@ visible ASCII: letters, digits and punctuation, no spaces, no accented or non-La
 Anything else raises `ValueError` before the request is sent. If your order ids are not ASCII,
 derive the key from something that is (your numeric order id, or a hash of the reference).
 
+## Integration contract
+
+`get_integration_contract()` reads the public contract of the API: the request fields, the
+statuses, the error codes, the webhook events and the signing recipe that the API uses now.
+
+1. The route is anonymous. The request goes out without a signature, so a success does not
+   check your credentials. Use `ping()` for that.
+2. Read accepted values from it, for example `recurring.consentTextVersions` for `consent`.
+
 ## Fields the SDK does not model yet
 
 The API can accept a request field before this SDK has an argument for it. Send it in `extra`:

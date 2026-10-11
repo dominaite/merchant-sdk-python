@@ -33,6 +33,7 @@ SESSIONS_PATH = "/merchant-api/checkout/sessions"
 PAYMENT_METHODS_PATH = "/merchant-api/payment-methods"
 PING_PATH = "/merchant-api/ping"
 PAYMENTS_PATH = "/merchant-api/payments"
+CONTRACT_PATH = "/merchant-api/integration/contract"
 DEFAULT_TIMEOUT_SECONDS = 45.0  # serverless cold starts hit 10+s on dev; 15s was a coin flip
 
 #: Hosts allowed to be addressed over plain http. Everything else must be https, so the
@@ -448,6 +449,24 @@ class DominaiteClient:
         # GET signs an EMPTY idempotency key and an EMPTY body, and sends no
         # Idempotency-Key header.
         return self._request("GET", PING_PATH, None, "")
+
+    def get_integration_contract(self) -> Dict[str, Any]:
+        """Read the public integration contract of the API.
+
+        The contract lists the request fields, the statuses, the error codes, the webhook
+        events and the signing recipe that the API uses now. Use it to check what the API
+        accepts today, for example the ``recurring.consentTextVersions``.
+
+        The route is anonymous: the request goes out without a signature, so a success
+        here says nothing about your credentials. Use :meth:`ping` for that.
+
+        :returns: The contract as the API sends it, a plain dict.
+
+        :raises RateLimitError: HTTP 429; wait ``retry_after_seconds`` before retrying.
+        :raises ApiError: Unexpected API response.
+        :raises TransportError: Network-level failure or a 5xx.
+        """
+        return self._request("GET", CONTRACT_PATH, None, "", signed=False)
 
     def create_checkout_session(
         self,
@@ -1025,9 +1044,10 @@ class DominaiteClient:
         path: str,
         body: Optional[Mapping[str, Any]],
         idempotency_key: str,
+        signed: bool = True,
     ) -> Dict[str, Any]:
         """Send and apply the generic failure rules: 5xx is transport, 4xx is ApiError."""
-        reply = self._send(method, path, body, idempotency_key)
+        reply = self._send(method, path, body, idempotency_key, signed=signed)
         if reply.status >= 400:
             raise _rejection(reply)
         if not 200 <= reply.status < 300:
@@ -1051,11 +1071,13 @@ class DominaiteClient:
         path: str,
         body: Optional[Mapping[str, Any]],
         idempotency_key: str,
+        signed: bool = True,
     ) -> _Reply:
         """Sign, send and parse one request.
 
         ``body`` is None for GET and DELETE: an empty body (and an empty idempotency
-        key) is what gets signed.
+        key) is what gets signed. ``signed=False`` is for the one anonymous route, the
+        integration contract: no key id, timestamp or signature goes out.
 
         Transport failures, redirects, non-JSON bodies, authentication failures (401,
         403) and rate limiting (429) raise here because they mean the same thing on
@@ -1069,19 +1091,18 @@ class DominaiteClient:
             # exact bytes we send, so the JSON is serialized once and reused.
             payload = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
-        timestamp = str(int(time.time()))
-        signature = sign_request(
-            self._secret.reveal(), timestamp, method, path, idempotency_key, payload
-        )
-
         headers = {
             "Content-Type": "application/json",
-            "X-Api-Key-Id": self._key_id,
-            "X-Timestamp": timestamp,
-            "X-Signature": signature,
             # Some edges block requests without a real User-Agent - always send one.
             "User-Agent": "dominaite-python/" + __version__,
         }
+        if signed:
+            timestamp = str(int(time.time()))
+            headers["X-Api-Key-Id"] = self._key_id
+            headers["X-Timestamp"] = timestamp
+            headers["X-Signature"] = sign_request(
+                self._secret.reveal(), timestamp, method, path, idempotency_key, payload
+            )
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
 

@@ -15,6 +15,7 @@ import pytest
 from dominaite import (
     AUTHORIZATION_ERROR_CODES,
     CHARGE_ERROR_CODES,
+    CONTRACT_PATH,
     DEFAULT_BASE_URL,
     PAYMENT_METHODS_PATH,
     PAYMENTS_PATH,
@@ -2485,3 +2486,39 @@ def test_list_refunds_on_a_503_is_a_transport_error(client, urlopen):
 
     with pytest.raises(TransportError):
         client.list_refunds(TRANSACTION_ID)
+
+
+# --- integration contract ----------------------------------------------------
+
+
+def test_the_integration_contract_is_read_without_a_signature(client, urlopen):
+    """The route is anonymous. Sending no credentials keeps a success here from looking
+    like a credential check, which is ping's job."""
+    contract = {"sdks": ["python"], "recurring": {"consentTextVersions": ["recurring-2026-09"]}}
+    recorder = urlopen((200, {"success": True, "data": contract}))
+
+    result = client.get_integration_contract()
+
+    request = recorder.last
+    headers = _headers(request)
+    assert request.get_method() == "GET"
+    assert request.full_url == BASE_URL + CONTRACT_PATH
+    assert request.data is None
+    for header in ("x-api-key-id", "x-timestamp", "x-signature", "idempotency-key"):
+        assert header not in headers
+    assert result == contract
+
+
+@pytest.mark.parametrize(
+    "outcome, error",
+    [
+        ((429, RATE_LIMITED_BODY, {"Retry-After": "5"}), RateLimitError),
+        ((503, {"success": False}), TransportError),
+    ],
+    ids=["429", "503"],
+)
+def test_the_integration_contract_keeps_the_shared_failure_rules(client, urlopen, outcome, error):
+    urlopen(outcome)
+
+    with pytest.raises(error):
+        client.get_integration_contract()

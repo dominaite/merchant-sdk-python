@@ -35,6 +35,8 @@
 - `list_refunds(transaction_id)` returns a `RefundList`: the refunds of a payment made through
   this API, newest first, each a `Refund` with every key, plus `refundedAmount` and
   `refundableAmount`. `create_refund` takes `extra`.
+- `get_integration_contract()` reads the public integration contract of the API. The route is
+  anonymous, so the request goes out without a signature. `CONTRACT_PATH` is exported.
 
 ### Changed
 
