@@ -316,12 +316,21 @@ class Transaction(_TransactionRequired, total=False):
     - ``completedAt``: when the payment first succeeded.
     - ``storedPaymentMethodId``: on a ``charge``, the ``pm_`` id of the card charged.
     - ``refundedAmount``: the total refunded so far in MINOR units, absent when nothing was.
+    - ``fee``: the acquirer fee in MINOR units, absent until the payment is settled. It can
+      change, or go absent again, when the settlement is matched again.
+    - ``netAmount``: ``amount`` minus ``fee`` in MINOR units, absent when ``fee`` is.
+    - ``settledAt``: the settlement date as ISO 8601 UTC at midnight, absent until settled.
+    - ``payoutId``: the id of the payout that paid the money to you, absent until paid out.
     """
 
     orderReference: Optional[str]
     completedAt: Optional[str]
     storedPaymentMethodId: Optional[str]
     refundedAmount: Optional[int]
+    fee: Optional[int]
+    netAmount: Optional[int]
+    settledAt: Optional[str]
+    payoutId: Optional[str]
 
 
 class TransactionPage(TypedDict):

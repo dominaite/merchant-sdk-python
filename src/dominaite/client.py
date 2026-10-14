@@ -372,6 +372,18 @@ def _query_instant(value: Any, name: str) -> str:
     raise ValueError("{0} must be an ISO 8601 UTC string, a datetime or a date".format(name))
 
 
+def _query_date(value: Any, name: str) -> str:
+    """A settlement window bound: a calendar date. The API refuses a time of day."""
+    if isinstance(value, datetime.datetime):
+        # A datetime would send a time the API refuses; a date has no zone to get wrong.
+        raise ValueError("{0} must be a date, not a datetime".format(name))
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    raise ValueError("{0} must be a date or a yyyy-MM-dd string".format(name))
+
+
 def _normalize_webhook_id(webhook_id: Any) -> str:
     # Signed in the lowercase hyphenated form, the same rule as a transaction id.
     normalized = str(webhook_id or "").strip().lower()
@@ -1462,6 +1474,8 @@ class DominaiteClient:
         status: Optional[str] = None,
         limit: Optional[int] = None,
         cursor: Optional[str] = None,
+        settled_from: Optional[Union[str, datetime.date]] = None,
+        settled_to: Optional[Union[str, datetime.date]] = None,
     ) -> TransactionPage:
         """List your card payments created in a window, one page at a time.
 
@@ -1488,12 +1502,18 @@ class DominaiteClient:
         :param limit: Rows per page, 1 to 100. The API uses 50 when you leave it out.
         :param cursor: The ``nextCursor`` of the previous page, unchanged. Leave it out for
             the first page.
+        :param settled_from: The start of the settlement window, inclusive: a ``date`` or a
+            ``"2026-10-13"`` string. With it, the list has only payments the acquirer settled
+            in the window. ``from_`` and ``to`` still apply on ``createdAt``. Send it with
+            ``settled_to``.
+        :param settled_to: The end of the settlement window, exclusive, in the same forms.
+            Later than ``settled_from`` and at most 31 days after it.
         :returns: A :class:`TransactionPage`.
 
-        :raises ValueError: A naive ``datetime`` or a ``limit`` that is not an integer,
-            before any request is made.
-        :raises ApiError: ``VALIDATION_ERROR`` (400): the window, ``status``, ``limit`` or
-            ``cursor`` is not valid. The fields are in
+        :raises ValueError: A naive ``datetime``, a ``datetime`` as a settlement bound or a
+            ``limit`` that is not an integer, before any request is made.
+        :raises ApiError: ``VALIDATION_ERROR`` (400): the window, the settlement window,
+            ``status``, ``limit`` or ``cursor`` is not valid. The fields are in
             ``result["error"]["validationErrors"]``.
         :raises AuthenticationError: Wrong/revoked credentials or bad signature
             (401), or a key without the ``transactions:read`` scope (403).
@@ -1511,6 +1531,10 @@ class DominaiteClient:
             query["limit"] = str(limit)
         if cursor is not None:
             query["cursor"] = cursor
+        if settled_from is not None:
+            query["settledFrom"] = _query_date(settled_from, "settled_from")
+        if settled_to is not None:
+            query["settledTo"] = _query_date(settled_to, "settled_to")
 
         reply = _checked(self._send("GET", TRANSACTIONS_PATH, None, "", query=query))
         items = reply.payload.get("items")

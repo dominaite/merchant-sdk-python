@@ -3206,6 +3206,43 @@ def test_list_transactions_sends_datetimes_as_utc_dates_as_days_and_enum_statuse
     }
 
 
+def test_list_transactions_sends_the_settlement_window_as_dates_and_signs_the_bare_path(
+    client, urlopen
+):
+    recorder = urlopen(_page([]))
+
+    client.list_transactions(
+        "2026-09-14T00:00:00Z", "2026-10-14T00:00:00Z",
+        settled_from=datetime.date(2026, 10, 13), settled_to=" 2026-10-14 ",
+    )
+
+    request = recorder.last
+    assert urllib.parse.urlsplit(request.full_url).path.endswith(TRANSACTIONS_PATH)
+    _assert_signed(request, "GET", TRANSACTIONS_PATH)
+    assert _query(request) == {
+        "from": ["2026-09-14T00:00:00Z"], "to": ["2026-10-14T00:00:00Z"],
+        "settledFrom": ["2026-10-13"], "settledTo": ["2026-10-14"],
+    }
+
+
+def test_list_transactions_reads_a_settled_row_and_an_unsettled_row(client, urlopen):
+    settled = dict(
+        TRANSACTION_ROW, fee=75, netAmount=2425, settledAt="2026-10-02T00:00:00Z",
+        payoutId="5b0f3c1e-8d2a-4c6b-9f1e-2a7d4e6c8b90",
+    )
+    urlopen(_page([settled, TRANSACTION_ROW]))
+
+    paid, unsettled = client.list_transactions("2026-10-01", "2026-10-08")["items"]
+
+    assert paid["fee"] == 75
+    assert paid["netAmount"] == 2425
+    assert paid["settledAt"] == "2026-10-02T00:00:00Z"
+    assert paid["payoutId"] == "5b0f3c1e-8d2a-4c6b-9f1e-2a7d4e6c8b90"
+    # The gateway leaves the keys out until the payment settles.
+    for key in ("fee", "netAmount", "settledAt", "payoutId"):
+        assert unsettled.get(key) is None
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -3215,8 +3252,13 @@ def test_list_transactions_sends_datetimes_as_utc_dates_as_days_and_enum_statuse
         {"limit": 0},
         {"limit": "50"},
         {"limit": True},
+        {"settled_from": datetime.datetime(2026, 10, 13, tzinfo=datetime.timezone.utc)},
+        {"settled_to": ""},
     ],
-    ids=["naive-datetime", "empty-from", "no-to", "zero-limit", "string-limit", "bool-limit"],
+    ids=[
+        "naive-datetime", "empty-from", "no-to", "zero-limit", "string-limit", "bool-limit",
+        "datetime-settled-from", "empty-settled-to",
+    ],
 )
 def test_list_transactions_refuses_bad_input_before_any_request(client, urlopen, overrides):
     recorder = urlopen(_page([]))
