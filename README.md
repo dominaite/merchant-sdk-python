@@ -1080,7 +1080,23 @@ while True:
    refund is not a row of its own. It shows on its payment as `refundedAmount` and `status`.
 5. `type` is `payment`, `charge` or `verification`. A `verification` row is not a purchase.
 6. For a statement, end the window a few minutes in the past. Read again later to get changes
-   such as refunds. Fees are not in this list.
+   such as refunds.
+7. `fee`, `netAmount`, `settledAt` and `payoutId` are empty until the acquirer settles the
+   payment. This is usually the next business day. Read them with `.get`.
+8. `netAmount` is `amount` minus the fee of this payment only. Deductions on the whole payout
+   are not in it. `fee` and `netAmount` can change, so read a settlement day again before you
+   close your books on it.
+9. To get one settlement day, send `settled_from` as that day and `settled_to` as the next day.
+   Also send a `from_` and `to` that cover when those payments were created, for example the
+   last 31 days.
+
+```python
+today = datetime.date(2026, 10, 14)
+page = client.list_transactions(
+    today - datetime.timedelta(days=31), today,
+    settled_from=today - datetime.timedelta(days=1), settled_to=today,
+)
+```
 
 ## Errors
 
