@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.1
+
+### Added
+
+- `Transaction` names `fee`, `netAmount`, `settledAt` and `payoutId`. They are absent until the
+  acquirer settles the payment. `fee` and `netAmount` are in minor units, `settledAt` is the
+  settlement date at midnight UTC, and `payoutId` is set once the money is paid out.
+- `list_transactions` takes `settled_from` and `settled_to`, a settlement window on the
+  settlement date. They are dates (`date` or `"2026-10-13"`). The SDK refuses a `datetime`
+  before sending. `from_` and `to` are still required.
+
 ## 0.5.0
 
 ### Added
