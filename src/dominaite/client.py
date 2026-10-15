@@ -562,9 +562,15 @@ class DominaiteClient:
             ``verify_only`` session.
         :param currency: ISO 4217 code.
         :param order_reference: Your own order id, 100 chars or fewer.
-        :param customer: ``{"firstName", "lastName", "email", "phone"}``. Pass everything
-            you already know - prefilled fields are hidden from the payer, so the
-            checkout form stays short.
+        :param customer: ``{"firstName", "lastName", "email", "phone", "address", "city",
+            "postalCode", "state"}``. Pass everything you already know - prefilled fields
+            are hidden from the payer, so the checkout form stays short. The billing
+            address is optional: ``address`` (street, one line, at most 200 characters),
+            ``city`` (100), ``postalCode`` (20) and ``state`` (50, an ISO 3166-2
+            subdivision code such as ``CA`` or ``NSW``, only used for the United States,
+            Canada and Australia). A value over its limit is a 400 :class:`ApiError` with
+            ``error_code`` ``VALIDATION_ERROR``; ``result["error"]["validationErrors"]``
+            names the field with code ``MAX_LENGTH``.
         :param country: ISO 3166-1 alpha-2.
         :param language: ISO 639-1, the widget UI language.
         :param theme: The checkout theme, for example ``light``, ``dark`` or ``bright``. At
