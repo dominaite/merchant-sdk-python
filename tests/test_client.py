@@ -498,6 +498,30 @@ def test_get_status_normalizes_transaction_id_casing(client, urlopen):
     )
 
 
+def test_billing_address_fields_reach_the_wire_body_unchanged(client, urlopen):
+    recorder = urlopen(_ok())
+    customer = {
+        "firstName": "Ana",
+        "email": "ana@example.com",
+        "address": "1 Market St, Apt 4",
+        "city": "San Francisco",
+        "postalCode": "94105",
+        "state": "CA",
+    }
+
+    client.create_checkout_session(
+        amount=2500,
+        currency="USD",
+        order_reference="order-1042",
+        customer=customer,
+        idempotency_key=IDEMPOTENCY_KEY,
+    )
+
+    body = json.loads(recorder.last.data.decode("utf-8"))
+    assert body["customer"] == customer
+    assert list(body["customer"]) == list(customer)
+
+
 def test_get_status_rejects_non_uuid(client):
     with pytest.raises(ValueError, match="UUID"):
         client.get_status("order-1042")

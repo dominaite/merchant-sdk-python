@@ -144,6 +144,12 @@ try:
             "firstName": "Ana",
             "lastName": "Kirova",
             "email": "ana@example.com",
+            # Billing address, all optional. The checkout asks for these only when the
+            # payment processor needs them, and never for one you send.
+            "address": "12 Vitosha Blvd",  # one line, up to 200 characters
+            "city": "Sofia",               # up to 100 characters
+            "postalCode": "1000",          # up to 20 characters
+            # "state": "CA",               # up to 50; only for the US, Canada and Australia
         },
         language="bg",                  # widget UI language
         theme="dark",
@@ -307,6 +313,24 @@ A session is valid for 2 hours. If the payer comes back later, re-POST with the 
 idempotency key: once the session is a few minutes past expiry, that returns a fresh session
 for the same order (see
 [Recovering from a replay refusal](#recovering-from-a-replay-refusal)).
+
+## Billing address
+
+`customer` takes four optional billing fields next to the name, email and phone:
+
+| Field | Limit | Notes |
+|---|---|---|
+| `address` | 200 characters | Street address, one line. |
+| `city` | 100 characters | |
+| `postalCode` | 20 characters | |
+| `state` | 50 characters | ISO 3166-2 subdivision code, for example `CA` or `NSW`. Only used for the United States, Canada and Australia. |
+
+The checkout asks the payer for address, city and postal code only when the payment processor
+needs them. It does not ask for a field that the session already carries, so send what your own
+checkout already collected. The SDK sends the fields as given and does not check the limits. The
+API refuses a value over its limit with a 400, which arrives as `ApiError` with `error_code`
+`VALIDATION_ERROR`. `error.result["error"]["validationErrors"]` names the field, for example
+`{"field": "customer.postalCode", "code": "MAX_LENGTH"}`. Do not retry: fix the value first.
 
 ## Card fields
 
