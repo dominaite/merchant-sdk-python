@@ -19,7 +19,6 @@ from dominaite import (
     AUTHORIZATION_ERROR_CODES,
     CHARGE_ERROR_CODES,
     CONTRACT_PATH,
-    DEFAULT_BASE_URL,
     PAYMENT_METHODS_PATH,
     PAYMENTS_PATH,
     PING_PATH,
@@ -53,6 +52,8 @@ from dominaite import (
     sign_request,
     sign_webhook,
     verify_webhook,
+    PRODUCTION_BASE_URL,
+    SANDBOX_BASE_URL,
 )
 from dominaite.client import MAX_RESPONSE_BYTES
 
@@ -200,7 +201,7 @@ SENTINEL_SECRET = "dms_" + "S3CRET" * 5
 )
 def test_the_secret_never_appears_when_the_client_is_shown_or_serialized(surface):
     """Each of these is a real way a client ends up in a log line or a crash dump."""
-    client = DominaiteClient(KEY_ID, SENTINEL_SECRET)
+    client = DominaiteClient(KEY_ID, SENTINEL_SECRET, base_url=BASE_URL)
 
     assert SENTINEL_SECRET not in surface(client)
 
@@ -214,13 +215,13 @@ def test_the_client_defines_its_own_repr_as_a_guard():
     """
     assert DominaiteClient.__repr__ is not object.__repr__
 
-    text = repr(DominaiteClient(KEY_ID, SENTINEL_SECRET))
+    text = repr(DominaiteClient(KEY_ID, SENTINEL_SECRET, base_url=BASE_URL))
     assert "***redacted***" in text
     assert KEY_ID in text, "the key id is not secret - keep the repr useful"
 
 
 def test_the_secret_cannot_be_pickled():
-    client = DominaiteClient(KEY_ID, SENTINEL_SECRET)
+    client = DominaiteClient(KEY_ID, SENTINEL_SECRET, base_url=BASE_URL)
 
     with pytest.raises(TypeError):
         pickle.dumps(client._secret)
@@ -1340,9 +1341,61 @@ def test_accepts_https_and_plain_http_on_loopback(base_url):
     assert DominaiteClient(KEY_ID, SECRET, base_url=base_url) is not None
 
 
-def test_the_default_base_url_is_https():
-    assert DEFAULT_BASE_URL.startswith("https://")
-    assert DominaiteClient(KEY_ID, SECRET) is not None
+# --- base_url is required ----------------------------------------------------
+
+BASE_URL_REQUIRED = (
+    "base_url is required. Use https://api.staging.dominaite.com/payments for the sandbox "
+    "or https://api.dominaite.com/payments for production."
+)
+
+
+def test_a_missing_base_url_is_refused_with_both_urls_in_the_message():
+    """No default: an unset setting must not send sandbox credentials to production."""
+    with pytest.raises(ValueError) as refused:
+        DominaiteClient(KEY_ID, SECRET)
+
+    assert str(refused.value) == BASE_URL_REQUIRED
+
+
+@pytest.mark.parametrize("base_url", [None, "", "   ", "\t\n", "/", " // "])
+def test_an_empty_or_blank_base_url_is_refused(base_url):
+    """os.environ.get() of an unset variable gives None, a blank .env line gives ""."""
+    with pytest.raises(ValueError) as refused:
+        DominaiteClient(KEY_ID, SECRET, base_url=base_url)
+
+    assert str(refused.value) == BASE_URL_REQUIRED
+
+
+def test_the_base_url_is_the_third_positional_parameter(urlopen):
+    recorder = urlopen((200, {"data": {"pong": True}}))
+
+    DominaiteClient(KEY_ID, SECRET, SANDBOX_BASE_URL).ping()
+
+    assert recorder.requests[0].full_url == SANDBOX_BASE_URL + "/merchant-api/ping"
+
+
+def test_the_named_base_urls_are_the_sandbox_and_production_hosts():
+    assert SANDBOX_BASE_URL == "https://api.staging.dominaite.com/payments"
+    assert PRODUCTION_BASE_URL == "https://api.dominaite.com/payments"
+
+
+@pytest.mark.parametrize("base_url", [SANDBOX_BASE_URL, PRODUCTION_BASE_URL])
+def test_each_named_base_url_is_where_requests_go(urlopen, base_url):
+    recorder = urlopen((200, {"data": {"pong": True}}))
+    client = DominaiteClient(KEY_ID, SECRET, base_url=base_url)
+
+    client.ping()
+
+    assert recorder.requests[0].full_url == base_url + "/merchant-api/ping"
+
+
+def test_surrounding_whitespace_and_trailing_slashes_are_trimmed(urlopen):
+    recorder = urlopen((200, {"data": {"pong": True}}))
+    client = DominaiteClient(KEY_ID, SECRET, base_url="  " + SANDBOX_BASE_URL + "//  ")
+
+    client.ping()
+
+    assert recorder.requests[0].full_url == SANDBOX_BASE_URL + "/merchant-api/ping"
 
 
 # --- length limits count characters, not bytes -------------------------------

@@ -37,7 +37,10 @@ from .models import (
 
 __version__ = "0.5.2"
 
-DEFAULT_BASE_URL = "https://api.dominaite.com/payments"
+# There is no default base URL: an unset setting must fail at construction, not send
+# sandbox credentials to production. Pass one of these, or your own value.
+SANDBOX_BASE_URL = "https://api.staging.dominaite.com/payments"
+PRODUCTION_BASE_URL = "https://api.dominaite.com/payments"
 SESSIONS_PATH = "/merchant-api/checkout/sessions"
 PAYMENT_METHODS_PATH = "/merchant-api/payment-methods"
 PING_PATH = "/merchant-api/ping"
@@ -218,6 +221,23 @@ def _retry_after_seconds(headers: Any) -> Optional[int]:
     except ValueError:
         return None
     return seconds if seconds >= 0 else None
+
+
+def _require_base_url(base_url: Optional[str]) -> str:
+    """Return base_url without surrounding whitespace and trailing slashes.
+
+    Raises ValueError when it is missing, empty or whitespace-only. The SDK has no default,
+    so a base URL read from an unset environment variable fails here instead of calling
+    production with the wrong key.
+    """
+    trimmed = (base_url or "").strip().rstrip("/")
+    if not trimmed:
+        raise ValueError(
+            "base_url is required. Use {0} for the sandbox or {1} for production.".format(
+                SANDBOX_BASE_URL, PRODUCTION_BASE_URL
+            )
+        )
+    return trimmed
 
 
 def _require_secure_base_url(base_url: str) -> None:
@@ -450,7 +470,11 @@ class DominaiteClient:
 
     Usage::
 
-        client = DominaiteClient(os.environ["DOMINAITE_KEY_ID"], os.environ["DOMINAITE_SECRET"])
+        client = DominaiteClient(
+            os.environ["DOMINAITE_KEY_ID"],
+            os.environ["DOMINAITE_SECRET"],
+            base_url=os.environ["DOMINAITE_BASE_URL"],
+        )
         session = client.create_checkout_session(
             amount=2500,              # minor units: 25.00 EUR
             currency="EUR",
@@ -465,24 +489,26 @@ class DominaiteClient:
         self,
         key_id: str,
         secret: str,
-        base_url: str = DEFAULT_BASE_URL,
+        base_url: Optional[str] = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         """
         :param key_id: Your API key id (``dmk_...``), from the Dominaite dashboard.
         :param secret: Your API secret (``dms_...``). Server-side only.
-        :param base_url: Override for non-production environments. Must be ``https://``
-            unless the host is localhost, 127.0.0.1 or ::1.
+        :param base_url: Required. ``SANDBOX_BASE_URL`` or ``PRODUCTION_BASE_URL``, or your
+            own value. Must be ``https://`` unless the host is localhost, 127.0.0.1 or ::1.
+            A missing, empty or whitespace-only value raises ``ValueError``.
         :param timeout: Per-request socket timeout in seconds.
         """
         if not key_id.startswith("dmk_"):
             raise ValueError("key_id must start with dmk_")
         if not secret.startswith("dms_"):
             raise ValueError("secret must start with dms_")
+        base_url = _require_base_url(base_url)
         _require_secure_base_url(base_url)
         self._key_id = key_id
         self._secret = _Secret(secret)
-        self._base_url = base_url.rstrip("/")
+        self._base_url = base_url
         self._timeout = timeout
         # Own opener rather than urlopen(): the default one follows redirects, and the
         # signed headers must never leave the host we addressed.
