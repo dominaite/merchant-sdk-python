@@ -745,8 +745,8 @@ class DominaiteClient:
         :param max_retries: How many times a call is sent again after a transport error, a
             5xx or ``PAYMENT_PROCESSING_UNAVAILABLE``, with the same idempotency key and the
             same body. Default 2. 0 sends every call once. Applies to every GET and to every
-            POST that carries an idempotency key; never to a 429, a 4xx, a PATCH or a
-            DELETE. The wait before retry ``n`` (0 for the first) is random between 0 and
+            POST that carries an idempotency key; never to a 429, a 4xx, a PATCH, a
+            DELETE or :meth:`create_webhook_endpoint`. The wait before retry ``n`` (0 for the first) is random between 0 and
             ``min(8, 0.5 * 2**n)`` seconds.
         :param sleep: Called with the wait in seconds before each retry. Default
             ``time.sleep``. Pass your own to test without waiting.
@@ -1690,10 +1690,16 @@ class DominaiteClient:
             ``["payment.succeeded", "payment.refunded"]``. The SDK does not check the names.
             The API refuses an unknown type with ``VALIDATION_ERROR``.
         :param idempotency_key: Required. The same key with the same url and events answers
-            the same endpoint again, without ``secret``. After a timeout or a 503, retry
-            with the SAME key: that replaces an endpoint the lost attempt registered.
+            the same endpoint again, without ``secret``. After a timeout or a 5xx, retry
+            with the SAME key. If that answer has no ``secret``, the lost attempt already
+            registered the endpoint: delete it with :meth:`delete_webhook_endpoint` and
+            create it again with a NEW key.
         :param extra: More request fields, sent as given in the signed body.
         :returns: The :class:`WebhookEndpoint`. ``secret`` is on the first answer only.
+
+        This call is sent once. ``max_retries`` does not apply here: an automatic retry
+        after an answer that was lost on the way gets the endpoint back without its
+        ``secret``, and you could not tell.
 
         :raises ApiError: A 4xx with ``error_code``; nothing new was registered:
             ``WEBHOOK_URL_REJECTED`` or ``VALIDATION_ERROR`` (400);
@@ -1707,7 +1713,7 @@ class DominaiteClient:
         :raises RateLimitError: HTTP 429; wait ``retry_after_seconds``, then retry WITH
             the same ``idempotency_key``.
         :raises TransportError: Network-level failure or a 5xx. Retry WITH the same
-            ``idempotency_key``.
+            ``idempotency_key``, then check the answer for ``secret`` as above.
         """
         if not url:
             raise ValueError("url is required")
@@ -1718,7 +1724,10 @@ class DominaiteClient:
         body: Dict[str, Any] = {"url": url, "events": list(events)}
         if extra is not None:
             body.update(extra)
-        return cast(WebhookEndpoint, self._request("POST", WEBHOOKS_PATH, body, key))
+        return cast(
+            WebhookEndpoint,
+            self._request("POST", WEBHOOKS_PATH, body, key, retry=_RetryPolicy(0)),
+        )
 
     def list_webhook_endpoints(self) -> List[WebhookEndpoint]:
         """List your webhook endpoints, the newest first, never with a secret.
@@ -1845,9 +1854,12 @@ class DominaiteClient:
         body: Optional[Mapping[str, Any]],
         idempotency_key: str,
         signed: bool = True,
+        retry: Optional[_RetryPolicy] = None,
     ) -> Dict[str, Any]:
         """Send and apply the generic failure rules: 5xx is transport, 4xx is ApiError."""
-        reply = _checked(self._send(method, path, body, idempotency_key, signed=signed))
+        reply = _checked(
+            self._send(method, path, body, idempotency_key, signed=signed, retry=retry)
+        )
         return _result(reply.payload, reply)
 
     def _request_list(self, path: str, what: str) -> List[Dict[str, Any]]:

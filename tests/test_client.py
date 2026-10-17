@@ -4110,6 +4110,26 @@ def test_a_patch_and_a_delete_are_never_retried(urlopen):
     assert len(recorder.requests) == 2
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        urllib.error.URLError("timed out"),
+        (503, {"success": False, "error": {"code": "MERCHANT_API_UNAVAILABLE"}}),
+    ],
+)
+def test_a_webhook_endpoint_create_is_sent_once(urlopen, failure):
+    """A replay of a create that already succeeded answers without the secret, so the SDK
+    never repeats it on its own, whatever max_retries says."""
+    client, clock = _retrying_client(max_retries=2)
+    recorder = urlopen(failure, (201, {"success": True, "data": dict(WEBHOOK_ENDPOINT)}))
+
+    with pytest.raises(TransportError):
+        client.create_webhook_endpoint(**_webhook_arguments())
+
+    assert len(recorder.requests) == 1
+    assert clock.waits == []
+
+
 @pytest.mark.parametrize("rng_value", [0.001, 0.25, 0.999999])
 def test_each_wait_stays_inside_its_full_jitter_bound(urlopen, rng_value):
     client, clock = _retrying_client(max_retries=6, rng=lambda: rng_value)

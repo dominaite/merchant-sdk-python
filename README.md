@@ -298,6 +298,9 @@ The client retries a call that may not have landed. It never retries a call that
 - **What it retries:** every GET, and every POST that carries an idempotency key (create a
   checkout session, charge, refund, and create a plan or an agreement when you pass a key). A PATCH, a DELETE and a
   POST without a key are sent once.
+- **Never retried: webhook endpoint create.** The secret is only in the first answer. A retry
+  after an answer that was lost gets the endpoint back without it. See
+  [Manage endpoints with the API](#manage-endpoints-with-the-api).
 - **When it retries:** a network failure, a 5xx, and `PAYMENT_PROCESSING_UNAVAILABLE` (card
   payments briefly off, nothing charged), as a 503 or as a refusal.
 - **When it does not:** a 4xx, a 429, every other refusal, and the two charge answers that are
@@ -792,8 +795,9 @@ admin.delete_webhook_endpoint(endpoint["id"])
 
 1. `secret` is in the first answer only. A replay with the same key and the list leave it out.
    If you lose the secret, delete the endpoint and create it again.
-2. After a timeout or a 503, retry with the same `idempotency_key`. The retry replaces an
-   endpoint that the lost attempt registered. A new key cannot do this.
+2. The SDK sends this call once, whatever `max_retries` says. After a timeout or a 5xx, retry
+   it yourself with the same `idempotency_key`. If that answer has no `secret`, the lost
+   attempt registered the endpoint: delete it and create it again with a new key.
 3. A key used again more than a day later raises `WEBHOOK_ALREADY_REGISTERED`.
    `result["error"]["params"]["webhookId"]` names the endpoint. Use a fresh key for a new
    endpoint.
