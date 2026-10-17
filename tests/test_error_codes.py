@@ -8,8 +8,6 @@ codes the gateway answers on each route.
 import json
 from pathlib import Path
 
-import pytest
-
 from dominaite import (
     AUTHORIZATION_ERROR_CODES,
     CHARGE_ERROR_CODES,
@@ -20,6 +18,7 @@ from dominaite import (
     REVOKE_ERROR_CODES,
     SESSION_REFUSAL_ERROR_CODES,
     STOREFRONT_ERROR_CODES,
+    SUBSCRIPTION_REFUSAL_ERROR_CODES,
     VALIDATION_ERROR_CODES,
     WEBHOOK_ERROR_CODES,
     ErrorCode,
@@ -107,9 +106,12 @@ def test_field_validation_codes_are_the_wire_contract_validation_group_in_order(
     ]
 
 
-@pytest.mark.parametrize("code", SUBSCRIPTION_REFUSALS)
-def test_subscription_refusals_are_session_refusals(code):
-    assert code in SESSION_REFUSAL_ERROR_CODES
+def test_subscription_refusals_are_the_gateway_list():
+    assert sorted(SUBSCRIPTION_REFUSAL_ERROR_CODES) == sorted(SUBSCRIPTION_REFUSALS)
+
+
+def test_subscription_refusals_stay_out_of_the_wire_pinned_session_refusals():
+    assert not set(SUBSCRIPTION_REFUSAL_ERROR_CODES) & set(SESSION_REFUSAL_ERROR_CODES)
 
 
 def test_charge_codes_are_every_coded_charge_failure_of_the_gateway():
@@ -126,6 +128,7 @@ def test_every_listed_code_has_a_named_constant_equal_to_the_wire_string():
     grouped = (
         AUTHORIZATION_ERROR_CODES
         + SESSION_REFUSAL_ERROR_CODES
+        + SUBSCRIPTION_REFUSAL_ERROR_CODES
         + VALIDATION_ERROR_CODES
         + STOREFRONT_ERROR_CODES
         + CHARGE_ERROR_CODES
@@ -147,6 +150,7 @@ def test_storefront_codes_stay_out_of_the_session_refusals():
 def test_no_list_holds_a_code_twice():
     for codes in (
         SESSION_REFUSAL_ERROR_CODES,
+        SUBSCRIPTION_REFUSAL_ERROR_CODES,
         CHARGE_ERROR_CODES,
         RECURRING_ERROR_CODES,
         WEBHOOK_ERROR_CODES,

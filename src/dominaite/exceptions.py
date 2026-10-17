@@ -124,17 +124,25 @@ class ErrorCode(str, Enum):
 
 
 #: Every ``errorCode`` the API can refuse a checkout session with - a business refusal,
-#: sent as HTTP 200 with ``success: false``, raised as :class:`CheckoutRefusedError`. The
-#: ``AGREEMENT_*`` codes and ``SUBSCRIPTIONS_NOT_ENABLED`` come only with ``agreement_id``.
-#: Listed so you can assert your own handling covers all of them; treat an unlisted code
-#: as a refusal too rather than crashing. ``STOREFRONT_MISMATCH`` can also arrive in this
-#: shape, on a replay; it is raised as :class:`StorefrontError`, so it is not here.
+#: sent as HTTP 200 with ``success: false``, raised as :class:`CheckoutRefusedError`. A
+#: session with ``agreement_id`` can also be refused with one of
+#: :data:`SUBSCRIPTION_REFUSAL_ERROR_CODES`. Listed so you can assert your own handling
+#: covers all of them; treat an unlisted code as a refusal too rather than crashing.
+#: ``STOREFRONT_MISMATCH`` can also arrive in this shape, on a replay; it is raised as
+#: :class:`StorefrontError`, so it is not here.
 SESSION_REFUSAL_ERROR_CODES: Tuple[str, ...] = (
     "PAYMENT_PROCESSING_UNAVAILABLE",
     "DUPLICATE_REQUEST",
     "ALREADY_PROCESSED",
     "IDEMPOTENCY_KEY_REUSED",
     "PRIOR_ATTEMPT_FAILED",
+)
+
+#: The refusals of a subscription session (``create_checkout_session`` with
+#: ``agreement_id``). Like :data:`SESSION_REFUSAL_ERROR_CODES` they are HTTP 200 with
+#: ``success: false`` and raise :class:`CheckoutRefusedError`; nothing is created.
+#: ``SUBSCRIPTIONS_NOT_ENABLED`` means subscriptions are not on for your account.
+SUBSCRIPTION_REFUSAL_ERROR_CODES: Tuple[str, ...] = (
     "AGREEMENT_NOT_FOUND",
     "AGREEMENT_NOT_PENDING",
     "AGREEMENT_AMOUNT_MISMATCH",

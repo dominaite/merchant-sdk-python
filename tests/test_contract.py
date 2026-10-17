@@ -721,10 +721,11 @@ def test_every_contract_refusal_code_surfaces_on_the_exception(
     assert raised.value.transaction_id is None
 
 
-def test_the_recognized_refusal_codes_hold_the_contract_set():
-    """The hand fixture lists the generic refusals; the subscription refusals are pinned in
-    test_error_codes.py against the gateway."""
-    assert set(CONTRACT["sessionRefusalErrorCodes"]) <= set(SESSION_REFUSAL_ERROR_CODES)
+def test_the_recognized_refusal_codes_are_exactly_the_contract_set():
+    """No extras either: a code the SDK invents is drift the same as a missing one."""
+    assert sorted(SESSION_REFUSAL_ERROR_CODES) == sorted(
+        CONTRACT["sessionRefusalErrorCodes"]
+    )
 
 
 # --- (4) validation error codes -----------------------------------------------
