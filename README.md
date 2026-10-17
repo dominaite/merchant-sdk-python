@@ -296,7 +296,7 @@ amount). Use `refusal.transaction_id` with `get_status()` to find out what the f
 The client retries a call that may not have landed. It never retries a call that got an answer.
 
 - **What it retries:** every GET, and every POST that carries an idempotency key (create a
-  checkout session, charge, refund, create a plan or an agreement). A PATCH, a DELETE and a
+  checkout session, charge, refund, and create a plan or an agreement when you pass a key). A PATCH, a DELETE and a
   POST without a key are sent once.
 - **When it retries:** a network failure, a 5xx, and `PAYMENT_PROCESSING_UNAVAILABLE` (card
   payments briefly off, nothing charged), as a 503 or as a refusal.
@@ -1193,8 +1193,9 @@ One rule picks the class: the gateway's code wins over the HTTP status.
 
 - A 5xx keeps its code on `error_code`. A 5xx without a JSON body (a proxy error page) is a
   `TransportError` with no code.
-- A coded answer to a charge is a `ChargeError`, a 404 included. Only 400, 401, 403 and 429
-  keep their usual classes.
+- A coded answer to a charge is a `ChargeError`, a 404 and a 5xx included. Only 400, 401, 403
+  and 429 keep their usual classes. Catch `ChargeError` around a charge, not only
+  `TransportError`.
 - A storefront code on checkout is a `StorefrontError`, also in the 200 shape.
 
 Note the two different failure shapes on the create endpoint. A business refusal is HTTP 200
