@@ -2432,6 +2432,29 @@ def test_create_refund_signs_the_lowercase_transaction_id_path(client, urlopen):
     )
 
 
+def test_a_charge_signs_the_lowercase_payment_method_id_path(client, urlopen):
+    """The gateway signs the lowercase pm_ id; an upper-case one must not break the signature."""
+    upper = "pm_" + PAYMENT_METHOD_ID[3:].upper()
+    recorder = urlopen(_placed(), (204, b""))
+
+    client.charge_payment_method(
+        upper, 2500, "EUR", "order-1043", idempotency_key=CHARGE_IDEMPOTENCY_KEY
+    )
+    headers = _headers(recorder.last)
+    assert recorder.last.full_url == BASE_URL + CHARGE_PATH
+    assert headers["x-signature"] == sign_request(
+        SECRET, headers["x-timestamp"], "POST", CHARGE_PATH, CHARGE_IDEMPOTENCY_KEY, CHARGE_BODY
+    )
+
+    client.revoke_payment_method(upper)
+    headers = _headers(recorder.last)
+    revoke_path = PAYMENT_METHODS_PATH + "/" + PAYMENT_METHOD_ID
+    assert recorder.last.full_url == BASE_URL + revoke_path
+    assert headers["x-signature"] == sign_request(
+        SECRET, headers["x-timestamp"], "DELETE", revoke_path, "", ""
+    )
+
+
 @pytest.mark.parametrize("key", [None, ""])
 def test_create_refund_refuses_to_send_without_a_key(client, urlopen, key):
     recorder = urlopen(_accepted())

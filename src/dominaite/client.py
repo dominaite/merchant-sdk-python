@@ -521,7 +521,9 @@ def _validate_whole_number(value: Any, name: str, minimum: int) -> None:
 
 
 def _normalize_payment_method_id(payment_method_id: Any) -> str:
-    normalized = str(payment_method_id or "").strip()
+    # The gateway signs the canonical path with the lowercase ``pm_`` id, so an id typed
+    # in upper case would sign one path and be checked against another.
+    normalized = str(payment_method_id or "").strip().lower()
     if not _PAYMENT_METHOD_ID_RE.match(normalized):
         raise ValueError(
             "payment_method_id must be the storedPaymentMethod id from get_status()"
