@@ -305,7 +305,9 @@ The client retries a call that may not have landed. It never retries a call that
   payments briefly off, nothing charged), as a 503 or as a refusal.
 - **When it does not:** a 4xx, a 429, every other refusal, and the two charge answers that are
   final: `CHARGE_OUTCOME_UNKNOWN` and `CHARGE_FAILED`. Those carry a charge row; see
-  [Stored payment methods](#stored-payment-methods-recurring).
+  [Stored payment methods](#stored-payment-methods-recurring). It also does not retry
+  `PAYMENT_METHOD_CHARGES_DISABLED` (503): it clears only when stored-card charges are on for
+  your account, and a retry a few seconds later cannot see that.
 - **Same key, same body.** Every attempt sends your one idempotency key and the same body. Only
   the timestamp and the signature over it change.
 - **How long it waits:** full jitter. Before retry `n` (from 0) it waits a random time between 0

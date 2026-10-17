@@ -4063,8 +4063,9 @@ def test_a_429_is_raised_without_a_retry_and_keeps_retry_after(urlopen):
         (409, {"success": False, "error": {"code": "CHARGE_IN_PROGRESS"}}),
         (502, {"success": False, "data": CHARGE, "error": {"code": "CHARGE_OUTCOME_UNKNOWN"}}),
         (502, {"success": False, "error": {"code": "CHARGE_FAILED"}}),
+        (503, {"success": False, "error": {"code": "PAYMENT_METHOD_CHARGES_DISABLED"}}),
     ],
-    ids=["400", "401", "409", "502-outcome-unknown", "502-charge-failed"],
+    ids=["400", "401", "409", "502-outcome-unknown", "502-charge-failed", "503-charges-disabled"],
 )
 def test_an_answer_about_the_call_is_not_retried(urlopen, answer):
     client, _ = _retrying_client()

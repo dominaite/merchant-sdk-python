@@ -240,7 +240,11 @@ class _RetryPolicy(NamedTuple):
 #: The 5xx codes of the charge route that are an answer about the charge, not the API
 #: being unavailable: retrying them cannot change the outcome, and a replay of the same
 #: key can lose the charge row that CHARGE_OUTCOME_UNKNOWN carries.
-_FINAL_5XX_CODES = frozenset({"CHARGE_OUTCOME_UNKNOWN", "CHARGE_FAILED"})
+#: PAYMENT_METHOD_CHARGES_DISABLED is a 503, but it clears only when stored-card charges
+#: are switched on for the merchant, which takes far longer than the retry waits.
+_FINAL_5XX_CODES = frozenset(
+    {"CHARGE_OUTCOME_UNKNOWN", "CHARGE_FAILED", "PAYMENT_METHOD_CHARGES_DISABLED"}
+)
 
 
 def _worth_retrying(reply: "_Reply") -> bool:
