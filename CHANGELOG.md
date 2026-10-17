@@ -11,6 +11,20 @@
   (`https://api.dominaite.com/payments`), or your own value.
 - `DEFAULT_BASE_URL` is removed. Use `PRODUCTION_BASE_URL`.
 
+### Added
+
+- The User-Agent is now `dominaite-python/<version> (python <version>)`, then your suffix. The
+  new keyword `user_agent` sets the suffix. A suffix with a control character raises
+  `ValueError`.
+- Warning hook: the keyword `on_warning` takes a callable. Without it the SDK calls
+  `warnings.warn`. It reports a deprecation notice from the API, a retry in
+  `create_checkout_session_with_retry`, and a ping clock skew over 60 seconds.
+- SDK notice: the client reads the `Dominaite-Sdk-Notice` response header on every response,
+  errors included, and warns once per distinct value. A missing header does nothing.
+- Debug log: the keyword `on_debug`, off by default, gets one line per request with the
+  method, path, status, time in ms, the `Dominaite-Request-Id` header and the idempotency key.
+  No warning or debug line carries the secret, the signature, a cashier token or a body.
+
 ## 0.5.2
 
 ### Added
