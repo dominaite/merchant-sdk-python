@@ -51,6 +51,7 @@ jobs:
               enablementSetups: [.wallets.enablement[].setup]
             },
             webhookEventCatalog: .webhookEventCatalog,
+            recurringWebhookEvents: [.recurring.webhookEvents[].type],
             errorCodes: (.errorCodes | with_entries(.value |= map({code, httpStatus, retry}))),
             validationHttpStatus: .validationResponseShape.httpStatus,
             requestSigning: (.requestSigning | {algorithm, signatureHeader, timestampToleranceSeconds, requiredHeaders, writeRequestHeaders, payloadTemplate}),

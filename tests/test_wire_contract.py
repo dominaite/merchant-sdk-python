@@ -77,3 +77,17 @@ def test_wallet_reporting_fields_are_optional_strings_on_the_status_read():
     # get_status passes the body through, so the status fields it promises are the
     # canonical fixture's: both reporting fields have to be among them.
     assert set(field["path"] for field in fields) <= set(CONTRACT["endpoints"]["getStatus"]["fields"])
+
+
+def test_recurring_webhook_events_are_the_agreement_and_charge_events():
+    recurring = WIRE["recurringWebhookEvents"]
+    assert recurring == [
+        "agreement.activated",
+        "agreement.past_due",
+        "agreement.cancelled",
+        "charge.succeeded",
+        "charge.failed",
+        "charge.retrying",
+    ]
+    # The payment events live in the catalog, the recurring ones here. No event is in both.
+    assert not set(recurring) & set(WIRE["webhookEventCatalog"])
