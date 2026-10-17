@@ -28,7 +28,7 @@ jobs:
       CONTRACT_URL: https://api.dominaite.com/payments/merchant-api/integration/contract
       FIXTURE: tests/merchant-api-wire-contract.json
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Fetch the live contract
         run: |
@@ -51,6 +51,7 @@ jobs:
               enablementSetups: [.wallets.enablement[].setup]
             },
             webhookEventCatalog: .webhookEventCatalog,
+            recurringWebhookEvents: [.recurring.webhookEvents[].type],
             errorCodes: (.errorCodes | with_entries(.value |= map({code, httpStatus, retry}))),
             validationHttpStatus: .validationResponseShape.httpStatus,
             requestSigning: (.requestSigning | {algorithm, signatureHeader, timestampToleranceSeconds, requiredHeaders, writeRequestHeaders, payloadTemplate}),

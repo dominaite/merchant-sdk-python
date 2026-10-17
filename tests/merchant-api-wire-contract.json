@@ -136,6 +136,14 @@
     "supersedeAfterSeconds": 7800
   },
   "pingPath": "/merchant-api/ping",
+  "recurringWebhookEvents": [
+    "agreement.activated",
+    "agreement.past_due",
+    "agreement.cancelled",
+    "charge.succeeded",
+    "charge.failed",
+    "charge.retrying"
+  ],
   "requestSigning": {
     "algorithm": "HMAC-SHA256",
     "payloadTemplate": "{timestamp}\n{METHOD}\n{path}\n{idempotency_key}\n{sha256_hex_of_body}",

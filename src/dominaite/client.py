@@ -10,6 +10,7 @@ import re
 import sys
 import threading
 import time
+import types
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -189,7 +190,7 @@ def _notice_message(notice: str) -> str:
 def _caller_stacklevel() -> int:
     """The ``stacklevel`` that points a warning at the first frame outside this package."""
     level = 1
-    frame = sys._getframe(1)
+    frame: Optional[types.FrameType] = sys._getframe(1)
     while frame is not None and frame.f_globals.get("__name__", "").startswith("dominaite"):
         frame = frame.f_back
         level += 1

@@ -1360,3 +1360,15 @@ the expected value.
 `tests/test_webhooks.py` pins the cross-SDK webhook vector: the same secret, timestamp and
 body bytes every Dominaite SDK verifies against. A failure there means the SDK is rejecting
 genuine deliveries or accepting forged ones. Same rule - fix the code, not the vector.
+
+## Versioning and support
+
+1. The SDK is on 0.x. A minor release (0.6 to 0.7) can contain a breaking change. A patch
+   release (0.6.0 to 0.6.1) does not. `CHANGELOG.md` marks every breaking change.
+2. Pin the minor version in your requirements, for example `dominaite>=0.6,<0.7`, and read
+   the changelog before you move to the next minor.
+3. The SDK supports Python 3.9 and later, and it has no runtime dependencies.
+4. The API can send a `Dominaite-Sdk-Notice` response header when your SDK version is
+   deprecated. The SDK passes it to `on_warning` once per distinct value per client, or emits a
+   `DeprecationWarning` when `on_warning` is not set (see "Logging and warnings"). When you
+   get the notice, upgrade to the latest release.
