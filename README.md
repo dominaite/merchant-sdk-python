@@ -318,6 +318,9 @@ is sent at most three times. `max_retries=0` sends every call once:
 client = DominaiteClient(key_id, secret, base_url, max_retries=0)
 ```
 
+`timeout` (default 45 seconds) is per attempt, not per call. One call can take up to
+`(max_retries + 1) * timeout` plus the waits: with the defaults, just under 137 seconds.
+
 Each retry goes to `on_warning` (see [Logging and warnings](#logging-and-warnings)), for example
 `dominaite-python: retrying POST /merchant-api/checkout/sessions after HTTP 503 (attempt 2 of 3)`.
 

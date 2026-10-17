@@ -730,7 +730,8 @@ class DominaiteClient:
         :param base_url: Required. ``SANDBOX_BASE_URL`` or ``PRODUCTION_BASE_URL``, or your
             own value. Must be ``https://`` unless the host is localhost, 127.0.0.1 or ::1.
             A missing, empty or whitespace-only value raises ``ValueError``.
-        :param timeout: Per-request socket timeout in seconds.
+        :param timeout: Socket timeout in seconds, per attempt. With retries one call
+            can take up to ``(max_retries + 1) * timeout`` plus the waits.
         :param user_agent: Your own identifier, appended to the SDK's User-Agent after one
             space (for example ``"shop/1.2"``). It helps support find your calls in the
             access logs. Blank means none; a control character raises ``ValueError``.
