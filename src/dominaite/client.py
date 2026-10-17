@@ -4,12 +4,29 @@ import datetime
 import hashlib
 import hmac
 import json
+import platform
 import re
+import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Union, cast
+import warnings
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Type,
+    Union,
+    cast,
+)
 
 from .exceptions import (
     STOREFRONT_ERROR_CODES,
@@ -35,9 +52,12 @@ from .models import (
     WebhookEndpoint,
 )
 
-__version__ = "0.5.2"
+__version__ = "0.6.0"
 
-DEFAULT_BASE_URL = "https://api.dominaite.com/payments"
+# There is no default base URL: an unset setting must fail at construction, not send
+# sandbox credentials to production. Pass one of these, or your own value.
+SANDBOX_BASE_URL = "https://api.staging.dominaite.com/payments"
+PRODUCTION_BASE_URL = "https://api.dominaite.com/payments"
 SESSIONS_PATH = "/merchant-api/checkout/sessions"
 PAYMENT_METHODS_PATH = "/merchant-api/payment-methods"
 PING_PATH = "/merchant-api/ping"
@@ -96,6 +116,79 @@ _REFUND_ID_RE = _PAYMENT_METHOD_ID_RE
 #: Plan and agreement ids (``plan_...``, ``agr_...``) are signed exactly as sent and are
 #: case-sensitive, so they are never case-changed; the same single-segment rule applies.
 _RECURRING_ID_RE = _PAYMENT_METHOD_ID_RE
+
+#: CR, LF and the other control characters. A User-Agent suffix carrying one could split
+#: the header, so the constructor refuses it.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+#: The response header the API uses to tell an old SDK version that it is deprecated.
+NOTICE_HEADER = "Dominaite-Sdk-Notice"
+
+#: The response header that carries the id support uses to find one call.
+REQUEST_ID_HEADER = "Dominaite-Request-Id"
+
+#: Longest notice value the SDK reads, and how many distinct notices one client remembers.
+_MAX_NOTICE_LENGTH = 512
+_MAX_NOTICES_SEEN = 32
+_MAX_REQUEST_ID_LENGTH = 128
+
+#: Ping warns above this clock skew. The API refuses requests at 300 seconds.
+CLOCK_SKEW_WARNING_SECONDS = 60
+
+
+def _clean_header(value: Any, limit: int) -> str:
+    """The header value cut to ``limit`` characters, without control characters."""
+    if value is None:
+        return ""
+    return _CONTROL_CHARS_RE.sub("", str(value)[:limit]).strip()
+
+
+def _notice_message(notice: str) -> str:
+    """The warning for one ``Dominaite-Sdk-Notice`` value."""
+    parts = [part.strip() for part in notice.split(";")]
+    if parts[0].lower() != "deprecated":
+        return "dominaite-python {0}: {1}".format(__version__, notice)
+    params: Dict[str, str] = {}
+    for part in parts[1:]:
+        name, sep, value = part.partition("=")
+        if sep:
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] == '"':
+                value = value[1:-1]
+            params[name.strip().lower()] = value
+    message = "dominaite-python {0} is deprecated".format(__version__)
+    if params.get("current"):
+        message += "; upgrade to " + params["current"]
+    if params.get("sunset"):
+        message += " (sunset " + params["sunset"] + ")"
+    message += "."
+    if params.get("info"):
+        message += " " + params["info"]
+    return message
+
+
+def _caller_stacklevel() -> int:
+    """The ``stacklevel`` that points a warning at the first frame outside this package."""
+    level = 1
+    frame = sys._getframe(1)
+    while frame is not None and frame.f_globals.get("__name__", "").startswith("dominaite"):
+        frame = frame.f_back
+        level += 1
+    return level
+
+
+def _user_agent(suffix: Optional[str]) -> str:
+    """``dominaite-python/<version> (python <version>)``, then the caller's suffix."""
+    base = "dominaite-python/{0} (python {1})".format(__version__, platform.python_version())
+    if suffix is None:
+        return base
+    if not isinstance(suffix, str):
+        raise ValueError("user_agent must be a string")
+    if _CONTROL_CHARS_RE.search(suffix):
+        raise ValueError("user_agent must not contain control characters")
+    trimmed = suffix.strip()
+    return base + " " + trimmed if trimmed else base
 
 
 class _Reply(NamedTuple):
@@ -218,6 +311,23 @@ def _retry_after_seconds(headers: Any) -> Optional[int]:
     except ValueError:
         return None
     return seconds if seconds >= 0 else None
+
+
+def _require_base_url(base_url: Optional[str]) -> str:
+    """Return base_url without surrounding whitespace and trailing slashes.
+
+    Raises ValueError when it is missing, empty or whitespace-only. The SDK has no default,
+    so a base URL read from an unset environment variable fails here instead of calling
+    production with the wrong key.
+    """
+    trimmed = (base_url or "").strip().rstrip("/")
+    if not trimmed:
+        raise ValueError(
+            "base_url is required. Use {0} for the sandbox or {1} for production.".format(
+                SANDBOX_BASE_URL, PRODUCTION_BASE_URL
+            )
+        )
+    return trimmed
 
 
 def _require_secure_base_url(base_url: str) -> None:
@@ -450,7 +560,11 @@ class DominaiteClient:
 
     Usage::
 
-        client = DominaiteClient(os.environ["DOMINAITE_KEY_ID"], os.environ["DOMINAITE_SECRET"])
+        client = DominaiteClient(
+            os.environ["DOMINAITE_KEY_ID"],
+            os.environ["DOMINAITE_SECRET"],
+            base_url=os.environ["DOMINAITE_BASE_URL"],
+        )
         session = client.create_checkout_session(
             amount=2500,              # minor units: 25.00 EUR
             currency="EUR",
@@ -465,25 +579,51 @@ class DominaiteClient:
         self,
         key_id: str,
         secret: str,
-        base_url: str = DEFAULT_BASE_URL,
+        base_url: Optional[str] = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        *,
+        user_agent: Optional[str] = None,
+        on_warning: Optional[Callable[[str], None]] = None,
+        on_debug: Optional[Callable[[str], None]] = None,
     ) -> None:
         """
         :param key_id: Your API key id (``dmk_...``), from the Dominaite dashboard.
         :param secret: Your API secret (``dms_...``). Server-side only.
-        :param base_url: Override for non-production environments. Must be ``https://``
-            unless the host is localhost, 127.0.0.1 or ::1.
+        :param base_url: Required. ``SANDBOX_BASE_URL`` or ``PRODUCTION_BASE_URL``, or your
+            own value. Must be ``https://`` unless the host is localhost, 127.0.0.1 or ::1.
+            A missing, empty or whitespace-only value raises ``ValueError``.
         :param timeout: Per-request socket timeout in seconds.
+        :param user_agent: Your own identifier, appended to the SDK's User-Agent after one
+            space (for example ``"shop/1.2"``). It helps support find your calls in the
+            access logs. Blank means none; a control character raises ``ValueError``.
+        :param on_warning: Called with each warning message: a ``Dominaite-Sdk-Notice``
+            from the API (once per distinct value), a retry in
+            :meth:`create_checkout_session_with_retry`, and a ping clock skew over 60
+            seconds. Without it the SDK calls ``warnings.warn``: ``DeprecationWarning`` for
+            the notice, ``UserWarning`` for the others.
+        :param on_debug: Called with one line per request: method, path, status, time in
+            ms, the ``Dominaite-Request-Id`` and the idempotency key. Off when not set.
+            Pass ``logging.getLogger("dominaite").debug`` to send it to logging.
+
+        A warning or debug line never carries the secret, the signature, a cashier token,
+        a query string or a request or response body. An exception from either callable
+        is dropped, so it never fails the request.
         """
         if not key_id.startswith("dmk_"):
             raise ValueError("key_id must start with dmk_")
         if not secret.startswith("dms_"):
             raise ValueError("secret must start with dms_")
+        base_url = _require_base_url(base_url)
         _require_secure_base_url(base_url)
         self._key_id = key_id
         self._secret = _Secret(secret)
-        self._base_url = base_url.rstrip("/")
+        self._base_url = base_url
         self._timeout = timeout
+        self._user_agent = _user_agent(user_agent)
+        self._on_warning = on_warning
+        self._on_debug = on_debug
+        self._notices_seen: Set[str] = set()
+        self._notices_lock = threading.Lock()
         # Own opener rather than urlopen(): the default one follows redirects, and the
         # signed headers must never leave the host we addressed.
         self._opener = urllib.request.build_opener(_NoRedirectHandler)
@@ -514,7 +654,16 @@ class DominaiteClient:
         """
         # GET signs an EMPTY idempotency key and an EMPTY body, and sends no
         # Idempotency-Key header.
-        return self._request("GET", PING_PATH, None, "")
+        pong = self._request("GET", PING_PATH, None, "")
+        skew = pong.get("clockSkewSeconds")
+        if isinstance(skew, (int, float)) and not isinstance(skew, bool):
+            if abs(skew) > CLOCK_SKEW_WARNING_SECONDS:
+                self._warn(
+                    "dominaite-python: clock skew is {0} s; requests fail at 300 s. "
+                    "Sync this server's clock.".format(int(skew)),
+                    UserWarning,
+                )
+        return pong
 
     def get_integration_contract(self) -> Dict[str, Any]:
         """Read the public integration contract of the API.
@@ -733,11 +882,13 @@ class DominaiteClient:
 
         delay = backoff_seconds
         for attempt in range(1, max_attempts + 1):
+            failure: DominaiteError
             try:
                 return self.create_checkout_session(**kwargs)
-            except TransportError:
+            except TransportError as error:
                 if attempt == max_attempts:
                     raise
+                failure = error
             except CheckoutRefusedError as refusal:
                 # The one refusal that is transient: processing is off for a moment,
                 # nothing was charged, and the gateway asks for the same key again.
@@ -746,6 +897,12 @@ class DominaiteClient:
                     or attempt == max_attempts
                 ):
                     raise
+                failure = refusal
+            self._warn(
+                "dominaite-python: retrying create_checkout_session_with_retry after {0} "
+                "(attempt {1} of {2})".format(_retry_reason(failure), attempt + 1, max_attempts),
+                UserWarning,
+            )
             if delay > 0:
                 time.sleep(delay)
             delay *= 2
@@ -1609,7 +1766,7 @@ class DominaiteClient:
         headers = {
             "Content-Type": "application/json",
             # Some edges block requests without a real User-Agent - always send one.
-            "User-Agent": "dominaite-python/" + __version__,
+            "User-Agent": self._user_agent,
         }
         if signed:
             timestamp = str(int(time.time()))
@@ -1630,20 +1787,29 @@ class DominaiteClient:
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
 
         headers_received: Any = None
+        started = time.monotonic()
         try:
-            with self._opener.open(request, timeout=self._timeout) as response:
-                status = response.status
-                headers_received = getattr(response, "headers", None)
-                raw = _read_bounded(response)
-        except urllib.error.HTTPError as error:
-            # 4xx/5xx: the body still carries the machine-readable code.
-            status = error.code
-            headers_received = getattr(error, "headers", None)
-            raw = _read_bounded(error)
+            try:
+                with self._opener.open(request, timeout=self._timeout) as response:
+                    status = response.status
+                    headers_received = getattr(response, "headers", None)
+                    raw = _read_bounded(response)
+            except urllib.error.HTTPError as error:
+                # 4xx/5xx: the body still carries the machine-readable code.
+                status = error.code
+                headers_received = getattr(error, "headers", None)
+                raw = _read_bounded(error)
         except (urllib.error.URLError, OSError) as error:
+            self._debug(method, path, "error", started, headers_received, idempotency_key)
             raise TransportError(
                 "Could not reach the Dominaite API: {0}".format(error)
             ) from error
+        except BaseException:
+            self._debug(method, path, "error", started, headers_received, idempotency_key)
+            raise
+        self._debug(method, path, str(status), started, headers_received, idempotency_key)
+        # Before any status handling, so a notice on an error or a non-JSON body still warns.
+        self._read_notice(headers_received)
 
         # 204 carries nothing to parse; the status is the whole answer.
         if status == 204:
@@ -1709,6 +1875,72 @@ class DominaiteClient:
                 result=dict(decoded),
             )
         return _Reply(status, decoded, result, envelope_error)
+
+
+    def _warn(self, message: str, category: Type[Warning]) -> None:
+        """Hand one warning to the caller's sink, or to ``warnings.warn``. Never raises."""
+        try:
+            if self._on_warning is not None:
+                self._on_warning(message)
+            else:
+                warnings.warn(message, category, stacklevel=_caller_stacklevel())
+        except Exception:
+            # A sink that fails (or a warnings filter set to "error") must not fail the
+            # payment call that triggered it.
+            pass
+
+    def _read_notice(self, headers: Any) -> None:
+        """Warn once per distinct ``Dominaite-Sdk-Notice`` value this client sees."""
+        getter = getattr(headers, "get", None)
+        if getter is None:
+            return
+        notice = _clean_header(getter(NOTICE_HEADER), _MAX_NOTICE_LENGTH)
+        if not notice:
+            return
+        with self._notices_lock:
+            if notice in self._notices_seen or len(self._notices_seen) >= _MAX_NOTICES_SEEN:
+                return
+            self._notices_seen.add(notice)
+        self._warn(_notice_message(notice), DeprecationWarning)
+
+    def _debug(
+        self,
+        method: str,
+        path: str,
+        status: str,
+        started: float,
+        headers: Any,
+        idempotency_key: str,
+    ) -> None:
+        """One debug line for one request, when the caller asked for them. Never raises."""
+        if self._on_debug is None:
+            return
+        try:
+            line = "dominaite-python: {0} {1} {2} {3}ms".format(
+                method, path, status, int((time.monotonic() - started) * 1000)
+            )
+            getter = getattr(headers, "get", None)
+            request_id = (
+                _clean_header(getter(REQUEST_ID_HEADER), _MAX_REQUEST_ID_LENGTH) if getter else ""
+            )
+            if request_id:
+                line += " request_id=" + request_id
+            if idempotency_key:
+                line += " idempotency_key=" + idempotency_key
+            self._on_debug(line)
+        except Exception:
+            pass
+
+
+def _retry_reason(error: BaseException) -> str:
+    """What a retry warning names: the error code, else the HTTP status, else the class."""
+    code = getattr(error, "error_code", None)
+    if code:
+        return str(getattr(code, "value", code))
+    status = getattr(error, "http_status", None)
+    if status:
+        return "HTTP {0}".format(status)
+    return type(error).__name__
 
 
 def _rejection(reply: _Reply) -> DominaiteError:

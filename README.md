@@ -76,11 +76,15 @@ dashboard, dev key - a prod key will not authenticate against dev):
 ```bash
 export DOMINAITE_KEY_ID='dmk_...'          # the key id shown on the tab
 export DOMINAITE_SECRET='dms_...'          # the secret shown once at key creation
-export DOMINAITE_BASE_URL='https://...'           # the base URL of your dev environment
+export DOMINAITE_BASE_URL='https://api.staging.dominaite.com/payments'   # the sandbox
 ```
 
-Production is
-`https://api.dominaite.com/payments`, which is the SDK's default when you pass no `base_url`.
+`base_url` is required. The SDK has no default, so a missing, empty or whitespace-only value
+raises `ValueError` at construction instead of calling production with the wrong key. Use
+`https://api.staging.dominaite.com/payments` for the sandbox and
+`https://api.dominaite.com/payments` for production. The package exports both as
+`SANDBOX_BASE_URL` and `PRODUCTION_BASE_URL`. `DEFAULT_BASE_URL` is removed in 0.6.0. Use
+`PRODUCTION_BASE_URL`.
 
 `base_url` has to be `https://`. Every request carries your key id and a signature, and over
 plain http anyone on the path can read them and replay the request inside the server's 5 minute
@@ -105,7 +109,7 @@ from dominaite import DominaiteClient
 client = DominaiteClient(
     os.environ["DOMINAITE_KEY_ID"],
     os.environ["DOMINAITE_SECRET"],
-    base_url=os.environ.get("DOMINAITE_BASE_URL", "https://api.dominaite.com/payments"),
+    base_url=os.environ.get("DOMINAITE_BASE_URL"),   # required, see step 1
 )
 
 print(client.ping())
@@ -130,7 +134,7 @@ from dominaite import (
 client = DominaiteClient(
     os.environ["DOMINAITE_KEY_ID"],
     os.environ["DOMINAITE_SECRET"],
-    base_url=os.environ.get("DOMINAITE_BASE_URL", "https://api.dominaite.com/payments"),
+    base_url=os.environ.get("DOMINAITE_BASE_URL"),   # required, see step 1
 )
 
 try:
@@ -756,7 +760,7 @@ key that holds the `webhooks:manage` scope: see [Credentials](#credentials). The
 Webhooks page needs no key.
 
 ```python
-admin = DominaiteClient(webhooks_key_id, webhooks_key_secret)
+admin = DominaiteClient(webhooks_key_id, webhooks_key_secret, base_url=base_url)
 
 endpoint = admin.create_webhook_endpoint(
     url="https://shop.example/webhooks/dominaite",
@@ -1121,6 +1125,36 @@ page = client.list_transactions(
     settled_from=today - datetime.timedelta(days=1), settled_to=today,
 )
 ```
+
+## Logging and warnings
+
+The SDK writes nothing to stdout or to `logging` on its own. It reports through two optional
+callables on the client:
+
+```python
+import logging
+
+client = DominaiteClient(
+    os.environ["DOMINAITE_KEY_ID"],
+    os.environ["DOMINAITE_SECRET"],
+    base_url=os.environ.get("DOMINAITE_BASE_URL"),
+    user_agent="shop/1.2",                                  # optional suffix
+    on_warning=logging.getLogger("dominaite").warning,      # optional
+    on_debug=logging.getLogger("dominaite").debug,          # optional, off when not set
+)
+```
+
+- `on_warning` gets a message for: a `Dominaite-Sdk-Notice` response header (the API sends it
+  when your SDK version is deprecated, once per distinct value per client), a retry in
+  `create_checkout_session_with_retry`, and a ping `clockSkewSeconds` over 60. Without it the
+  SDK calls `warnings.warn`: `DeprecationWarning` for the notice, `UserWarning` for the others.
+- `on_debug` gets one line per request, for example
+  `dominaite-python: POST /merchant-api/checkout/sessions 201 184ms request_id=... idempotency_key=checkout-1042-2500-EUR`.
+  Debug is off until you pass it. Give support the `request_id` when you ask about a call.
+- No line carries the secret, the signature, a cashier token, a query string or a request or
+  response body. An exception from either callable is dropped, so it never fails the request.
+- The User-Agent is `dominaite-python/0.6.0 (python 3.12.4)`, then your `user_agent` suffix
+  after one space. A suffix with a control character raises `ValueError`.
 
 ## Errors
 

@@ -6,7 +6,9 @@ import hashlib
 import io
 import json
 import pickle
+import platform
 import pprint
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -14,12 +16,13 @@ import uuid
 
 import pytest
 
+import dominaite
+
 from dominaite import (
     AGREEMENTS_PATH,
     AUTHORIZATION_ERROR_CODES,
     CHARGE_ERROR_CODES,
     CONTRACT_PATH,
-    DEFAULT_BASE_URL,
     PAYMENT_METHODS_PATH,
     PAYMENTS_PATH,
     PING_PATH,
@@ -53,6 +56,8 @@ from dominaite import (
     sign_request,
     sign_webhook,
     verify_webhook,
+    PRODUCTION_BASE_URL,
+    SANDBOX_BASE_URL,
 )
 from dominaite.client import MAX_RESPONSE_BYTES
 
@@ -200,7 +205,7 @@ SENTINEL_SECRET = "dms_" + "S3CRET" * 5
 )
 def test_the_secret_never_appears_when_the_client_is_shown_or_serialized(surface):
     """Each of these is a real way a client ends up in a log line or a crash dump."""
-    client = DominaiteClient(KEY_ID, SENTINEL_SECRET)
+    client = DominaiteClient(KEY_ID, SENTINEL_SECRET, base_url=BASE_URL)
 
     assert SENTINEL_SECRET not in surface(client)
 
@@ -214,13 +219,13 @@ def test_the_client_defines_its_own_repr_as_a_guard():
     """
     assert DominaiteClient.__repr__ is not object.__repr__
 
-    text = repr(DominaiteClient(KEY_ID, SENTINEL_SECRET))
+    text = repr(DominaiteClient(KEY_ID, SENTINEL_SECRET, base_url=BASE_URL))
     assert "***redacted***" in text
     assert KEY_ID in text, "the key id is not secret - keep the repr useful"
 
 
 def test_the_secret_cannot_be_pickled():
-    client = DominaiteClient(KEY_ID, SENTINEL_SECRET)
+    client = DominaiteClient(KEY_ID, SENTINEL_SECRET, base_url=BASE_URL)
 
     with pytest.raises(TypeError):
         pickle.dumps(client._secret)
@@ -1340,9 +1345,61 @@ def test_accepts_https_and_plain_http_on_loopback(base_url):
     assert DominaiteClient(KEY_ID, SECRET, base_url=base_url) is not None
 
 
-def test_the_default_base_url_is_https():
-    assert DEFAULT_BASE_URL.startswith("https://")
-    assert DominaiteClient(KEY_ID, SECRET) is not None
+# --- base_url is required ----------------------------------------------------
+
+BASE_URL_REQUIRED = (
+    "base_url is required. Use https://api.staging.dominaite.com/payments for the sandbox "
+    "or https://api.dominaite.com/payments for production."
+)
+
+
+def test_a_missing_base_url_is_refused_with_both_urls_in_the_message():
+    """No default: an unset setting must not send sandbox credentials to production."""
+    with pytest.raises(ValueError) as refused:
+        DominaiteClient(KEY_ID, SECRET)
+
+    assert str(refused.value) == BASE_URL_REQUIRED
+
+
+@pytest.mark.parametrize("base_url", [None, "", "   ", "\t\n", "/", " // "])
+def test_an_empty_or_blank_base_url_is_refused(base_url):
+    """os.environ.get() of an unset variable gives None, a blank .env line gives ""."""
+    with pytest.raises(ValueError) as refused:
+        DominaiteClient(KEY_ID, SECRET, base_url=base_url)
+
+    assert str(refused.value) == BASE_URL_REQUIRED
+
+
+def test_the_base_url_is_the_third_positional_parameter(urlopen):
+    recorder = urlopen((200, {"data": {"pong": True}}))
+
+    DominaiteClient(KEY_ID, SECRET, SANDBOX_BASE_URL).ping()
+
+    assert recorder.requests[0].full_url == SANDBOX_BASE_URL + "/merchant-api/ping"
+
+
+def test_the_named_base_urls_are_the_sandbox_and_production_hosts():
+    assert SANDBOX_BASE_URL == "https://api.staging.dominaite.com/payments"
+    assert PRODUCTION_BASE_URL == "https://api.dominaite.com/payments"
+
+
+@pytest.mark.parametrize("base_url", [SANDBOX_BASE_URL, PRODUCTION_BASE_URL])
+def test_each_named_base_url_is_where_requests_go(urlopen, base_url):
+    recorder = urlopen((200, {"data": {"pong": True}}))
+    client = DominaiteClient(KEY_ID, SECRET, base_url=base_url)
+
+    client.ping()
+
+    assert recorder.requests[0].full_url == base_url + "/merchant-api/ping"
+
+
+def test_surrounding_whitespace_and_trailing_slashes_are_trimmed(urlopen):
+    recorder = urlopen((200, {"data": {"pong": True}}))
+    client = DominaiteClient(KEY_ID, SECRET, base_url="  " + SANDBOX_BASE_URL + "//  ")
+
+    client.ping()
+
+    assert recorder.requests[0].full_url == SANDBOX_BASE_URL + "/merchant-api/ping"
 
 
 # --- length limits count characters, not bytes -------------------------------
@@ -3437,3 +3494,248 @@ def test_values_the_sdk_has_never_seen_pass_through_and_never_throw(client, urlo
     event = verify_webhook(body, header, WEBHOOK_SECRET, now=int(timestamp))
     assert event["type"] == "payment.settled_v9"
     assert event["data"]["status"] == "settling_v9"
+
+
+# --- User-Agent ----------------------------------------------------------------
+
+
+def test_the_user_agent_names_the_sdk_version_and_the_python_version(client, urlopen):
+    recorder = urlopen((200, {"pong": True}))
+    client.ping()
+    agent = _headers(recorder.last)["user-agent"]
+    assert re.fullmatch(r"dominaite-python/0\.6\.0 \(python [^ ()]+\)", agent), agent
+    assert agent == "dominaite-python/{0} (python {1})".format(
+        dominaite.__version__, platform.python_version()
+    )
+
+
+def test_the_user_agent_suffix_follows_after_one_space(urlopen):
+    recorder = urlopen((200, {"pong": True}))
+    DominaiteClient(KEY_ID, SECRET, BASE_URL, user_agent="  shop/1.2 ").ping()
+    assert re.fullmatch(
+        r"dominaite-python/0\.6\.0 \(python [^ ()]+\) shop/1\.2",
+        _headers(recorder.last)["user-agent"],
+    )
+
+
+def test_a_blank_user_agent_suffix_is_none(urlopen):
+    recorder = urlopen((200, {"pong": True}))
+    DominaiteClient(KEY_ID, SECRET, BASE_URL, user_agent="   ").ping()
+    assert _headers(recorder.last)["user-agent"].endswith(")")
+
+
+@pytest.mark.parametrize("suffix", ["shop\r\nX-Injected: 1", "shop\n", "tab\there", "del\x7f"])
+def test_a_user_agent_suffix_with_a_control_character_is_refused(suffix):
+    with pytest.raises(ValueError, match="control characters"):
+        DominaiteClient(KEY_ID, SECRET, BASE_URL, user_agent=suffix)
+
+
+# --- warnings, the SDK notice and the debug log ----------------------------------
+
+NOTICE = 'deprecated; current="0.7.0"; sunset="2027-01-31"; info="https://example.test/upgrade"'
+NOTICE_MESSAGE = (
+    "dominaite-python 0.6.0 is deprecated; upgrade to 0.7.0 (sunset 2027-01-31). "
+    "https://example.test/upgrade"
+)
+
+
+def test_one_warning_per_distinct_notice_value(urlopen):
+    warned = []
+    client = DominaiteClient(KEY_ID, SECRET, BASE_URL, on_warning=warned.append)
+    other = 'deprecated; current="0.8.0"'
+    urlopen(
+        (200, {"pong": True}, {"Dominaite-Sdk-Notice": NOTICE}),
+        (200, {"pong": True}, {"Dominaite-Sdk-Notice": NOTICE}),
+        (200, {"pong": True}, {"Dominaite-Sdk-Notice": NOTICE}),
+        (200, {"pong": True}, {"Dominaite-Sdk-Notice": other}),
+    )
+    for _ in range(4):
+        client.ping()
+
+    assert warned == [NOTICE_MESSAGE, "dominaite-python 0.6.0 is deprecated; upgrade to 0.8.0."]
+
+
+def test_a_notice_on_an_error_response_also_warns(urlopen):
+    warned = []
+    client = DominaiteClient(KEY_ID, SECRET, BASE_URL, on_warning=warned.append)
+    urlopen((404, {"success": False, "error": {"code": "NOT_FOUND"}}, {"dominaite-sdk-notice": NOTICE}))
+
+    with pytest.raises(ApiError):
+        client.get_status(TRANSACTION_ID)
+
+    assert warned == [NOTICE_MESSAGE]
+
+
+def test_a_notice_without_sunset_or_info_and_an_unknown_notice_kind(urlopen):
+    warned = []
+    client = DominaiteClient(KEY_ID, SECRET, BASE_URL, on_warning=warned.append)
+    urlopen(
+        (200, {"pong": True}, {"Dominaite-Sdk-Notice": "deprecated"}),
+        (200, {"pong": True}, {"Dominaite-Sdk-Notice": "maintenance; at=\"tonight\""}),
+    )
+    client.ping()
+    client.ping()
+
+    assert warned == [
+        "dominaite-python 0.6.0 is deprecated.",
+        'dominaite-python 0.6.0: maintenance; at="tonight"',
+    ]
+
+
+def test_no_notice_header_means_no_warning(urlopen):
+    warned = []
+    client = DominaiteClient(KEY_ID, SECRET, BASE_URL, on_warning=warned.append)
+    urlopen((200, {"pong": True}), (204, b""))
+    client.ping()
+    client.delete_plan("plan_1")
+
+    assert warned == []
+
+
+def test_the_default_sink_is_a_deprecation_warning(urlopen):
+    client = DominaiteClient(KEY_ID, SECRET, BASE_URL)
+    urlopen((200, {"pong": True}, {"Dominaite-Sdk-Notice": NOTICE}))
+
+    with pytest.warns(DeprecationWarning) as caught:
+        client.ping()
+
+    assert [str(w.message) for w in caught] == [NOTICE_MESSAGE]
+    # Pointed at the caller's line, not at the SDK.
+    assert caught[0].filename.endswith("test_client.py")
+
+
+def test_a_failing_sink_never_fails_the_request(urlopen):
+    def explode(_line):
+        raise RuntimeError("sink down")
+
+    client = DominaiteClient(
+        KEY_ID, SECRET, BASE_URL, on_warning=explode, on_debug=explode
+    )
+    urlopen((200, {"pong": True, "clockSkewSeconds": 0}, {"Dominaite-Sdk-Notice": NOTICE}))
+
+    assert client.ping()["pong"] is True
+
+
+def test_a_warnings_filter_set_to_error_never_fails_the_request(urlopen):
+    import warnings
+
+    client = DominaiteClient(KEY_ID, SECRET, BASE_URL)
+    urlopen((200, {"pong": True}, {"Dominaite-Sdk-Notice": NOTICE}))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert client.ping()["pong"] is True
+
+
+@pytest.mark.parametrize("skew, warns", [(61, True), (-61, True), (60, False), (0, False)])
+def test_ping_warns_on_a_clock_skew_over_60_seconds(urlopen, skew, warns):
+    warned = []
+    client = DominaiteClient(KEY_ID, SECRET, BASE_URL, on_warning=warned.append)
+    urlopen((200, {"pong": True, "clockSkewSeconds": skew}))
+    client.ping()
+
+    expected = [
+        "dominaite-python: clock skew is {0} s; requests fail at 300 s. "
+        "Sync this server's clock.".format(skew)
+    ]
+    assert warned == (expected if warns else [])
+
+
+def test_the_retry_helper_warns_before_each_retry(urlopen):
+    warned = []
+    client = DominaiteClient(KEY_ID, SECRET, BASE_URL, on_warning=warned.append)
+    urlopen(
+        (503, {}),
+        (503, {"success": False, "error": {"code": "PAYMENT_PROCESSING_UNAVAILABLE"}}),
+        _ok(),
+    )
+    client.create_checkout_session_with_retry(
+        amount=2500,
+        currency="EUR",
+        order_reference="order-1042",
+        backoff_seconds=0,
+        idempotency_key=IDEMPOTENCY_KEY,
+    )
+
+    assert len(warned) == 2
+    assert warned[0] == (
+        "dominaite-python: retrying create_checkout_session_with_retry after TransportError "
+        "(attempt 2 of 3)"
+    )
+    assert warned[1].endswith("(attempt 3 of 3)")
+
+
+def test_debug_is_off_by_default(urlopen):
+    warned = []
+    client = DominaiteClient(KEY_ID, SECRET, BASE_URL, on_warning=warned.append)
+    urlopen((201, {"success": True, "checkout": CHECKOUT}, {"Dominaite-Request-Id": "req-1"}))
+    client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference="order-1042", idempotency_key=IDEMPOTENCY_KEY
+    )
+
+    assert warned == []
+
+
+def test_debug_writes_one_line_per_request(urlopen):
+    lines = []
+    client = DominaiteClient(KEY_ID, SECRET, BASE_URL, on_debug=lines.append)
+    urlopen(
+        (201, {"success": True, "checkout": CHECKOUT}, {"Dominaite-Request-Id": "req-1"}),
+        (200, {"pong": True}),
+    )
+    client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference="order-1042", idempotency_key=IDEMPOTENCY_KEY
+    )
+    client.ping()
+
+    assert len(lines) == 2
+    assert re.fullmatch(
+        r"dominaite-python: POST /merchant-api/checkout/sessions 201 \d+ms "
+        r"request_id=req-1 idempotency_key=checkout-1042-2500-EUR",
+        lines[0],
+    ), lines[0]
+    assert re.fullmatch(r"dominaite-python: GET /merchant-api/ping 200 \d+ms", lines[1]), lines[1]
+
+
+def test_debug_marks_a_transport_failure_and_leaves_out_the_query(urlopen):
+    lines = []
+    client = DominaiteClient(KEY_ID, SECRET, BASE_URL, on_debug=lines.append)
+    urlopen(urllib.error.URLError("refused"))
+
+    with pytest.raises(TransportError):
+        client.ping()
+
+    assert re.fullmatch(r"dominaite-python: GET /merchant-api/ping error \d+ms", lines[0])
+
+
+def test_no_line_carries_the_secret_the_signature_the_cashier_token_or_a_body(urlopen):
+    lines = []
+    client = DominaiteClient(
+        KEY_ID, SECRET, BASE_URL, on_warning=lines.append, on_debug=lines.append
+    )
+    recorder = urlopen(
+        (201, {"success": True, "checkout": CHECKOUT}, {"Dominaite-Sdk-Notice": NOTICE}),
+        (400, {"success": False, "error": {"code": "VALIDATION_ERROR", "message": "bad-field-xyz"}}),
+        (200, {"pong": True, "clockSkewSeconds": 120}, {"Dominaite-Request-Id": "req-2"}),
+    )
+    client.create_checkout_session(
+        amount=2500,
+        currency="EUR",
+        order_reference="order-secret-ref",
+        idempotency_key=IDEMPOTENCY_KEY,
+    )
+    with pytest.raises(ApiError):
+        client.create_checkout_session(
+            amount=2500, currency="EUR", order_reference="order-1042", idempotency_key="k-2"
+        )
+    client.ping()
+
+    signatures = {_headers(r)["x-signature"] for r in recorder.requests}
+    assert len(lines) >= 5
+    for line in lines:
+        assert SECRET not in line
+        assert CHECKOUT["cashierToken"] not in line
+        assert "order-secret-ref" not in line
+        assert "bad-field-xyz" not in line
+        assert "{" not in line
+        for signature in signatures:
+            assert signature not in line
