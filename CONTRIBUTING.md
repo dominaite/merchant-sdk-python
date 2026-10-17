@@ -11,7 +11,8 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/mypy src
 ```
 
-CI runs the same commands. A pull request must pass all of them.
+CI runs the same commands. A pull request must pass all of them. mypy needs Python 3.10 or
+later, so a 3.9 environment installs and runs only pytest and ruff.
 
 ## Runtime floor
 
