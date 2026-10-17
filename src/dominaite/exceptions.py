@@ -277,7 +277,14 @@ class DominaiteError(Exception):
 
     Catch this if you only care that the payment call failed. Catch the subclasses
     when you want to branch on why.
+
+    ``request_id`` is the id the API gave this call, for support: the
+    ``Dominaite-Request-Id`` response header, else ``metadata.requestId`` in the body. It
+    is None when no answer arrived (a network failure) or the answer carried no id.
     """
+
+    #: The API's id for this call, or None. Give it to support with the time of the call.
+    request_id: Optional[str] = None
 
 
 class ApiError(DominaiteError):
@@ -301,12 +308,15 @@ class ApiError(DominaiteError):
         message: str,
         error_code: Optional[str] = None,
         result: Optional[Dict[str, Any]] = None,
+        *,
+        request_id: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.http_status = http_status
         self.error_code = error_code
         #: The full JSON body the API sent, for fields not modelled above.
         self.result = result if result is not None else {}
+        self.request_id = request_id
 
 
 class RateLimitError(ApiError):
@@ -352,8 +362,10 @@ class RateLimitError(ApiError):
         retry_after_seconds: Optional[int] = None,
         error_code: Optional[str] = None,
         result: Optional[Dict[str, Any]] = None,
+        *,
+        request_id: Optional[str] = None,
     ) -> None:
-        super().__init__(429, message, error_code=error_code, result=result)
+        super().__init__(429, message, error_code=error_code, result=result, request_id=request_id)
         #: Seconds the API asked you to wait, or None when it did not say.
         self.retry_after_seconds = retry_after_seconds
 
@@ -411,6 +423,8 @@ class AuthenticationError(DominaiteError):
         message: str,
         http_status: int = 401,
         result: Optional[Dict[str, Any]] = None,
+        *,
+        request_id: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.error_code = error_code
@@ -418,6 +432,7 @@ class AuthenticationError(DominaiteError):
         self.http_status = http_status
         #: The full JSON body the API sent, for fields not modelled above.
         self.result = result if result is not None else {}
+        self.request_id = request_id
 
 
 class CheckoutRefusedError(DominaiteError):
@@ -453,12 +468,15 @@ class CheckoutRefusedError(DominaiteError):
         message: str,
         transaction_id: Optional[str] = None,
         result: Optional[Dict[str, Any]] = None,
+        *,
+        request_id: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.error_code = error_code
         self.transaction_id = transaction_id
         #: The full unwrapped refusal payload, for fields not modelled above.
         self.result = result if result is not None else {}
+        self.request_id = request_id
 
 
 class ChargeError(DominaiteError):
@@ -501,6 +519,8 @@ class ChargeError(DominaiteError):
         message: str,
         charge: Optional[Dict[str, Any]] = None,
         result: Optional[Dict[str, Any]] = None,
+        *,
+        request_id: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.http_status = http_status
@@ -511,6 +531,7 @@ class ChargeError(DominaiteError):
         self.transaction_id = charge.get("transactionId") if charge else None
         #: The full envelope, for fields not modelled above.
         self.result = result if result is not None else {}
+        self.request_id = request_id
 
 
 class RevokeError(DominaiteError):
@@ -533,12 +554,15 @@ class RevokeError(DominaiteError):
         error_code: str,
         message: str,
         result: Optional[Dict[str, Any]] = None,
+        *,
+        request_id: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.http_status = http_status
         self.error_code = error_code
         #: The full envelope, for fields not modelled above.
         self.result = result if result is not None else {}
+        self.request_id = request_id
 
 
 class RefundError(ApiError):
@@ -575,8 +599,12 @@ class RefundError(ApiError):
         error_code: str,
         message: str,
         result: Optional[Dict[str, Any]] = None,
+        *,
+        request_id: Optional[str] = None,
     ) -> None:
-        super().__init__(http_status, message, error_code=error_code, result=result)
+        super().__init__(
+            http_status, message, error_code=error_code, result=result, request_id=request_id
+        )
         #: Seconds to keep retrying with the same key, or None when retrying cannot help.
         self.retry_stop_after_seconds = REFUND_RETRY_WINDOWS_SECONDS.get(error_code)
         #: True when the same call with the same key can still succeed.
@@ -623,6 +651,8 @@ class TransportError(DominaiteError):
         http_status: Optional[int] = None,
         error_code: Optional[str] = None,
         result: Optional[Dict[str, Any]] = None,
+        *,
+        request_id: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         #: The 5xx status, or None when no answer arrived.
@@ -631,3 +661,4 @@ class TransportError(DominaiteError):
         self.error_code = error_code
         #: The full JSON body the API sent, for fields not modelled above.
         self.result = result if result is not None else {}
+        self.request_id = request_id

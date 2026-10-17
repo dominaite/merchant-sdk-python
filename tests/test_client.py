@@ -53,6 +53,7 @@ from dominaite import (
     is_paid,
     is_terminal,
     order_idempotency_key,
+    request_id_of,
     sign_request,
     sign_webhook,
     verify_webhook,
@@ -3834,3 +3835,121 @@ def test_no_line_carries_the_secret_the_signature_the_cashier_token_or_a_body(ur
         assert "{" not in line
         for signature in signatures:
             assert signature not in line
+
+
+# --- request id ----------------------------------------------------------------
+
+BODY_REQUEST_ID = "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a"
+HEADER_REQUEST_ID = "9f8e7d6c-5b4a-4321-8fed-cba987654321"
+
+
+def _with_metadata(body):
+    return dict(body, metadata={"requestId": BODY_REQUEST_ID, "apiVersion": "1.0"})
+
+
+def test_the_header_request_id_wins_over_the_body(client, urlopen):
+    urlopen((200, _with_metadata(_ok()[1]), {"Dominaite-Request-Id": HEADER_REQUEST_ID}))
+
+    session = client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference="order-1042", idempotency_key=IDEMPOTENCY_KEY
+    )
+
+    assert request_id_of(session) == HEADER_REQUEST_ID
+    assert session == CHECKOUT
+
+
+def test_the_body_request_id_is_the_fallback_when_there_is_no_header(client, urlopen):
+    urlopen((200, _with_metadata({"success": True, "data": {"pong": True}})))
+
+    pong = client.ping()
+
+    assert request_id_of(pong) == BODY_REQUEST_ID
+    assert pong.request_id == BODY_REQUEST_ID
+    assert pong == {"pong": True}
+
+
+def test_the_request_id_is_none_when_the_answer_has_none(client, urlopen):
+    urlopen((200, {"success": True, "data": {"pong": True}}))
+
+    assert request_id_of(client.ping()) is None
+
+
+@pytest.mark.parametrize(
+    "call, answer",
+    [
+        ("status", (200, {"success": True, "data": {"transactionId": TRANSACTION_ID, "status": "pending"}})),
+        ("plans", (200, {"success": True, "data": []})),
+        ("transactions", (200, {"success": True, "data": {"items": [], "nextCursor": None}})),
+        ("refunds", (200, {"success": True, "data": {"transactionId": TRANSACTION_ID, "currency": "EUR", "refundedAmount": 0, "refundableAmount": 2500, "refunds": []}})),
+        ("charge", (201, {"success": True, "data": CHARGE})),
+    ],
+)
+def test_every_result_shape_carries_the_request_id(client, urlopen, call, answer):
+    urlopen((answer[0], _with_metadata(answer[1])))
+    calls = {
+        "status": lambda: client.get_status(TRANSACTION_ID),
+        "plans": lambda: client.list_plans(),
+        "transactions": lambda: client.list_transactions("2026-10-01", "2026-10-02"),
+        "refunds": lambda: client.list_refunds(TRANSACTION_ID),
+        "charge": lambda: _charge(client),
+    }
+
+    assert request_id_of(calls[call]()) == BODY_REQUEST_ID
+
+
+@pytest.mark.parametrize(
+    "status, body, error_type",
+    [
+        (401, {"success": False, "error": {"code": "INVALID_SIGNATURE"}}, AuthenticationError),
+        (429, {"success": False, "error": {"code": "RATE_LIMIT_EXCEEDED"}}, RateLimitError),
+        (400, {"success": False, "error": {"code": "VALIDATION_ERROR"}}, ApiError),
+        (409, {"success": False, "error": {"code": "STOREFRONT_INACTIVE"}}, StorefrontError),
+        (503, {"success": False, "error": {"code": "MERCHANT_API_UNAVAILABLE"}}, TransportError),
+        (200, {"success": True, "data": {"success": False, "errorCode": "ALREADY_PROCESSED"}}, CheckoutRefusedError),
+    ],
+)
+def test_every_error_carries_the_request_id(client, urlopen, status, body, error_type):
+    urlopen((status, _with_metadata(body)))
+
+    with pytest.raises(error_type) as raised:
+        client.create_checkout_session(
+            amount=2500, currency="EUR", order_reference="order-1042", idempotency_key=IDEMPOTENCY_KEY
+        )
+
+    assert raised.value.request_id == BODY_REQUEST_ID
+    assert request_id_of(raised.value) == BODY_REQUEST_ID
+
+
+def test_charge_and_refund_errors_carry_the_request_id(client, urlopen):
+    urlopen(
+        (409, _with_metadata({"success": False, "error": {"code": "CHARGE_IN_PROGRESS"}}), {"Dominaite-Request-Id": HEADER_REQUEST_ID}),
+        (422, _with_metadata({"success": False, "error": {"code": "PAYMENT_NOT_REFUNDABLE"}})),
+    )
+
+    with pytest.raises(ChargeError) as charge:
+        _charge(client)
+    with pytest.raises(RefundError) as refund:
+        client.create_refund(TRANSACTION_ID, idempotency_key="refund-1")
+
+    assert charge.value.request_id == HEADER_REQUEST_ID
+    assert refund.value.request_id == BODY_REQUEST_ID
+
+
+def test_a_network_failure_has_no_request_id(client, urlopen):
+    urlopen(urllib.error.URLError("connection reset"))
+
+    with pytest.raises(TransportError) as raised:
+        client.ping()
+
+    assert raised.value.request_id is None
+    assert raised.value.http_status is None
+
+
+def test_the_debug_line_names_the_body_request_id_when_there_is_no_header(urlopen):
+    lines = []
+    client = DominaiteClient(KEY_ID, SECRET, base_url=BASE_URL, on_debug=lines.append)
+    urlopen((200, _with_metadata({"success": True, "data": {"pong": True}})))
+
+    client.ping()
+
+    assert lines and lines[-1].endswith("request_id=" + BODY_REQUEST_ID)

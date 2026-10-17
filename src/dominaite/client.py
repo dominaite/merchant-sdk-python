@@ -43,6 +43,8 @@ from .exceptions import (
     TransportError,
 )
 from .models import (
+    _ResultDict,
+    _ResultList,
     Agreement,
     Plan,
     Refund,
@@ -208,6 +210,8 @@ class _Reply(NamedTuple):
     payload: Dict[str, Any]
     #: ``envelope["error"]`` when present, {} otherwise.
     error: Dict[str, Any]
+    #: The ``Dominaite-Request-Id`` header, else ``envelope["metadata"]["requestId"]``.
+    request_id: Optional[str] = None
 
 
 class _Secret:
@@ -261,6 +265,7 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
             "Unexpected redirect response; the Dominaite API never redirects. "
             "Check base_url and anything proxying it.",
             error_code="UNEXPECTED_REDIRECT",
+            request_id=_request_id(headers, None),
         )
 
     # CPython grew http_error_308 in 3.11; we support 3.9, where a 308 would otherwise
@@ -297,6 +302,25 @@ def _read_bounded(stream: Any) -> str:
             "retry with the same idempotency key.".format(MAX_RESPONSE_BYTES)
         )
     return body.decode("utf-8", errors="replace")
+
+
+def _request_id(headers: Any, envelope: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """The API's id for one call: the ``Dominaite-Request-Id`` header, else the body's.
+
+    Production sends only ``metadata.requestId`` in the body today; the header wins when
+    both are there. Both hold the same id. None when neither is set.
+    """
+    getter = getattr(headers, "get", None)
+    if getter is not None:
+        from_header = _clean_header(getter(REQUEST_ID_HEADER), _MAX_REQUEST_ID_LENGTH)
+        if from_header:
+            return from_header
+    metadata = envelope.get("metadata") if isinstance(envelope, Mapping) else None
+    if isinstance(metadata, Mapping):
+        from_body = _clean_header(metadata.get("requestId"), _MAX_REQUEST_ID_LENGTH)
+        if from_body:
+            return from_body
+    return None
 
 
 def _retry_after_seconds(headers: Any) -> Optional[int]:
@@ -838,7 +862,8 @@ class DominaiteClient:
         if extra is not None:
             body.update(extra)
 
-        response = self._request("POST", SESSIONS_PATH, body, key)
+        reply = _checked(self._send("POST", SESSIONS_PATH, body, key))
+        response = reply.payload
 
         if response.get("success") is not True or "checkout" not in response:
             if response.get("errorCode") in STOREFRONT_ERROR_CODES:
@@ -848,6 +873,7 @@ class DominaiteClient:
                     str(response.get("errorMessage") or "The storefront refused the session."),
                     error_code=str(response.get("errorCode")),
                     result=dict(response),
+                    request_id=reply.request_id,
                 )
             # A replay refusal names the transaction your key collided with. Carry it
             # (and the whole payload) so the caller can reconcile with get_status()
@@ -858,9 +884,10 @@ class DominaiteClient:
                 str(response.get("errorMessage") or "The checkout session was refused."),
                 transaction_id=str(transaction_id) if transaction_id else None,
                 result=dict(response),
+                request_id=reply.request_id,
             )
 
-        return response["checkout"]
+        return _result(response["checkout"], reply)
 
     def create_checkout_session_with_retry(
         self,
@@ -995,14 +1022,15 @@ class DominaiteClient:
         """
         normalized = _normalize_transaction_id(transaction_id)
 
-        status = self._request("GET", SESSIONS_PATH + "/" + normalized, None, "")
+        reply = _checked(self._send("GET", SESSIONS_PATH + "/" + normalized, None, ""))
+        status = reply.payload
         # Passed through as sent, except the card on file: the gateway omits its null
         # fields on the wire, and the caller gets one shape for it, not two. When the
         # gateway sent no storedPaymentMethod at all there is no key here either.
         stored = status.get("storedPaymentMethod")
         if isinstance(stored, dict):
             status = dict(status, storedPaymentMethod=_stored_payment_method(stored))
-        return status
+        return _result(status, reply)
 
     def charge_payment_method(
         self,
@@ -1116,7 +1144,7 @@ class DominaiteClient:
         # 402: the provider declined; the envelope says success=false but the charge is
         # right there, status failed with its decline class, so it is a result.
         if charge is not None and (reply.envelope.get("success") is True or reply.status == 402):
-            return charge
+            return _result(charge, reply)
 
         if (
             error_code
@@ -1129,6 +1157,7 @@ class DominaiteClient:
                 str(reply.error.get("message") or "The charge was refused."),
                 charge=charge,
                 result=dict(reply.envelope),
+                request_id=reply.request_id,
             )
         if reply.status >= 400:
             raise _rejection(reply)
@@ -1136,6 +1165,7 @@ class DominaiteClient:
             reply.status,
             "The API answered the charge without a charge body",
             error_code="UNEXPECTED_RESPONSE",
+            request_id=reply.request_id,
         )
 
     def revoke_payment_method(self, payment_method_id: str) -> None:
@@ -1170,6 +1200,7 @@ class DominaiteClient:
                 str(error_code),
                 str(reply.error.get("message") or "The revoke was refused."),
                 result=dict(reply.envelope),
+                request_id=reply.request_id,
             )
         raise _rejection(reply)
 
@@ -1733,11 +1764,12 @@ class DominaiteClient:
                 reply.status,
                 "The API answered the transaction list without a list",
                 error_code="UNEXPECTED_RESPONSE",
+                request_id=reply.request_id,
             )
         page = dict(reply.payload)
         page["items"] = [cast(Transaction, dict(item)) for item in items if isinstance(item, dict)]
         page["nextCursor"] = reply.payload.get("nextCursor")
-        return cast(TransactionPage, page)
+        return cast(TransactionPage, _result(page, reply))
 
     def _request(
         self,
@@ -1748,7 +1780,8 @@ class DominaiteClient:
         signed: bool = True,
     ) -> Dict[str, Any]:
         """Send and apply the generic failure rules: 5xx is transport, 4xx is ApiError."""
-        return _checked(self._send(method, path, body, idempotency_key, signed=signed)).payload
+        reply = _checked(self._send(method, path, body, idempotency_key, signed=signed))
+        return _result(reply.payload, reply)
 
     def _request_list(self, path: str, what: str) -> List[Dict[str, Any]]:
         """GET a route whose ``data`` is a bare JSON array, and return its objects."""
@@ -1759,8 +1792,11 @@ class DominaiteClient:
                 reply.status,
                 "The API answered the {0} without a list".format(what),
                 error_code="UNEXPECTED_RESPONSE",
+                request_id=reply.request_id,
             )
-        return [dict(item) for item in items if isinstance(item, dict)]
+        return _ResultList(
+            [dict(item) for item in items if isinstance(item, dict)], reply.request_id
+        )
 
     def _send(
         self,
@@ -1827,25 +1863,31 @@ class DominaiteClient:
                 headers_received = getattr(error, "headers", None)
                 raw = _read_bounded(error)
         except (urllib.error.URLError, OSError) as error:
-            self._debug(method, path, "error", started, headers_received, idempotency_key)
+            self._debug(method, path, "error", started, None, idempotency_key)
             raise TransportError(
                 "Could not reach the Dominaite API: {0}".format(error)
             ) from error
         except BaseException:
-            self._debug(method, path, "error", started, headers_received, idempotency_key)
+            self._debug(
+                method, path, "error", started, _request_id(headers_received, None), idempotency_key
+            )
             raise
-        self._debug(method, path, str(status), started, headers_received, idempotency_key)
+
+        # 204 carries nothing to parse; the status is the whole answer.
+        decoded: Any = None
+        if status != 204:
+            try:
+                decoded = json.loads(raw)
+            except ValueError:
+                decoded = None
+        request_id = _request_id(headers_received, decoded if isinstance(decoded, dict) else None)
+        self._debug(method, path, str(status), started, request_id, idempotency_key)
         # Before any status handling, so a notice on an error or a non-JSON body still warns.
         self._read_notice(headers_received)
 
-        # 204 carries nothing to parse; the status is the whole answer.
         if status == 204:
-            return _Reply(204, {}, {}, {})
+            return _Reply(204, {}, {}, {}, request_id)
 
-        try:
-            decoded = json.loads(raw)
-        except ValueError:
-            decoded = None
         if not isinstance(decoded, dict):
             # A 429 is a rate limit whatever its body: something in front of the API can
             # throttle too, with an HTML page or nothing at all. It gets the same error and
@@ -1857,9 +1899,12 @@ class DominaiteClient:
                     "The Dominaite API is unavailable (HTTP {0}); "
                     "retry with the same idempotency key.".format(status),
                     http_status=status,
+                    request_id=request_id,
                 )
             if status != 429:
-                raise ApiError(status, "The API returned a non-JSON response")
+                raise ApiError(
+                    status, "The API returned a non-JSON response", request_id=request_id
+                )
             decoded = {}
 
         # The gateway wraps responses as { success, data, ... }; unwrap when present.
@@ -1885,6 +1930,7 @@ class DominaiteClient:
                 ),
                 http_status=status,
                 result=dict(decoded),
+                request_id=request_id,
             )
         if status == 429:
             # Deliberately not retried here, not even by
@@ -1908,8 +1954,9 @@ class DominaiteClient:
                     or ErrorCode.RATE_LIMIT_EXCEEDED.value
                 ),
                 result=dict(decoded),
+                request_id=request_id,
             )
-        return _Reply(status, decoded, result, envelope_error)
+        return _Reply(status, decoded, result, envelope_error, request_id)
 
 
     def _warn(self, message: str, category: Type[Warning]) -> None:
@@ -1944,7 +1991,7 @@ class DominaiteClient:
         path: str,
         status: str,
         started: float,
-        headers: Any,
+        request_id: Optional[str],
         idempotency_key: str,
     ) -> None:
         """One debug line for one request, when the caller asked for them. Never raises."""
@@ -1953,10 +2000,6 @@ class DominaiteClient:
         try:
             line = "dominaite-python: {0} {1} {2} {3}ms".format(
                 method, path, status, int((time.monotonic() - started) * 1000)
-            )
-            getter = getattr(headers, "get", None)
-            request_id = (
-                _clean_header(getter(REQUEST_ID_HEADER), _MAX_REQUEST_ID_LENGTH) if getter else ""
             )
             if request_id:
                 line += " request_id=" + request_id
@@ -1992,6 +2035,7 @@ def _rejection(reply: _Reply) -> DominaiteError:
             http_status=reply.status,
             error_code=str(code) if code else None,
             result=dict(reply.envelope),
+            request_id=reply.request_id,
         )
     # Input validation (IDEMPOTENCY_KEY_REQUIRED and friends) answers 400 with the code
     # at error.code, not as a success=false refusal. Carry it through instead of
@@ -2009,7 +2053,13 @@ def _rejection(reply: _Reply) -> DominaiteError:
         ),
         error_code=str(error_code) if error_code else None,
         result=dict(reply.envelope),
+        request_id=reply.request_id,
     )
+
+
+def _result(data: Dict[str, Any], reply: _Reply) -> Dict[str, Any]:
+    """The result handed to the caller: the data as a dict that carries the request id."""
+    return _ResultDict(data, reply.request_id)
 
 
 def _auth_message(status: int, code: str, server_message: Any) -> str:
@@ -2058,11 +2108,12 @@ def _refund_result(reply: _Reply) -> Refund:
     """Read a refund route's reply: a refund on 2xx, a RefundError when the gateway sent a code."""
     if 200 <= reply.status < 300:
         if isinstance(reply.payload.get("refundId"), str):
-            return _refund(reply.payload)
+            return cast(Refund, _result(dict(_refund(reply.payload)), reply))
         raise ApiError(
             reply.status,
             "The API answered the refund without a refund body",
             error_code="UNEXPECTED_RESPONSE",
+            request_id=reply.request_id,
         )
     raise _refund_failure(reply)
 
@@ -2083,6 +2134,7 @@ def _checked(reply: _Reply) -> _Reply:
                 reply.status
             ),
             error_code="UNEXPECTED_STATUS",
+            request_id=reply.request_id,
         )
     return reply
 
@@ -2094,11 +2146,12 @@ def _refund_list(reply: _Reply) -> RefundList:
         if isinstance(refunds, list):
             listing = dict(reply.payload)
             listing["refunds"] = [_refund(item) for item in refunds if isinstance(item, dict)]
-            return cast(RefundList, listing)
+            return cast(RefundList, _result(listing, reply))
         raise ApiError(
             reply.status,
             "The API answered the refund list without a list",
             error_code="UNEXPECTED_RESPONSE",
+            request_id=reply.request_id,
         )
     raise _refund_failure(reply)
 
@@ -2115,6 +2168,7 @@ def _refund_failure(reply: _Reply) -> DominaiteError:
             str(error_code),
             str(reply.error.get("message") or reply.payload.get("errorMessage") or "The refund was refused."),
             result=dict(reply.envelope),
+            request_id=reply.request_id,
         )
     if reply.status >= 400:
         return _rejection(reply)
@@ -2123,6 +2177,7 @@ def _refund_failure(reply: _Reply) -> DominaiteError:
         "Unexpected HTTP {0} response; the Dominaite API answers 2xx or a "
         "documented error. Check base_url and anything proxying it.".format(reply.status),
         error_code="UNEXPECTED_STATUS",
+        request_id=reply.request_id,
     )
 
 

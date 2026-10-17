@@ -57,6 +57,7 @@ from .models import (
     Transaction,
     TransactionPage,
     WebhookEndpoint,
+    request_id_of,
 )
 from .statuses import (
     CHARGE_STATUSES,
@@ -182,6 +183,7 @@ __all__ = [
     "is_paid",
     "is_terminal",
     "order_idempotency_key",
+    "request_id_of",
     "sign_request",
     "sign_webhook",
     "to_minor_units",
