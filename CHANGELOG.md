@@ -7,10 +7,13 @@
 - The client retries by default. Every GET, and every POST with an idempotency key, is retried
   up to twice on a network failure, a 5xx or `PAYMENT_PROCESSING_UNAVAILABLE`, with full-jitter
   backoff (0 to 0.5 s times 2^n, capped at 8 s). Pass `max_retries=0` to send every call once.
-  A 429, `CHARGE_OUTCOME_UNKNOWN` and `CHARGE_FAILED` are never retried.
+  A 429, `CHARGE_OUTCOME_UNKNOWN`, `CHARGE_FAILED` and `PAYMENT_METHOD_CHARGES_DISABLED` are
+  never retried.
   `create_webhook_endpoint` is never retried either: a replay answers without the secret.
-- `timeout` is per attempt. With retries one call can take up to `(max_retries + 1) * timeout`
-  plus the waits: just under 137 seconds with the defaults.
+- `timeout` is a socket timeout on the connect and on each read, not a cap on one attempt.
+  Each retry starts with the full value, so one call can take `(max_retries + 1) * timeout` plus
+  the waits (just under 137 seconds with the defaults), or longer when a server sends its answer
+  slowly.
 - A 5xx whose body is not JSON (for example an HTML 502 from a proxy) raises `TransportError`.
   It was an `ApiError`.
 - `TransportError.__init__` takes `(message, http_status=None, error_code=None, result=None, *,

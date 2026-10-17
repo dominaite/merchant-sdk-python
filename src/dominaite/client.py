@@ -240,7 +240,11 @@ class _RetryPolicy(NamedTuple):
 #: The 5xx codes of the charge route that are an answer about the charge, not the API
 #: being unavailable: retrying them cannot change the outcome, and a replay of the same
 #: key can lose the charge row that CHARGE_OUTCOME_UNKNOWN carries.
-_FINAL_5XX_CODES = frozenset({"CHARGE_OUTCOME_UNKNOWN", "CHARGE_FAILED"})
+#: PAYMENT_METHOD_CHARGES_DISABLED is a 503, but it clears only when stored-card charges
+#: are switched on for the merchant, which takes far longer than the retry waits.
+_FINAL_5XX_CODES = frozenset(
+    {"CHARGE_OUTCOME_UNKNOWN", "CHARGE_FAILED", "PAYMENT_METHOD_CHARGES_DISABLED"}
+)
 
 
 def _worth_retrying(reply: "_Reply") -> bool:
@@ -730,8 +734,12 @@ class DominaiteClient:
         :param base_url: Required. ``SANDBOX_BASE_URL`` or ``PRODUCTION_BASE_URL``, or your
             own value. Must be ``https://`` unless the host is localhost, 127.0.0.1 or ::1.
             A missing, empty or whitespace-only value raises ``ValueError``.
-        :param timeout: Socket timeout in seconds, per attempt. With retries one call
-            can take up to ``(max_retries + 1) * timeout`` plus the waits.
+        :param timeout: Socket timeout in seconds. It limits each blocking step of an
+            attempt (the connect, and each read of the answer), not the whole attempt: a
+            server that sends its answer slowly can hold one attempt longer. Each retry
+            starts with the full value again, so with retries one call can take
+            ``(max_retries + 1) * timeout`` plus the waits, or longer. For a hard limit on
+            one call, enforce it in your own code.
         :param user_agent: Your own identifier, appended to the SDK's User-Agent after one
             space (for example ``"shop/1.2"``). It helps support find your calls in the
             access logs. Blank means none; a control character raises ``ValueError``.
