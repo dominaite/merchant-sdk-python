@@ -109,6 +109,10 @@ _PAYMENT_METHOD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 #: decline, an unknown outcome, a refusal) and arrives as ChargeError / RevokeError.
 _GENERIC_FAILURE_STATUSES = frozenset({400, 401, 403, 404, 429})
 
+#: The charge route keeps a coded 404 as a ChargeError: PAYMENT_METHOD_NOT_FOUND and
+#: AGREEMENT_NOT_FOUND are answers about this charge, like the 409 and 422 codes.
+_CHARGE_GENERIC_FAILURE_STATUSES = frozenset({400, 401, 403, 429})
+
 #: A refund id is ``re_`` + 32 hex today, but held to the same single-path-segment rule as a
 #: payment method id rather than to its current shape.
 _REFUND_ID_RE = _PAYMENT_METHOD_ID_RE
@@ -825,6 +829,14 @@ class DominaiteClient:
         response = self._request("POST", SESSIONS_PATH, body, key)
 
         if response.get("success") is not True or "checkout" not in response:
+            if response.get("errorCode") in STOREFRONT_ERROR_CODES:
+                # A key first used on another storefront: the same error as the 400 form.
+                raise StorefrontError(
+                    200,
+                    str(response.get("errorMessage") or "The storefront refused the session."),
+                    error_code=str(response.get("errorCode")),
+                    result=dict(response),
+                )
             # A replay refusal names the transaction your key collided with. Carry it
             # (and the whole payload) so the caller can reconcile with get_status()
             # instead of minting a second payment for the same order.
@@ -1094,7 +1106,11 @@ class DominaiteClient:
         if charge is not None and (reply.envelope.get("success") is True or reply.status == 402):
             return charge
 
-        if error_code and reply.status >= 400 and reply.status not in _GENERIC_FAILURE_STATUSES:
+        if (
+            error_code
+            and reply.status >= 400
+            and reply.status not in _CHARGE_GENERIC_FAILURE_STATUSES
+        ):
             raise ChargeError(
                 reply.status,
                 str(error_code),
@@ -1823,6 +1839,14 @@ class DominaiteClient:
             # A 429 is a rate limit whatever its body: something in front of the API can
             # throttle too, with an HTML page or nothing at all. It gets the same error and
             # the same Retry-After reading as the API's own.
+            if status >= 500:
+                # A proxy or a load balancer in front of the API answers a 502 or a 504
+                # with an HTML page. It is the API being unreachable, not a rejection.
+                raise TransportError(
+                    "The Dominaite API is unavailable (HTTP {0}); "
+                    "retry with the same idempotency key.".format(status),
+                    http_status=status,
+                )
             if status != 429:
                 raise ApiError(status, "The API returned a non-JSON response")
             decoded = {}
@@ -1946,9 +1970,17 @@ def _retry_reason(error: BaseException) -> str:
 def _rejection(reply: _Reply) -> DominaiteError:
     """The generic reading of a failed reply: 5xx is the API being unavailable, 4xx a rejection."""
     if reply.status >= 500:
+        # Still a transport error (nothing to fix in the call, retry with the same key),
+        # but the code the API sent is kept.
+        code = reply.error.get("code") or reply.payload.get("errorCode")
         return TransportError(
-            "The Dominaite API is unavailable (HTTP {0}); "
-            "retry with the same idempotency key.".format(reply.status)
+            "The Dominaite API is unavailable (HTTP {0}{1}); "
+            "retry with the same idempotency key.".format(
+                reply.status, ", " + str(code) if code else ""
+            ),
+            http_status=reply.status,
+            error_code=str(code) if code else None,
+            result=dict(reply.envelope),
         )
     # Input validation (IDEMPOTENCY_KEY_REQUIRED and friends) answers 400 with the code
     # at error.code, not as a success=false refusal. Carry it through instead of

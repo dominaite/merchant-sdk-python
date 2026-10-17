@@ -422,14 +422,13 @@ def test_the_charge_error_examples_cover_every_code_the_sdk_claims():
     assert seen == set(REVOKE_ERROR_CODES)
 
 
-def test_a_charge_against_an_unknown_id_is_the_generic_api_error_404(client, answers_with):
+def test_a_charge_against_an_unknown_id_is_a_charge_error_404(client, answers_with):
     example = ENDPOINTS["chargePaymentMethod"]["notFoundExample"]
     answers_with(example["body"], example["httpStatus"])
 
-    with pytest.raises(ApiError) as raised:
+    with pytest.raises(ChargeError) as raised:
         _charge(client)
 
-    assert not isinstance(raised.value, ChargeError)
     assert raised.value.http_status == 404
     assert raised.value.error_code == example["code"]
 

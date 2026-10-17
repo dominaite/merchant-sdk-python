@@ -755,6 +755,46 @@ def test_503_raises_transport_not_refusal(client, urlopen):
         )
 
 
+@pytest.mark.parametrize(
+    "status, code",
+    [(503, "MERCHANT_API_UNAVAILABLE"), (500, "INTERNAL_ERROR")],
+)
+def test_a_coded_5xx_is_a_transport_error_that_keeps_its_code(client, urlopen, status, code):
+    body = {"success": False, "error": {"code": code, "message": "Unavailable", "statusCode": status}}
+    urlopen((status, body))
+
+    with pytest.raises(TransportError) as raised:
+        client.get_status(TRANSACTION_ID)
+
+    assert raised.value.http_status == status
+    assert raised.value.error_code == code
+    assert raised.value.result == body
+
+
+def test_a_coded_5xx_on_a_refund_keeps_its_code(client, urlopen):
+    urlopen((503, {"success": False, "error": {"code": "MERCHANT_API_UNAVAILABLE"}}))
+
+    with pytest.raises(TransportError) as raised:
+        client.list_refunds(TRANSACTION_ID)
+
+    assert raised.value.error_code == "MERCHANT_API_UNAVAILABLE"
+
+
+def test_an_html_502_from_a_proxy_is_a_transport_error(client, monkeypatch):
+    def proxy(request, timeout=None):
+        raise urllib.error.HTTPError(
+            request.full_url, 502, "Bad Gateway", _message({}), io.BytesIO(b"<html>502</html>")
+        )
+
+    _patch_opener(monkeypatch, proxy)
+
+    with pytest.raises(TransportError) as raised:
+        client.get_status(TRANSACTION_ID)
+
+    assert raised.value.http_status == 502
+    assert raised.value.error_code is None
+
+
 def test_network_failure_raises_transport(client, urlopen):
     urlopen(urllib.error.URLError("connection reset"))
 
@@ -1083,8 +1123,8 @@ def test_other_4xx_codes_stay_a_plain_api_error(client, urlopen):
     assert not isinstance(raised.value, StorefrontError)
 
 
-def test_a_storefront_mismatch_on_replay_is_a_refusal_carrying_the_code(client, urlopen):
-    """The replay path answers 200 with success false, not 400."""
+def test_a_storefront_mismatch_on_replay_is_a_storefront_error(client, urlopen):
+    """The replay path answers 200 with success false, not 400, and is the same error."""
     urlopen(
         (
             200,
@@ -1096,7 +1136,7 @@ def test_a_storefront_mismatch_on_replay_is_a_refusal_carrying_the_code(client, 
         )
     )
 
-    with pytest.raises(CheckoutRefusedError) as raised:
+    with pytest.raises(StorefrontError) as raised:
         client.create_checkout_session(
             amount=2500,
             currency="EUR",
@@ -1105,6 +1145,8 @@ def test_a_storefront_mismatch_on_replay_is_a_refusal_carrying_the_code(client, 
         )
 
     assert raised.value.error_code == ErrorCode.STOREFRONT_MISMATCH
+    assert raised.value.http_status == 200
+    assert not isinstance(raised.value, CheckoutRefusedError)
 
 
 def test_the_retry_helper_does_not_retry_a_storefront_refusal(client, urlopen):
@@ -2122,13 +2164,12 @@ def test_an_agreement_charge_refusal_is_a_charge_error_with_its_code(client, url
     assert caught.value.result == body
 
 
-def test_a_charge_under_an_unknown_agreement_is_an_api_error_404_with_its_code(client, urlopen):
+def test_a_charge_under_an_unknown_agreement_is_a_charge_error_404_with_its_code(client, urlopen):
     urlopen((404, _gateway_error(404, "AGREEMENT_NOT_FOUND", "Agreement not found.")))
 
-    with pytest.raises(ApiError) as caught:
+    with pytest.raises(ChargeError) as caught:
         _charge(client, agreement_id=AGREEMENT_ID)
 
-    assert not isinstance(caught.value, ChargeError)
     assert caught.value.http_status == 404
     assert caught.value.error_code == "AGREEMENT_NOT_FOUND"
 
@@ -2208,15 +2249,25 @@ def test_a_5xx_without_a_code_on_the_charge_route_is_still_a_transport_error(cli
         _charge(client)
 
 
-def test_a_charge_against_a_method_that_is_not_yours_is_an_api_error_404(client, urlopen):
+def test_a_charge_against_a_method_that_is_not_yours_is_a_charge_error_404(client, urlopen):
     urlopen((404, {"success": False, "error": {"code": "PAYMENT_METHOD_NOT_FOUND", "message": "No stored payment method with this id."}}))
+
+    with pytest.raises(ChargeError) as raised:
+        _charge(client)
+
+    assert raised.value.http_status == 404
+    assert raised.value.error_code == "PAYMENT_METHOD_NOT_FOUND"
+    assert raised.value.charge is None
+
+
+def test_a_charge_404_without_a_code_stays_the_generic_api_error(client, urlopen):
+    urlopen((404, {"success": False}))
 
     with pytest.raises(ApiError) as raised:
         _charge(client)
 
-    assert not isinstance(raised.value, ChargeError)
     assert raised.value.http_status == 404
-    assert raised.value.error_code == "PAYMENT_METHOD_NOT_FOUND"
+    assert raised.value.error_code is None
 
 
 def test_a_2xx_without_a_charge_body_is_an_api_error_not_a_half_built_charge(client, urlopen):
@@ -3658,7 +3709,7 @@ def test_the_retry_helper_warns_before_each_retry(urlopen):
 
     assert len(warned) == 2
     assert warned[0] == (
-        "dominaite-python: retrying create_checkout_session_with_retry after TransportError "
+        "dominaite-python: retrying create_checkout_session_with_retry after HTTP 503 "
         "(attempt 2 of 3)"
     )
     assert warned[1].endswith("(attempt 3 of 3)")

@@ -373,9 +373,8 @@ class StorefrontError(ApiError):
       than the request names.
 
     An idempotency key first used on another storefront is refused with
-    ``STOREFRONT_MISMATCH`` too, but in the HTTP 200 shape, so that one arrives as
-    :class:`CheckoutRefusedError`. Match on ``error_code`` rather than the exception
-    type if you want to handle both.
+    ``STOREFRONT_MISMATCH`` too, in the HTTP 200 refusal shape. It is a
+    :class:`StorefrontError` as well, with ``http_status`` 200.
 
     Subclasses :class:`ApiError`, so existing ``except ApiError`` handlers keep
     catching it, with ``http_status`` and ``error_code`` set.
@@ -487,6 +486,10 @@ class ChargeError(DominaiteError):
       stored-card charges on for your account, a retry does not help: ask Dominaite support.
       If they are on, retry later with the SAME idempotency key. The code is the same in
       both cases.
+    - ``PAYMENT_METHOD_NOT_FOUND`` or ``AGREEMENT_NOT_FOUND`` (404): the id is not yours
+      or does not exist. Nothing was charged.
+
+    :data:`CHARGE_ERROR_CODES` lists every code, the agreement checks included.
 
     ``result`` is the whole envelope the gateway sent, for fields not modelled above.
     """
@@ -607,4 +610,24 @@ class TransportError(DominaiteError):
 
     The request may or may not have reached the API. Safe to retry WITH THE SAME
     idempotency key; a retried key never creates a second payment.
+
+    On a 5xx the API answered, so ``http_status`` is set and ``error_code`` carries the
+    code it sent (``MERCHANT_API_UNAVAILABLE``, ``INTERNAL_ERROR``), None when it sent
+    none. ``result`` is the whole JSON body. All three are None or {} on a network
+    failure, where no answer arrived.
     """
+
+    def __init__(
+        self,
+        message: str,
+        http_status: Optional[int] = None,
+        error_code: Optional[str] = None,
+        result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message)
+        #: The 5xx status, or None when no answer arrived.
+        self.http_status = http_status
+        #: The code the API sent with the 5xx, or None.
+        self.error_code = error_code
+        #: The full JSON body the API sent, for fields not modelled above.
+        self.result = result if result is not None else {}
