@@ -10,6 +10,7 @@ import hmac
 import json
 import re
 import time
+from enum import Enum
 from typing import Any, Dict, Optional, Tuple, TypedDict, Union
 
 from .exceptions import WebhookVerificationError
@@ -21,6 +22,52 @@ WEBHOOK_SIGNATURE_HEADER = "X-Webhook-Signature"
 
 #: How far the delivery timestamp may sit from your clock before it is rejected.
 DEFAULT_WEBHOOK_TOLERANCE_SECONDS = 300
+
+
+class WebhookEventType(str, Enum):
+    """The event ``type`` values the platform delivers, as named constants.
+
+    Subclasses ``str``, so ``event["type"] == WebhookEventType.PAYMENT_SUCCEEDED`` works.
+    Use the values in ``events`` of :meth:`DominaiteClient.create_webhook_endpoint`. A
+    type that is not listed here is valid: ignore an event you do not handle.
+    """
+
+    PAYMENT_SUCCEEDED = "payment.succeeded"
+    PAYMENT_FAILED = "payment.failed"
+    PAYMENT_REQUIRES_CAPTURE = "payment.requires_capture"
+    PAYMENT_CANCELLED = "payment.cancelled"
+    PAYMENT_ABANDONED = "payment.abandoned"
+    PAYMENT_REFUNDED = "payment.refunded"
+    PAYMENT_DISPUTED = "payment.disputed"
+    AGREEMENT_ACTIVATED = "agreement.activated"
+    AGREEMENT_PAST_DUE = "agreement.past_due"
+    AGREEMENT_CANCELLED = "agreement.cancelled"
+    CHARGE_SUCCEEDED = "charge.succeeded"
+    CHARGE_FAILED = "charge.failed"
+    CHARGE_RETRYING = "charge.retrying"
+    VERIFICATION_SUCCEEDED = "verification.succeeded"
+    VERIFICATION_FAILED = "verification.failed"
+
+
+#: The ``payment.*`` events, in the order of the integration contract's event catalog.
+#: Their ``data`` is a :class:`PaymentEventData`.
+PAYMENT_WEBHOOK_EVENTS: Tuple[str, ...] = tuple(
+    member.value for member in WebhookEventType if member.value.startswith("payment.")
+)
+
+#: The ``agreement.*`` and ``charge.*`` events. Their ``data`` is an
+#: :class:`AgreementEventData` or a :class:`ChargeEventData`.
+RECURRING_WEBHOOK_EVENTS: Tuple[str, ...] = tuple(
+    member.value
+    for member in WebhookEventType
+    if member.value.startswith(("agreement.", "charge."))
+)
+
+#: The ``verification.*`` events of a verify-only session. Their ``data`` is a
+#: :class:`PaymentEventData` with ``verifyOnly`` True.
+VERIFICATION_WEBHOOK_EVENTS: Tuple[str, ...] = tuple(
+    member.value for member in WebhookEventType if member.value.startswith("verification.")
+)
 
 
 class _WebhookEventRequired(TypedDict):
@@ -137,7 +184,7 @@ class ChargeEventPaymentMethod(TypedDict):
 class _ChargeEventDataRequired(TypedDict):
     chargeId: str
     transactionId: str
-    storedPaymentMethodId: str
+    storedPaymentMethodId: Optional[str]
     agreementId: Optional[str]
     customerReference: Optional[str]
     outcome: str
