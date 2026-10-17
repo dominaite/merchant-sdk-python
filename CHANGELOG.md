@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.0
+
+### Breaking
+
+- The base URL is required. The client no longer falls back to production when you leave it
+  out, so an unset environment variable cannot send sandbox credentials to production.
+  Construction fails with `ValueError` when the base URL is missing, empty or whitespace. Pass
+  `SANDBOX_BASE_URL` (`https://api.staging.dominaite.com/payments`) or `PRODUCTION_BASE_URL`
+  (`https://api.dominaite.com/payments`), or your own value.
+- `DEFAULT_BASE_URL` is removed. Use `PRODUCTION_BASE_URL`.
+
 ## 0.5.2
 
 ### Added

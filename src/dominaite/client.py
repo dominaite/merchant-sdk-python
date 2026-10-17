@@ -35,7 +35,7 @@ from .models import (
     WebhookEndpoint,
 )
 
-__version__ = "0.5.2"
+__version__ = "0.6.0"
 
 # There is no default base URL: an unset setting must fail at construction, not send
 # sandbox credentials to production. Pass one of these, or your own value.
