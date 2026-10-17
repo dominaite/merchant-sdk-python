@@ -4041,6 +4041,28 @@ def test_the_default_policy_sends_three_times_then_raises(urlopen):
     assert raised.value.error_code == "MERCHANT_API_UNAVAILABLE"
 
 
+def test_every_attempt_gets_the_full_socket_timeout(monkeypatch):
+    # The timeout is a socket timeout handed to each attempt whole; a retry does not get
+    # what is left of a budget for the call.
+    timeouts = []
+    answers = [
+        (503, {"success": False, "error": {"code": "MERCHANT_API_UNAVAILABLE"}}),
+        (503, {"success": False, "error": {"code": "MERCHANT_API_UNAVAILABLE"}}),
+        _placed(),
+    ]
+    recorder = _Recorder(*answers)
+
+    def opener(request, timeout=None):
+        timeouts.append(timeout)
+        return recorder(request, timeout=timeout)
+
+    _patch_opener(monkeypatch, opener)
+    client, _ = _retrying_client(timeout=7.5)
+
+    assert _charge(client) == CHARGE_RESULT
+    assert timeouts == [7.5, 7.5, 7.5]
+
+
 def test_a_429_is_raised_without_a_retry_and_keeps_retry_after(urlopen):
     client, clock = _retrying_client()
     recorder = urlopen(

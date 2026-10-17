@@ -320,8 +320,12 @@ is sent at most three times. `max_retries=0` sends every call once:
 client = DominaiteClient(key_id, secret, base_url, max_retries=0)
 ```
 
-`timeout` (default 45 seconds) is per attempt, not per call. One call can take up to
-`(max_retries + 1) * timeout` plus the waits: with the defaults, just under 137 seconds.
+`timeout` (default 45 seconds) is a socket timeout. It limits each step of an attempt: the
+connect, and each wait for more of the answer. It is not a cap on the attempt or on the call: a
+server that sends its answer slowly can hold one attempt longer than `timeout`. Each retry starts
+with the full `timeout` again, so one call can take `(max_retries + 1) * timeout` plus the waits
+(just under 137 seconds with the defaults), or longer. For a hard limit on one call, enforce it in
+your own code.
 
 Each retry goes to `on_warning` (see [Logging and warnings](#logging-and-warnings)), for example
 `dominaite-python: retrying POST /merchant-api/checkout/sessions after HTTP 503 (attempt 2 of 3)`.
