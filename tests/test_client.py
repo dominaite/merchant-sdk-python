@@ -42,6 +42,7 @@ from dominaite import (
     CheckoutIntegration,
     CheckoutRefusedError,
     DominaiteClient,
+    DominaiteError,
     ErrorCode,
     PaymentStatus,
     RateLimitError,
@@ -143,7 +144,8 @@ class _Recorder:
 
 @pytest.fixture
 def client():
-    return DominaiteClient(KEY_ID, SECRET, base_url=BASE_URL)
+    # The default retry policy stays on; only the wait is skipped.
+    return DominaiteClient(KEY_ID, SECRET, base_url=BASE_URL, sleep=lambda seconds: None)
 
 
 @pytest.fixture
@@ -3752,12 +3754,16 @@ def test_the_retry_helper_warns_before_each_retry(urlopen):
         idempotency_key=IDEMPOTENCY_KEY,
     )
 
-    assert len(warned) == 2
-    assert warned[0] == (
-        "dominaite-python: retrying create_checkout_session_with_retry after HTTP 503 "
+    assert len(warned) == 3
+    assert "create_checkout_session_with_retry is deprecated" in warned[0]
+    assert warned[1] == (
+        "dominaite-python: retrying POST /merchant-api/checkout/sessions after HTTP 503 "
         "(attempt 2 of 3)"
     )
-    assert warned[1].endswith("(attempt 3 of 3)")
+    assert warned[2] == (
+        "dominaite-python: retrying POST /merchant-api/checkout/sessions after "
+        "PAYMENT_PROCESSING_UNAVAILABLE (attempt 3 of 3)"
+    )
 
 
 def test_debug_is_off_by_default(urlopen):
@@ -3794,7 +3800,7 @@ def test_debug_writes_one_line_per_request(urlopen):
 
 def test_debug_marks_a_transport_failure_and_leaves_out_the_query(urlopen):
     lines = []
-    client = DominaiteClient(KEY_ID, SECRET, BASE_URL, on_debug=lines.append)
+    client = DominaiteClient(KEY_ID, SECRET, BASE_URL, on_debug=lines.append, max_retries=0)
     urlopen(urllib.error.URLError("refused"))
 
     with pytest.raises(TransportError):
@@ -3953,3 +3959,214 @@ def test_the_debug_line_names_the_body_request_id_when_there_is_no_header(urlope
     client.ping()
 
     assert lines and lines[-1].endswith("request_id=" + BODY_REQUEST_ID)
+
+
+# --- the client retry policy ----------------------------------------------------
+
+
+class _Clock:
+    """Records every wait the client asks for, without waiting."""
+
+    def __init__(self):
+        self.waits = []
+
+    def __call__(self, seconds):
+        self.waits.append(seconds)
+
+
+def _retrying_client(max_retries=2, rng=lambda: 0.5, **kwargs):
+    clock = _Clock()
+    client = DominaiteClient(
+        KEY_ID, SECRET, BASE_URL, max_retries=max_retries, sleep=clock, random=rng, **kwargs
+    )
+    return client, clock
+
+
+def _signature_inputs(request):
+    """What the signature covers apart from the timestamp: method, path, key and body."""
+    headers = _headers(request)
+    body = request.data.decode("utf-8") if request.data is not None else ""
+    path = urllib.parse.urlsplit(request.full_url).path[len(urllib.parse.urlsplit(BASE_URL).path):]
+    assert headers["x-signature"] == sign_request(
+        SECRET, headers["x-timestamp"], request.get_method(), path, headers.get("idempotency-key", ""), body
+    )
+    return (request.get_method(), path, headers.get("idempotency-key"), body)
+
+
+def test_a_transport_failure_then_success_on_a_charge_reuses_the_key_and_the_signed_body(urlopen):
+    client, _ = _retrying_client()
+    recorder = urlopen(urllib.error.URLError("connection reset"), _placed())
+
+    charge = _charge(client)
+
+    assert charge == CHARGE_RESULT
+    assert len(recorder.requests) == 2
+    first, second = (_signature_inputs(request) for request in recorder.requests)
+    assert first == second == ("POST", CHARGE_PATH, CHARGE_IDEMPOTENCY_KEY, CHARGE_BODY)
+
+
+def test_a_transport_failure_then_success_on_a_refund_reuses_the_key_and_the_signed_body(urlopen):
+    client, _ = _retrying_client()
+    recorder = urlopen(urllib.error.URLError("timed out"), _accepted())
+
+    client.create_refund(TRANSACTION_ID, amount=1500, idempotency_key=REFUND_KEY)
+
+    assert len(recorder.requests) == 2
+    first, second = (_signature_inputs(request) for request in recorder.requests)
+    path = PAYMENTS_PATH + "/" + TRANSACTION_ID + "/refunds"
+    assert first == second == ("POST", path, REFUND_KEY, '{"amount":1500}')
+
+
+def test_max_retries_0_sends_once(urlopen):
+    client, clock = _retrying_client(max_retries=0)
+    recorder = urlopen(urllib.error.URLError("down"))
+
+    with pytest.raises(TransportError):
+        _charge(client)
+
+    assert len(recorder.requests) == 1
+    assert clock.waits == []
+
+
+def test_the_default_policy_sends_three_times_then_raises(urlopen):
+    clock = _Clock()
+    client = DominaiteClient(KEY_ID, SECRET, BASE_URL, sleep=clock)
+    recorder = urlopen((503, {"success": False, "error": {"code": "MERCHANT_API_UNAVAILABLE"}}))
+
+    with pytest.raises(TransportError) as raised:
+        client.get_status(TRANSACTION_ID)
+
+    assert len(recorder.requests) == 3
+    assert len(clock.waits) == 2
+    assert raised.value.error_code == "MERCHANT_API_UNAVAILABLE"
+
+
+def test_a_429_is_raised_without_a_retry_and_keeps_retry_after(urlopen):
+    client, clock = _retrying_client()
+    recorder = urlopen(
+        (429, {"success": False, "error": {"code": "RATE_LIMIT_EXCEEDED"}}, {"Retry-After": "17"})
+    )
+
+    with pytest.raises(RateLimitError) as raised:
+        _charge(client)
+
+    assert len(recorder.requests) == 1
+    assert clock.waits == []
+    assert raised.value.retry_after_seconds == 17
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        (400, {"success": False, "error": {"code": "VALIDATION_ERROR"}}),
+        (401, {"success": False, "error": {"code": "INVALID_SIGNATURE"}}),
+        (409, {"success": False, "error": {"code": "CHARGE_IN_PROGRESS"}}),
+        (502, {"success": False, "data": CHARGE, "error": {"code": "CHARGE_OUTCOME_UNKNOWN"}}),
+        (502, {"success": False, "error": {"code": "CHARGE_FAILED"}}),
+    ],
+    ids=["400", "401", "409", "502-outcome-unknown", "502-charge-failed"],
+)
+def test_an_answer_about_the_call_is_not_retried(urlopen, answer):
+    client, _ = _retrying_client()
+    recorder = urlopen(answer)
+
+    with pytest.raises(DominaiteError):
+        _charge(client)
+
+    assert len(recorder.requests) == 1
+
+
+def test_payment_processing_unavailable_on_a_charge_is_retried_with_the_same_key(urlopen):
+    client, _ = _retrying_client()
+    unavailable = (503, {"success": False, "error": {"code": "PAYMENT_PROCESSING_UNAVAILABLE"}})
+    recorder = urlopen(unavailable, _placed())
+
+    assert _charge(client) == CHARGE_RESULT
+    assert [_headers(r)["idempotency-key"] for r in recorder.requests] == [CHARGE_IDEMPOTENCY_KEY] * 2
+
+
+def test_a_payment_processing_refusal_on_create_is_retried(urlopen):
+    client, _ = _retrying_client()
+    refusal = (200, {"success": False, "errorCode": "PAYMENT_PROCESSING_UNAVAILABLE"})
+    recorder = urlopen(refusal, _ok())
+
+    session = client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference="order-1042", idempotency_key=IDEMPOTENCY_KEY
+    )
+
+    assert session == CHECKOUT
+    assert len(recorder.requests) == 2
+
+
+def test_a_patch_and_a_delete_are_never_retried(urlopen):
+    client, _ = _retrying_client()
+    recorder = urlopen(urllib.error.URLError("down"))
+
+    with pytest.raises(TransportError):
+        client.update_plan("plan_0123456789abcdef0123456789abcdef", name="Gold")
+    with pytest.raises(TransportError):
+        client.revoke_payment_method(PAYMENT_METHOD_ID)
+
+    assert len(recorder.requests) == 2
+
+
+@pytest.mark.parametrize("rng_value", [0.001, 0.25, 0.999999])
+def test_each_wait_stays_inside_its_full_jitter_bound(urlopen, rng_value):
+    client, clock = _retrying_client(max_retries=6, rng=lambda: rng_value)
+    urlopen(urllib.error.URLError("down"))
+
+    with pytest.raises(TransportError):
+        client.ping()
+
+    bounds = [0.5, 1.0, 2.0, 4.0, 8.0, 8.0]
+    assert len(clock.waits) == len(bounds)
+    for wait, bound in zip(clock.waits, bounds):
+        assert 0 <= wait < bound
+        assert wait == pytest.approx(rng_value * bound)
+
+
+def test_a_zero_draw_retries_at_once_without_a_wait(urlopen):
+    client, clock = _retrying_client(max_retries=2, rng=lambda: 0.0)
+    recorder = urlopen(urllib.error.URLError("down"))
+
+    with pytest.raises(TransportError):
+        client.ping()
+
+    assert len(recorder.requests) == 3
+    assert clock.waits == []
+
+
+def test_the_wait_is_capped_at_eight_seconds(urlopen):
+    client, clock = _retrying_client(max_retries=8, rng=lambda: 1.0)
+    urlopen(urllib.error.URLError("down"))
+
+    with pytest.raises(TransportError):
+        client.ping()
+
+    assert max(clock.waits) == 8.0
+    assert clock.waits[:4] == [0.5, 1.0, 2.0, 4.0]
+
+
+@pytest.mark.parametrize("value", [-1, True, 1.5, "2"])
+def test_max_retries_must_be_a_whole_number_of_at_least_0(value):
+    with pytest.raises(ValueError, match="max_retries"):
+        DominaiteClient(KEY_ID, SECRET, BASE_URL, max_retries=value)
+
+
+def test_the_deprecated_helper_uses_its_own_attempts_not_the_client_policy(urlopen):
+    client, clock = _retrying_client(max_retries=0)
+    recorder = urlopen((503, {}), (503, {}), _ok())
+
+    with pytest.warns(DeprecationWarning):
+        session = client.create_checkout_session_with_retry(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
+            max_attempts=3,
+            backoff_seconds=0.5,
+        )
+
+    assert session == CHECKOUT
+    assert len(recorder.requests) == 3
+    assert clock.waits == [0.25, 0.5]

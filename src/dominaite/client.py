@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import platform
+import random as _random
 import re
 import sys
 import threading
@@ -23,6 +24,7 @@ from typing import (
     Optional,
     Sequence,
     Set,
+    Tuple,
     Type,
     Union,
     cast,
@@ -70,6 +72,13 @@ AGREEMENTS_PATH = "/merchant-api/agreements"
 WEBHOOKS_PATH = "/merchant-api/webhooks"
 TRANSACTIONS_PATH = "/merchant-api/transactions"
 DEFAULT_TIMEOUT_SECONDS = 45.0  # serverless cold starts hit 10+s on dev; 15s was a coin flip
+
+#: Retries after the first attempt, unless the client is built with another ``max_retries``.
+DEFAULT_MAX_RETRIES = 2
+
+#: Full jitter: retry ``n`` (0 for the first) waits ``random(0, min(cap, base * 2**n))``.
+RETRY_BASE_DELAY_SECONDS = 0.5
+RETRY_MAX_DELAY_SECONDS = 8.0
 
 #: Hosts allowed to be addressed over plain http. Everything else must be https, so the
 #: signed headers cannot be read off the wire.
@@ -212,6 +221,33 @@ class _Reply(NamedTuple):
     error: Dict[str, Any]
     #: The ``Dominaite-Request-Id`` header, else ``envelope["metadata"]["requestId"]``.
     request_id: Optional[str] = None
+
+
+class _RetryPolicy(NamedTuple):
+    """How many times to retry, and the bounds of the jittered wait before each retry."""
+
+    max_retries: int
+    base_delay: float = RETRY_BASE_DELAY_SECONDS
+    max_delay: float = RETRY_MAX_DELAY_SECONDS
+
+    def delay(self, retry: int, rng: Callable[[], float]) -> float:
+        """Full jitter: a random wait in ``[0, min(max_delay, base_delay * 2**retry))``."""
+        bound = min(self.max_delay, self.base_delay * (2 ** retry))
+        return max(0.0, rng() * bound)
+
+
+#: The 5xx codes of the charge route that are an answer about the charge, not the API
+#: being unavailable: retrying them cannot change the outcome, and a replay of the same
+#: key can lose the charge row that CHARGE_OUTCOME_UNKNOWN carries.
+_FINAL_5XX_CODES = frozenset({"CHARGE_OUTCOME_UNKNOWN", "CHARGE_FAILED"})
+
+
+def _worth_retrying(reply: "_Reply") -> bool:
+    """A reply the retry policy sends again: a 5xx, or PAYMENT_PROCESSING_UNAVAILABLE."""
+    code = reply.error.get("code") or reply.payload.get("errorCode")
+    if code == ErrorCode.PAYMENT_PROCESSING_UNAVAILABLE.value:
+        return True
+    return reply.status >= 500 and code not in _FINAL_5XX_CODES
 
 
 class _Secret:
@@ -565,6 +601,64 @@ def _normalize_payment_method_id(payment_method_id: Any) -> str:
     return normalized
 
 
+def _checkout_request(
+    amount: int,
+    currency: str,
+    order_reference: str,
+    customer: Optional[Mapping[str, Any]] = None,
+    country: Optional[str] = None,
+    language: Optional[str] = None,
+    theme: Optional[str] = None,
+    description: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    save_card: Optional[bool] = None,
+    integration: Optional[str] = None,
+    verify_only: Optional[bool] = None,
+    agreement_id: Optional[str] = None,
+    consent: Optional[Mapping[str, Any]] = None,
+    location_id: Optional[Any] = None,
+    extra: Optional[Mapping[str, Any]] = None,
+) -> Tuple[Dict[str, Any], str]:
+    """Check the arguments of a checkout session and build its body and key."""
+    _validate_money_params(
+        amount, currency, order_reference, allow_zero=verify_only is True
+    )
+    key = _normalize_idempotency_key(idempotency_key)
+
+    body: Dict[str, Any] = {
+        "amount": amount,
+        "currency": currency,
+        "orderReference": order_reference,
+    }
+    if customer is not None:
+        body["customer"] = dict(customer)
+    if country is not None:
+        body["country"] = country
+    if language is not None:
+        body["language"] = language
+    if theme is not None:
+        body["theme"] = theme
+    if description is not None:
+        body["description"] = description
+    if save_card is not None:
+        body["saveCard"] = bool(save_card)
+    if integration is not None:
+        # A CheckoutIntegration member goes out as its plain value.
+        body["integration"] = str(getattr(integration, "value", integration))
+    if verify_only is not None:
+        body["verifyOnly"] = bool(verify_only)
+    if agreement_id is not None:
+        body["agreementId"] = str(agreement_id)
+    if consent is not None:
+        body["consent"] = dict(consent)
+    if location_id is not None:
+        # A uuid.UUID goes out in its canonical string form.
+        body["locationId"] = str(location_id)
+    if extra is not None:
+        body.update(extra)
+    return body, key
+
+
 def sign_request(
     secret: str,
     timestamp: str,
@@ -625,6 +719,9 @@ class DominaiteClient:
         user_agent: Optional[str] = None,
         on_warning: Optional[Callable[[str], None]] = None,
         on_debug: Optional[Callable[[str], None]] = None,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        sleep: Optional[Callable[[float], None]] = None,
+        random: Optional[Callable[[], float]] = None,
     ) -> None:
         """
         :param key_id: Your API key id (``dmk_...``), from the Dominaite dashboard.
@@ -637,13 +734,23 @@ class DominaiteClient:
             space (for example ``"shop/1.2"``). It helps support find your calls in the
             access logs. Blank means none; a control character raises ``ValueError``.
         :param on_warning: Called with each warning message: a ``Dominaite-Sdk-Notice``
-            from the API (once per distinct value), a retry in
-            :meth:`create_checkout_session_with_retry`, and a ping clock skew over 60
-            seconds. Without it the SDK calls ``warnings.warn``: ``DeprecationWarning`` for
-            the notice, ``UserWarning`` for the others.
+            from the API (once per distinct value), each retry, a call to a deprecated
+            method, and a ping clock skew over 60 seconds. Without it the SDK calls
+            ``warnings.warn``: ``DeprecationWarning`` for the notice and the deprecated
+            method, ``UserWarning`` for the others.
         :param on_debug: Called with one line per request: method, path, status, time in
             ms, the ``Dominaite-Request-Id`` and the idempotency key. Off when not set.
             Pass ``logging.getLogger("dominaite").debug`` to send it to logging.
+        :param max_retries: How many times a call is sent again after a transport error, a
+            5xx or ``PAYMENT_PROCESSING_UNAVAILABLE``, with the same idempotency key and the
+            same body. Default 2. 0 sends every call once. Applies to every GET and to every
+            POST that carries an idempotency key; never to a 429, a 4xx, a PATCH or a
+            DELETE. The wait before retry ``n`` (0 for the first) is random between 0 and
+            ``min(8, 0.5 * 2**n)`` seconds.
+        :param sleep: Called with the wait in seconds before each retry. Default
+            ``time.sleep``. Pass your own to test without waiting.
+        :param random: Returns a float in ``[0, 1)`` that scales each wait. Default
+            ``random.random``.
 
         A warning or debug line never carries the secret, the signature, a cashier token,
         a query string or a request or response body. An exception from either callable
@@ -653,6 +760,8 @@ class DominaiteClient:
             raise ValueError("key_id must start with dmk_")
         if not secret.startswith("dms_"):
             raise ValueError("secret must start with dms_")
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
+            raise ValueError("max_retries must be an integer of at least 0")
         base_url = _require_base_url(base_url)
         _require_secure_base_url(base_url)
         self._key_id = key_id
@@ -662,6 +771,9 @@ class DominaiteClient:
         self._user_agent = _user_agent(user_agent)
         self._on_warning = on_warning
         self._on_debug = on_debug
+        self._retry = _RetryPolicy(max_retries)
+        self._sleep: Callable[[float], None] = sleep if sleep is not None else time.sleep
+        self._random: Callable[[], float] = random if random is not None else _random.random
         self._notices_seen: Set[str] = set()
         self._notices_lock = threading.Lock()
         # Own opener rather than urlopen(): the default one follows redirects, and the
@@ -825,44 +937,31 @@ class DominaiteClient:
         :raises TransportError: Network-level failure (safe to retry WITH the same
             ``idempotency_key``).
         """
-        _validate_money_params(
-            amount, currency, order_reference, allow_zero=verify_only is True
+        body, key = _checkout_request(
+            amount,
+            currency,
+            order_reference,
+            customer=customer,
+            country=country,
+            language=language,
+            theme=theme,
+            description=description,
+            idempotency_key=idempotency_key,
+            save_card=save_card,
+            integration=integration,
+            verify_only=verify_only,
+            agreement_id=agreement_id,
+            consent=consent,
+            location_id=location_id,
+            extra=extra,
         )
-        key = _normalize_idempotency_key(idempotency_key)
+        return self._open_checkout_session(body, key, None)
 
-        body: Dict[str, Any] = {
-            "amount": amount,
-            "currency": currency,
-            "orderReference": order_reference,
-        }
-        if customer is not None:
-            body["customer"] = dict(customer)
-        if country is not None:
-            body["country"] = country
-        if language is not None:
-            body["language"] = language
-        if theme is not None:
-            body["theme"] = theme
-        if description is not None:
-            body["description"] = description
-        if save_card is not None:
-            body["saveCard"] = bool(save_card)
-        if integration is not None:
-            # A CheckoutIntegration member goes out as its plain value.
-            body["integration"] = str(getattr(integration, "value", integration))
-        if verify_only is not None:
-            body["verifyOnly"] = bool(verify_only)
-        if agreement_id is not None:
-            body["agreementId"] = str(agreement_id)
-        if consent is not None:
-            body["consent"] = dict(consent)
-        if location_id is not None:
-            # A uuid.UUID goes out in its canonical string form.
-            body["locationId"] = str(location_id)
-        if extra is not None:
-            body.update(extra)
-
-        reply = _checked(self._send("POST", SESSIONS_PATH, body, key))
+    def _open_checkout_session(
+        self, body: Dict[str, Any], key: str, retry: Optional[_RetryPolicy]
+    ) -> Dict[str, Any]:
+        """Send a built checkout body and read the session or the refusal out of the answer."""
+        reply = _checked(self._send("POST", SESSIONS_PATH, body, key, retry=retry))
         response = reply.payload
 
         if response.get("success") is not True or "checkout" not in response:
@@ -892,73 +991,40 @@ class DominaiteClient:
     def create_checkout_session_with_retry(
         self,
         max_attempts: int = 3,
-        backoff_seconds: float = 0.5,
+        backoff_seconds: float = RETRY_BASE_DELAY_SECONDS,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Create a session, retrying transient failures with the SAME idempotency key.
+        """Deprecated: :meth:`create_checkout_session` now retries on its own.
 
-        Two things are retried. A ``TransportError`` (network blip, 5xx, including a 503
-        carrying ``MERCHANT_API_UNAVAILABLE`` or ``PAYMENT_PROCESSING_UNAVAILABLE``) leaves
-        you not knowing whether the request landed. A ``PAYMENT_PROCESSING_UNAVAILABLE``
-        refusal means card payments are briefly off and nothing was charged; the API
-        contract marks it retryable with the same key. Reusing the key is what makes the retry
-        safe: if the first attempt did land, the server answers the retry from that
-        attempt instead of opening a second session. Generating a fresh key here would be
-        the double-charge bug this method exists to prevent.
+        Kept so existing code runs unchanged. It is :meth:`create_checkout_session` with the
+        retry count and the base wait of this one call: ``max_attempts - 1`` retries, and a
+        wait before retry ``n`` (0 for the first) that is random between 0 and
+        ``min(8, backoff_seconds * 2**n)`` seconds. ``backoff_seconds=0`` retries at once.
+        Every attempt sends the SAME idempotency key and the same body. The client's
+        ``max_retries`` does not apply here.
 
-        While the first session is still open, the retry returns that same session.
-        Otherwise it arrives as a :class:`CheckoutRefusedError` with a replay code
-        (``DUPLICATE_REQUEST``, ``ALREADY_PROCESSED``, ``PRIOR_ATTEMPT_FAILED``,
-        ``IDEMPOTENCY_KEY_REUSED``) and no cashier fields. When the refusal names a
-        ``transaction_id``, read it with :meth:`get_status` to find out what the earlier
-        attempt did.
-
-        Every other refusal, storefront errors and authentication failures are raised
-        immediately - retrying them just
-        burns time. So is a :class:`RateLimitError`: the API has just told us it is
-        already seeing too much from this key, and answering that with more traffic on a
-        half-second backoff is how a spike becomes a lockout. Catch it and wait out
-        ``retry_after_seconds`` yourself.
+        What is retried and what is not is the client's rule: a transport error, a 5xx and
+        ``PAYMENT_PROCESSING_UNAVAILABLE`` are retried; a refusal, a storefront error, an
+        authentication failure and a :class:`RateLimitError` are raised at once.
 
         :param max_attempts: Total attempts including the first one.
-        :param backoff_seconds: Base delay; doubles after each failed attempt.
+        :param backoff_seconds: Base of the jittered wait.
         :param kwargs: Passed straight to :meth:`create_checkout_session`, including the
             required ``idempotency_key``, which every attempt reuses.
         """
+        self._warn(
+            "dominaite-python: create_checkout_session_with_retry is deprecated; "
+            "create_checkout_session retries on its own (see max_retries).",
+            DeprecationWarning,
+        )
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
         # Checked up front so a missing key fails before the first attempt, never after
         # a retry has already been spent.
-        kwargs["idempotency_key"] = _normalize_idempotency_key(kwargs.get("idempotency_key"))
-
-        delay = backoff_seconds
-        for attempt in range(1, max_attempts + 1):
-            failure: DominaiteError
-            try:
-                return self.create_checkout_session(**kwargs)
-            except TransportError as error:
-                if attempt == max_attempts:
-                    raise
-                failure = error
-            except CheckoutRefusedError as refusal:
-                # The one refusal that is transient: processing is off for a moment,
-                # nothing was charged, and the gateway asks for the same key again.
-                if (
-                    refusal.error_code != ErrorCode.PAYMENT_PROCESSING_UNAVAILABLE
-                    or attempt == max_attempts
-                ):
-                    raise
-                failure = refusal
-            self._warn(
-                "dominaite-python: retrying create_checkout_session_with_retry after {0} "
-                "(attempt {1} of {2})".format(_retry_reason(failure), attempt + 1, max_attempts),
-                UserWarning,
-            )
-            if delay > 0:
-                time.sleep(delay)
-            delay *= 2
-
-        raise AssertionError("unreachable")
+        body, key = _checkout_request(**kwargs)
+        return self._open_checkout_session(
+            body, key, _RetryPolicy(max_attempts - 1, base_delay=backoff_seconds)
+        )
 
     def get_status(self, transaction_id: str) -> Dict[str, Any]:
         """Read the payment status of one of your checkout sessions.
@@ -1806,6 +1872,59 @@ class DominaiteClient:
         idempotency_key: str,
         signed: bool = True,
         query: Optional[Mapping[str, str]] = None,
+        retry: Optional[_RetryPolicy] = None,
+    ) -> _Reply:
+        """Send one call, with the retry policy when the call may be repeated.
+
+        A GET, and a POST with an idempotency key, may be repeated: the key makes the
+        server answer a repeat from the first attempt. A transport error, a 5xx and
+        ``PAYMENT_PROCESSING_UNAVAILABLE`` are retried. Every other answer, and every error
+        ``_send_once`` raises for it (401, 403, 429, a redirect), comes back at once.
+
+        The body is serialized once. Every attempt sends the same bytes under the same key;
+        only the timestamp and the signature over it are new.
+        """
+        if body is None:
+            payload: Optional[str] = None
+        else:
+            # Compact separators and no ASCII escaping: the bytes we hash must be the
+            # exact bytes we send, so the JSON is serialized once and reused.
+            payload = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+
+        policy = retry if retry is not None else self._retry
+        repeatable = method == "GET" or (method == "POST" and bool(idempotency_key))
+        attempts = policy.max_retries + 1 if repeatable else 1
+        for attempt in range(attempts):
+            failure: Union[TransportError, _Reply]
+            try:
+                reply = self._send_once(method, path, payload, idempotency_key, signed, query)
+            except TransportError as error:
+                if attempt + 1 >= attempts:
+                    raise
+                failure = error
+            else:
+                if attempt + 1 >= attempts or not _worth_retrying(reply):
+                    return reply
+                failure = reply
+            wait = policy.delay(attempt, self._random)
+            self._warn(
+                "dominaite-python: retrying {0} {1} after {2} (attempt {3} of {4})".format(
+                    method, path, _retry_reason(failure), attempt + 2, attempts
+                ),
+                UserWarning,
+            )
+            if wait > 0:
+                self._sleep(wait)
+        raise AssertionError("unreachable")
+
+    def _send_once(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[str],
+        idempotency_key: str,
+        signed: bool = True,
+        query: Optional[Mapping[str, str]] = None,
     ) -> _Reply:
         """Sign, send and parse one request.
 
@@ -1819,13 +1938,6 @@ class DominaiteClient:
         every route. Any other status comes back parsed, so a route can read the code
         and the data the gateway attached before deciding what it is.
         """
-        if body is None:
-            payload = ""
-        else:
-            # Compact separators and no ASCII escaping: the bytes we hash must be the
-            # exact bytes we send, so the JSON is serialized once and reused.
-            payload = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-
         headers = {
             "Content-Type": "application/json",
             # Some edges block requests without a real User-Agent - always send one.
@@ -1836,12 +1948,12 @@ class DominaiteClient:
             headers["X-Api-Key-Id"] = self._key_id
             headers["X-Timestamp"] = timestamp
             headers["X-Signature"] = sign_request(
-                self._secret.reveal(), timestamp, method, path, idempotency_key, payload
+                self._secret.reveal(), timestamp, method, path, idempotency_key, payload or ""
             )
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
 
-        data = payload.encode("utf-8") if body is not None else None
+        data = payload.encode("utf-8") if payload is not None else None
         url = self._base_url + path
         if query:
             # urlencode percent-encodes "+", so an offset such as +02:00 does not arrive as
@@ -2010,15 +2122,18 @@ class DominaiteClient:
             pass
 
 
-def _retry_reason(error: BaseException) -> str:
+def _retry_reason(failure: Any) -> str:
     """What a retry warning names: the error code, else the HTTP status, else the class."""
-    code = getattr(error, "error_code", None)
+    if isinstance(failure, _Reply):
+        code = failure.error.get("code") or failure.payload.get("errorCode")
+        return str(code) if code else "HTTP {0}".format(failure.status)
+    code = getattr(failure, "error_code", None)
     if code:
         return str(getattr(code, "value", code))
-    status = getattr(error, "http_status", None)
+    status = getattr(failure, "http_status", None)
     if status:
         return "HTTP {0}".format(status)
-    return type(error).__name__
+    return type(failure).__name__
 
 
 def _rejection(reply: _Reply) -> DominaiteError:

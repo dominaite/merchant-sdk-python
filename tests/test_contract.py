@@ -84,7 +84,8 @@ class _Response:
 
 @pytest.fixture
 def client():
-    return DominaiteClient(KEY_ID, SECRET, base_url=BASE_URL)
+    # The default retry policy stays on; only the wait is skipped.
+    return DominaiteClient(KEY_ID, SECRET, base_url=BASE_URL, sleep=lambda seconds: None)
 
 
 def _patch_opener(monkeypatch, handler):
