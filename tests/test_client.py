@@ -2455,6 +2455,27 @@ def test_a_charge_signs_the_lowercase_payment_method_id_path(client, urlopen):
     )
 
 
+@pytest.mark.parametrize("currency", ["eur", "Eur", "EURO", "E1R", 978])
+def test_a_currency_that_is_not_three_upper_case_letters_is_refused_before_sending(
+    client, urlopen, currency
+):
+    recorder = urlopen(_ok())
+
+    with pytest.raises(ValueError, match="currency"):
+        client.create_checkout_session(
+            amount=2500,
+            currency=currency,
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
+        )
+    with pytest.raises(ValueError, match="currency"):
+        _charge(client, currency=currency)
+    with pytest.raises(ValueError, match="currency"):
+        client.create_plan("Gold", 2500, currency, "month", idempotency_key="plan-gold")
+
+    assert recorder.requests == []
+
+
 @pytest.mark.parametrize("key", [None, ""])
 def test_create_refund_refuses_to_send_without_a_key(client, urlopen, key):
     recorder = urlopen(_accepted())

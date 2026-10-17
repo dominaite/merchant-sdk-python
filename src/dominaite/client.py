@@ -121,6 +121,9 @@ _REFUND_ID_RE = _PAYMENT_METHOD_ID_RE
 #: case-sensitive, so they are never case-changed; the same single-segment rule applies.
 _RECURRING_ID_RE = _PAYMENT_METHOD_ID_RE
 
+#: An ISO 4217 code as the API accepts it: three upper-case letters.
+_CURRENCY_RE = re.compile(r"[A-Z]{3}")
+
 #: CR, LF and the other control characters. A User-Agent suffix carrying one could split
 #: the header, so the constructor refuses it.
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -373,8 +376,7 @@ def _validate_money_params(
             if allow_zero
             else "amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)"
         )
-    if not currency:
-        raise ValueError("currency is required")
+    _validate_currency(currency)
     if not order_reference:
         raise ValueError("order_reference is required")
     # Characters, not bytes. len() on a str counts Unicode code points, which is what
@@ -393,6 +395,14 @@ def _validate_money_params(
                 MAX_ORDER_REFERENCE_LENGTH
             )
         )
+
+
+def _validate_currency(currency: Any) -> None:
+    """The API refuses anything but three upper-case letters with a 400."""
+    if not currency:
+        raise ValueError("currency is required")
+    if not isinstance(currency, str) or not _CURRENCY_RE.fullmatch(currency):
+        raise ValueError("currency must be a three-letter ISO 4217 code in upper case, e.g. EUR")
 
 
 def _normalize_idempotency_key(idempotency_key: Optional[str]) -> str:
@@ -1335,8 +1345,7 @@ class DominaiteClient:
         if not name:
             raise ValueError("name is required")
         _validate_whole_number(amount, "amount", 1)
-        if not currency:
-            raise ValueError("currency is required")
+        _validate_currency(currency)
         if not interval_unit:
             raise ValueError("interval_unit is required")
         for value, field in ((interval_count, "interval_count"), (period_count, "period_count")):
