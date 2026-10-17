@@ -569,6 +569,10 @@ def test_payment_event_types_are_the_contract_event_catalog_in_order():
     assert list(PAYMENT_WEBHOOK_EVENTS) == WIRE["webhookEventCatalog"]
 
 
+def test_recurring_event_types_are_the_contract_recurring_events_in_order():
+    assert list(RECURRING_WEBHOOK_EVENTS) == WIRE["recurringWebhookEvents"]
+
+
 def test_every_event_type_the_platform_delivers_is_named_once():
     grouped = PAYMENT_WEBHOOK_EVENTS + RECURRING_WEBHOOK_EVENTS + VERIFICATION_WEBHOOK_EVENTS
     assert sorted(grouped) == sorted(member.value for member in WebhookEventType)
