@@ -69,16 +69,80 @@ class ErrorCode(str, Enum):
     REFUND_AMOUNT_EXCEEDED = "REFUND_AMOUNT_EXCEEDED"
     REFUND_FAILED = "REFUND_FAILED"
 
+    # Subscription refusals on create (CheckoutRefusedError, HTTP 200 with success false).
+    AGREEMENT_NOT_FOUND = "AGREEMENT_NOT_FOUND"
+    AGREEMENT_NOT_PENDING = "AGREEMENT_NOT_PENDING"
+    AGREEMENT_AMOUNT_MISMATCH = "AGREEMENT_AMOUNT_MISMATCH"
+    AGREEMENT_CONSENT_REQUIRED = "AGREEMENT_CONSENT_REQUIRED"
+    AGREEMENT_SESSION_OPEN = "AGREEMENT_SESSION_OPEN"
+    AGREEMENT_ALREADY_PAID = "AGREEMENT_ALREADY_PAID"
+    AGREEMENT_VARIABLE_AMOUNT_UNSUPPORTED = "AGREEMENT_VARIABLE_AMOUNT_UNSUPPORTED"
+    SUBSCRIPTIONS_NOT_ENABLED = "SUBSCRIPTIONS_NOT_ENABLED"
+
+    # More charge codes (ChargeError). CHARGE_DECLINED (402) is a charge result, not an error.
+    CHARGE_DECLINED = "CHARGE_DECLINED"
+    PAYMENT_METHOD_NOT_FOUND = "PAYMENT_METHOD_NOT_FOUND"
+    CHARGE_IN_PROGRESS = "CHARGE_IN_PROGRESS"
+    CHARGE_CURRENCY_MISMATCH = "CHARGE_CURRENCY_MISMATCH"
+    AGREEMENT_METHOD_MISMATCH = "AGREEMENT_METHOD_MISMATCH"
+    AGREEMENT_CONSENT_MISSING = "AGREEMENT_CONSENT_MISSING"
+    AGREEMENT_CURRENCY_MISMATCH = "AGREEMENT_CURRENCY_MISMATCH"
+    CHARGE_AMOUNT_ABOVE_AGREEMENT = "CHARGE_AMOUNT_ABOVE_AGREEMENT"
+    AGREEMENT_PERIOD_ALREADY_CHARGED = "AGREEMENT_PERIOD_ALREADY_CHARGED"
+    AGREEMENT_ENDED = "AGREEMENT_ENDED"
+    AGREEMENT_NOT_STARTED = "AGREEMENT_NOT_STARTED"
+    CHARGE_AMOUNT_ABOVE_CAP = "CHARGE_AMOUNT_ABOVE_CAP"
+
+    # Plans and agreements (ApiError).
+    PLAN_NOT_FOUND = "PLAN_NOT_FOUND"
+    PLAN_NOT_ACTIVE = "PLAN_NOT_ACTIVE"
+    PAYMENT_METHOD_CURRENCY_MISMATCH = "PAYMENT_METHOD_CURRENCY_MISMATCH"
+    PAYMENT_METHOD_CURRENCY_UNKNOWN = "PAYMENT_METHOD_CURRENCY_UNKNOWN"
+    MAX_AMOUNT_BELOW_PLAN_AMOUNT = "MAX_AMOUNT_BELOW_PLAN_AMOUNT"
+
+    # Webhook endpoints (ApiError).
+    WEBHOOK_NOT_FOUND = "WEBHOOK_NOT_FOUND"
+    WEBHOOK_LIMIT_REACHED = "WEBHOOK_LIMIT_REACHED"
+    WEBHOOK_ALREADY_REGISTERED = "WEBHOOK_ALREADY_REGISTERED"
+    WEBHOOK_URL_REJECTED = "WEBHOOK_URL_REJECTED"
+
+    # Generic codes on any route. VALIDATION_ERROR (400) lists the refused fields in
+    # ``result["error"]["validationErrors"]``; INTERNAL_ERROR comes with a 500.
+    VALIDATION_ERROR = "VALIDATION_ERROR"
+    BAD_REQUEST = "BAD_REQUEST"
+    INTERNAL_ERROR = "INTERNAL_ERROR"
+
+    # Field codes: the ``code`` of one entry in ``result["error"]["validationErrors"]``.
+    REQUIRED = "REQUIRED"
+    MIN_VALUE = "MIN_VALUE"
+    MAX_LENGTH = "MAX_LENGTH"
+    INVALID_FORMAT = "INVALID_FORMAT"
+    INVALID_SELECTION = "INVALID_SELECTION"
+    DATE_IN_FUTURE = "DATE_IN_FUTURE"
+    INVALID_EMAIL = "INVALID_EMAIL"
+    INVALID_CURRENCY = "INVALID_CURRENCY"
+
 
 #: Every ``errorCode`` the API can refuse a checkout session with - a business refusal,
-#: sent as HTTP 200 with ``success: false``. Listed so you can assert your own handling
-#: covers all of them; treat an unlisted code as a refusal too rather than crashing.
+#: sent as HTTP 200 with ``success: false``, raised as :class:`CheckoutRefusedError`. The
+#: ``AGREEMENT_*`` codes and ``SUBSCRIPTIONS_NOT_ENABLED`` come only with ``agreement_id``.
+#: Listed so you can assert your own handling covers all of them; treat an unlisted code
+#: as a refusal too rather than crashing. ``STOREFRONT_MISMATCH`` can also arrive in this
+#: shape, on a replay; it is raised as :class:`StorefrontError`, so it is not here.
 SESSION_REFUSAL_ERROR_CODES: Tuple[str, ...] = (
     "PAYMENT_PROCESSING_UNAVAILABLE",
     "DUPLICATE_REQUEST",
     "ALREADY_PROCESSED",
     "IDEMPOTENCY_KEY_REUSED",
     "PRIOR_ATTEMPT_FAILED",
+    "AGREEMENT_NOT_FOUND",
+    "AGREEMENT_NOT_PENDING",
+    "AGREEMENT_AMOUNT_MISMATCH",
+    "AGREEMENT_CONSENT_REQUIRED",
+    "AGREEMENT_SESSION_OPEN",
+    "AGREEMENT_ALREADY_PAID",
+    "AGREEMENT_VARIABLE_AMOUNT_UNSUPPORTED",
+    "SUBSCRIPTIONS_NOT_ENABLED",
 )
 
 #: Input validation codes on the create endpoint. These are HTTP 400, NOT the
@@ -104,9 +168,10 @@ STOREFRONT_ERROR_CODES: Tuple[str, ...] = (
 )
 
 #: The codes :meth:`DominaiteClient.charge_payment_method` raises as
-#: :class:`ChargeError`, in the gateway's own order. ``CHARGE_DECLINED`` (HTTP 402) is
-#: deliberately not here: a decline is a charge result with ``status`` ``failed``, not
-#: an exception.
+#: :class:`ChargeError`. ``CHARGE_DECLINED`` (HTTP 402) is deliberately not here: a
+#: decline is a charge result with ``status`` ``failed``, not an exception. The two
+#: charge limits (HTTP 429) are a :class:`RateLimitError`. The ``AGREEMENT_*`` codes and
+#: the two amount caps come only with ``agreement_id``.
 CHARGE_ERROR_CODES: Tuple[str, ...] = (
     "PAYMENT_METHOD_NOT_ACTIVE",
     "DUPLICATE_REQUEST",
@@ -115,11 +180,68 @@ CHARGE_ERROR_CODES: Tuple[str, ...] = (
     "CHARGE_FAILED",
     "PAYMENT_METHOD_CHARGES_DISABLED",
     "PAYMENT_PROCESSING_UNAVAILABLE",
+    "PAYMENT_METHOD_NOT_FOUND",
+    "CHARGE_IN_PROGRESS",
+    "CHARGE_CURRENCY_MISMATCH",
+    "AGREEMENT_NOT_FOUND",
+    "AGREEMENT_METHOD_MISMATCH",
+    "AGREEMENT_CONSENT_MISSING",
+    "AGREEMENT_CURRENCY_MISMATCH",
+    "AGREEMENT_AMOUNT_MISMATCH",
+    "CHARGE_AMOUNT_ABOVE_AGREEMENT",
+    "AGREEMENT_PERIOD_ALREADY_CHARGED",
+    "AGREEMENT_ENDED",
+    "AGREEMENT_NOT_STARTED",
+    "CHARGE_AMOUNT_ABOVE_CAP",
 )
 
 #: The codes :meth:`DominaiteClient.revoke_payment_method` raises as
 #: :class:`RevokeError`, in the gateway's own order.
 REVOKE_ERROR_CODES: Tuple[str, ...] = ("UPSTREAM_CONTRACT_ERROR", "MERCHANT_API_UNAVAILABLE")
+
+#: The codes the plan and agreement methods raise as :class:`ApiError`. Nothing was
+#: created or changed on any of them. ``MERCHANT_API_UNAVAILABLE`` (503) is a
+#: :class:`TransportError` that keeps the code.
+RECURRING_ERROR_CODES: Tuple[str, ...] = (
+    "PLAN_NOT_FOUND",
+    "PLAN_NOT_ACTIVE",
+    "AGREEMENT_NOT_FOUND",
+    "AGREEMENT_ENDED",
+    "PAYMENT_METHOD_NOT_FOUND",
+    "PAYMENT_METHOD_NOT_ACTIVE",
+    "PAYMENT_METHOD_CURRENCY_MISMATCH",
+    "PAYMENT_METHOD_CURRENCY_UNKNOWN",
+    "MAX_AMOUNT_BELOW_PLAN_AMOUNT",
+    "AGREEMENT_CONSENT_REQUIRED",
+    "IDEMPOTENCY_KEY_REUSED",
+    "MERCHANT_API_UNAVAILABLE",
+)
+
+#: The codes the webhook endpoint methods raise as :class:`ApiError`. Nothing new was
+#: registered on any of them. ``MERCHANT_API_UNAVAILABLE`` (503) is a
+#: :class:`TransportError` that keeps the code.
+WEBHOOK_ERROR_CODES: Tuple[str, ...] = (
+    "WEBHOOK_NOT_FOUND",
+    "WEBHOOK_LIMIT_REACHED",
+    "WEBHOOK_ALREADY_REGISTERED",
+    "WEBHOOK_URL_REJECTED",
+    "IDEMPOTENCY_KEY_REUSED",
+    "DUPLICATE_REQUEST",
+    "MERCHANT_API_UNAVAILABLE",
+)
+
+#: The ``code`` values of one entry in ``result["error"]["validationErrors"]`` on a 400
+#: ``VALIDATION_ERROR``. Each names why one field was refused.
+FIELD_VALIDATION_CODES: Tuple[str, ...] = (
+    "REQUIRED",
+    "MIN_VALUE",
+    "MAX_LENGTH",
+    "INVALID_FORMAT",
+    "INVALID_SELECTION",
+    "DATE_IN_FUTURE",
+    "INVALID_EMAIL",
+    "INVALID_CURRENCY",
+)
 
 #: The codes :meth:`DominaiteClient.create_refund` and :meth:`DominaiteClient.get_refund`
 #: raise as :class:`RefundError`, in contract order. ``REFUND_FAILED`` is not here: a

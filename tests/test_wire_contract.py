@@ -31,11 +31,13 @@ def test_status_vocabulary_matches_the_gateway_in_order():
     assert list(PAYMENT_STATUSES) == WIRE["statuses"]
 
 
-def test_refusal_codes_are_exactly_the_http_200_error_codes():
+def test_refusal_codes_hold_every_http_200_error_code():
+    # The contract groups list the generic refusals only; the subscription refusals are
+    # also HTTP 200, so the SDK list is a superset.
     expected = _codes_with_status(
         [WIRE["errorCodes"]["transient"], WIRE["errorCodes"]["idempotency"]], 200
     )
-    assert sorted(SESSION_REFUSAL_ERROR_CODES) == expected
+    assert set(expected) <= set(SESSION_REFUSAL_ERROR_CODES)
 
 
 def test_validation_codes_are_exactly_the_http_400_idempotency_codes():
