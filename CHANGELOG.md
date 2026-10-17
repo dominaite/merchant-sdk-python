@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.7.0 (unreleased)
+
+### Breaking
+
+- The client retries by default. Every GET, and every POST with an idempotency key, is retried
+  up to twice on a network failure, a 5xx or `PAYMENT_PROCESSING_UNAVAILABLE`, with full-jitter
+  backoff (0 to 0.5 s times 2^n, capped at 8 s). Pass `max_retries=0` to send every call once.
+  A 429, `CHARGE_OUTCOME_UNKNOWN` and `CHARGE_FAILED` are never retried.
+  `create_webhook_endpoint` is never retried either: a replay answers without the secret.
+- `timeout` is per attempt. With retries one call can take up to `(max_retries + 1) * timeout`
+  plus the waits: just under 137 seconds with the defaults.
+- A 5xx whose body is not JSON (for example an HTML 502 from a proxy) raises `TransportError`.
+  It was an `ApiError`.
+- `TransportError.__init__` takes `(message, http_status=None, error_code=None, result=None, *,
+  request_id=None)`. Code that builds a `TransportError` with more than the message, in a test
+  double for example, must pass those by name.
+- `create_checkout_session_with_retry` waits with full jitter, capped at 8 s: a random time
+  between 0 and `min(8, backoff_seconds * 2**n)`. It waited exactly `backoff_seconds * 2**n`.
+- A coded 404 on a charge (`PAYMENT_METHOD_NOT_FOUND`, `AGREEMENT_NOT_FOUND`) is a
+  `ChargeError`. It was an `ApiError`.
+- `STOREFRONT_MISMATCH` on a checkout replay (the 200 shape) is a `StorefrontError` with
+  `http_status` 200. It was a `CheckoutRefusedError`.
+- A 5xx keeps the gateway's code: `TransportError` now has `error_code`, `http_status` and
+  `result`. Code that only caught `TransportError` keeps working.
+- A currency that is not three upper-case letters raises `ValueError` before anything is sent.
+- The payment method id is lower-cased before it is signed and sent, so `PM_...` works.
+- The retry warning names the method and the path:
+  `dominaite-python: retrying POST /merchant-api/checkout/sessions after HTTP 503 (attempt 2 of 3)`.
+
+### Added
+
+- Request ids. Every result and every error carries the gateway's request id: read
+  `error.request_id`, or `request_id_of(result)` on a result. The SDK reads the
+  `Dominaite-Request-Id` header first, then `metadata.requestId` in the body. The debug line
+  carries it too.
+- The client keywords `max_retries`, `sleep` and `random` (the last two for tests).
+- `ErrorCode` names every code the gateway answers: subscription refusals, charge codes, plan and
+  agreement codes, webhook endpoint codes, generic codes and field validation codes. New lists:
+  `RECURRING_ERROR_CODES`, `WEBHOOK_ERROR_CODES` and `FIELD_VALIDATION_CODES`.
+  `CHARGE_ERROR_CODES` holds the new charge codes.
+- `SUBSCRIPTION_REFUSAL_ERROR_CODES`: the `AGREEMENT_*` codes and `SUBSCRIPTIONS_NOT_ENABLED`
+  that refuse a checkout session with `agreement_id`. They raise `CheckoutRefusedError`, like
+  the codes in `SESSION_REFUSAL_ERROR_CODES`. That list stays the five codes the integration
+  contract publishes.
+- `WebhookEventType` names every webhook event, with the lists `PAYMENT_WEBHOOK_EVENTS`,
+  `RECURRING_WEBHOOK_EVENTS` and `VERIFICATION_WEBHOOK_EVENTS`.
+- `ChargeEventData.storedPaymentMethodId` is `Optional[str]`: the gateway can send null.
+
+### Deprecated
+
+- `create_checkout_session_with_retry`. Call `create_checkout_session`: the client retry policy
+  now covers it. The helper still works and warns with a `DeprecationWarning` on each call.
+
 ## 0.6.0
 
 ### Breaking

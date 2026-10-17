@@ -14,11 +14,15 @@ The secret below is the dummy from the public contract. It authenticates nothing
 
 import hmac
 import json
+from pathlib import Path
 from typing import Optional, get_type_hints
 
 import pytest
 
 from dominaite import (
+    PAYMENT_WEBHOOK_EVENTS,
+    RECURRING_WEBHOOK_EVENTS,
+    VERIFICATION_WEBHOOK_EVENTS,
     AgreementEventData,
     ChargeEventData,
     PaymentEventData,
@@ -26,6 +30,7 @@ from dominaite import (
     StoredPaymentMethodRetiredReason,
     StoredPaymentMethodStatus,
     WebhookEvent,
+    WebhookEventType,
     WebhookVerificationError,
     sign_webhook,
     verify_webhook,
@@ -551,3 +556,38 @@ def test_a_payment_event_without_a_psp_reference_reads_none_whether_null_or_abse
     absent = verify_webhook(BODY, EXPECTED_HEADER, SECRET, now=NOW)
     assert "pspReference" not in absent["data"]
     assert absent["data"].get("pspReference") is None
+
+
+# --- event types ---------------------------------------------------------------
+
+WIRE = json.loads(
+    (Path(__file__).resolve().parent / "merchant-api-wire-contract.json").read_text("utf-8")
+)
+
+
+def test_payment_event_types_are_the_contract_event_catalog_in_order():
+    assert list(PAYMENT_WEBHOOK_EVENTS) == WIRE["webhookEventCatalog"]
+
+
+def test_recurring_event_types_are_the_contract_recurring_events_in_order():
+    assert list(RECURRING_WEBHOOK_EVENTS) == WIRE["recurringWebhookEvents"]
+
+
+def test_every_event_type_the_platform_delivers_is_named_once():
+    grouped = PAYMENT_WEBHOOK_EVENTS + RECURRING_WEBHOOK_EVENTS + VERIFICATION_WEBHOOK_EVENTS
+    assert sorted(grouped) == sorted(member.value for member in WebhookEventType)
+    assert len(grouped) == 15
+    assert RECURRING_WEBHOOK_EVENTS == (
+        "agreement.activated",
+        "agreement.past_due",
+        "agreement.cancelled",
+        "charge.succeeded",
+        "charge.failed",
+        "charge.retrying",
+    )
+    assert WebhookEventType.CHARGE_RETRYING == "charge.retrying"
+
+
+def test_a_charge_event_may_carry_a_null_stored_payment_method_id():
+    """Webhooks send every field, null when empty."""
+    assert get_type_hints(ChargeEventData)["storedPaymentMethodId"] == Optional[str]

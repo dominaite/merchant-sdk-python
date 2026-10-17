@@ -4,7 +4,44 @@ These are ``TypedDict``s: at runtime every one is a plain dict, so indexing and 
 work as usual and nothing is parsed or validated on the way in.
 """
 
-from typing import List, Optional, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict
+
+
+class _ResultDict(Dict[str, Any]):
+    """A result dict that also carries the API's id for the call on ``request_id``.
+
+    Equality, ``json.dumps`` and indexing are a plain dict's. ``dict(result)`` and
+    ``copy.deepcopy`` keep the keys; only the class keeps ``request_id``.
+    """
+
+    __slots__ = ("request_id",)
+
+    def __init__(self, data: Dict[str, Any], request_id: Optional[str]) -> None:
+        super().__init__(data)
+        self.request_id = request_id
+
+
+class _ResultList(List[Any]):
+    """A result list that also carries the API's id for the call on ``request_id``."""
+
+    __slots__ = ("request_id",)
+
+    def __init__(self, items: List[Any], request_id: Optional[str]) -> None:
+        super().__init__(items)
+        self.request_id = request_id
+
+
+def request_id_of(value: Any) -> Optional[str]:
+    """The API's id for the call that returned ``value``, or None.
+
+    Works on every result of :class:`DominaiteClient` and on every :class:`DominaiteError`:
+    both carry it as ``request_id``. The id comes from the ``Dominaite-Request-Id``
+    response header, else from ``metadata.requestId`` in the body. Give it to support
+    with the time of the call. The results are typed as ``TypedDict``, which hides the
+    attribute from a type checker; this function is the typed way to read it.
+    """
+    request_id = getattr(value, "request_id", None)
+    return request_id if isinstance(request_id, str) else None
 
 
 class StoredPaymentMethod(TypedDict):

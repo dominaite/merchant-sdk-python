@@ -291,25 +291,45 @@ session: same transaction id, same cashier values. Otherwise it comes back as a
 amount). Use `refusal.transaction_id` with `get_status()` to find out what the first attempt did
 (see [Recovering from a replay refusal](#recovering-from-a-replay-refusal)).
 
-There is a helper that retries with the same key for you:
+### The client retries for you
+
+The client retries a call that may not have landed. It never retries a call that got an answer.
+
+- **What it retries:** every GET, and every POST that carries an idempotency key (create a
+  checkout session, charge, refund, and create a plan or an agreement when you pass a key). A PATCH, a DELETE and a
+  POST without a key are sent once.
+- **Never retried: webhook endpoint create.** The secret is only in the first answer. A retry
+  after an answer that was lost gets the endpoint back without it. See
+  [Manage endpoints with the API](#manage-endpoints-with-the-api).
+- **When it retries:** a network failure, a 5xx, and `PAYMENT_PROCESSING_UNAVAILABLE` (card
+  payments briefly off, nothing charged), as a 503 or as a refusal.
+- **When it does not:** a 4xx, a 429, every other refusal, and the two charge answers that are
+  final: `CHARGE_OUTCOME_UNKNOWN` and `CHARGE_FAILED`. Those carry a charge row; see
+  [Stored payment methods](#stored-payment-methods-recurring).
+- **Same key, same body.** Every attempt sends your one idempotency key and the same body. Only
+  the timestamp and the signature over it change.
+- **How long it waits:** full jitter. Before retry `n` (from 0) it waits a random time between 0
+  and `min(8, 0.5 * 2**n)` seconds.
+
+`max_retries` sets the number of retries after the first attempt. The default is 2, so a call
+is sent at most three times. `max_retries=0` sends every call once:
 
 ```python
-session = client.create_checkout_session_with_retry(
-    amount=2500,
-    currency="EUR",
-    order_reference="order-1042",
-    idempotency_key=order_idempotency_key("checkout", "1042", 2500, "EUR"),
-    max_attempts=3,
-)
+client = DominaiteClient(key_id, secret, base_url, max_retries=0)
 ```
 
-It retries `TransportError` (network failures, any 5xx, including a 503 carrying
-`MERCHANT_API_UNAVAILABLE` or `PAYMENT_PROCESSING_UNAVAILABLE`) and the
-`PAYMENT_PROCESSING_UNAVAILABLE` refusal (card payments briefly off, nothing charged). It sends
-your one key on every attempt and backs off between them. Every other refusal, storefront
-errors, authentication failures and rate limits are raised immediately. If processing stays
-unavailable past the last attempt you get the `CheckoutRefusedError`; retry later with the
-same key, and give up after about fifteen minutes.
+`timeout` (default 45 seconds) is per attempt, not per call. One call can take up to
+`(max_retries + 1) * timeout` plus the waits: with the defaults, just under 137 seconds.
+
+Each retry goes to `on_warning` (see [Logging and warnings](#logging-and-warnings)), for example
+`dominaite-python: retrying POST /merchant-api/checkout/sessions after HTTP 503 (attempt 2 of 3)`.
+
+If processing stays unavailable past the last attempt you get the `CheckoutRefusedError` or the
+`TransportError`. Retry later with the same key, and give up after about fifteen minutes.
+
+`create_checkout_session_with_retry` is deprecated. It still works: it runs on the same retry
+loop with its own `max_attempts` and `backoff_seconds`, and warns once per call. Call
+`create_checkout_session` instead.
 
 ## Sessions expire
 
@@ -671,7 +691,8 @@ for the two codes worth retrying with the same key:
 | `DUPLICATE_REQUEST` | 409 | Yes, after a second, for up to 120 seconds |
 | `IDEMPOTENCY_KEY_REQUIRED` | 400 | No: fix the call |
 
-A 5xx is a `TransportError`: nothing was queued, retry with the same key.
+A 5xx is a `TransportError`: nothing was queued. The client already retried it; retry later with
+the same key.
 
 ```python
 try:
@@ -777,8 +798,9 @@ admin.delete_webhook_endpoint(endpoint["id"])
 
 1. `secret` is in the first answer only. A replay with the same key and the list leave it out.
    If you lose the secret, delete the endpoint and create it again.
-2. After a timeout or a 503, retry with the same `idempotency_key`. The retry replaces an
-   endpoint that the lost attempt registered. A new key cannot do this.
+2. The SDK sends this call once, whatever `max_retries` says. After a timeout or a 5xx, retry
+   it yourself with the same `idempotency_key`. If that answer has no `secret`, the lost
+   attempt registered the endpoint: delete it and create it again with a new key.
 3. A key used again more than a day later raises `WEBHOOK_ALREADY_REGISTERED`.
    `result["error"]["params"]["webhookId"]` names the endpoint. Use a fresh key for a new
    endpoint.
@@ -1145,9 +1167,10 @@ client = DominaiteClient(
 ```
 
 - `on_warning` gets a message for: a `Dominaite-Sdk-Notice` response header (the API sends it
-  when your SDK version is deprecated, once per distinct value per client), a retry in
-  `create_checkout_session_with_retry`, and a ping `clockSkewSeconds` over 60. Without it the
-  SDK calls `warnings.warn`: `DeprecationWarning` for the notice, `UserWarning` for the others.
+  when your SDK version is deprecated, once per distinct value per client), each retry, a call
+  to `create_checkout_session_with_retry`, and a ping `clockSkewSeconds` over 60. Without it the
+  SDK calls `warnings.warn`: `DeprecationWarning` for the notice and the deprecated helper,
+  `UserWarning` for the others.
 - `on_debug` gets one line per request, for example
   `dominaite-python: POST /merchant-api/checkout/sessions 201 184ms request_id=... idempotency_key=checkout-1042-2500-EUR`.
   Debug is off until you pass it. Give support the `request_id` when you ask about a call.
@@ -1163,15 +1186,24 @@ client = DominaiteClient(
 | `AuthenticationError` | `http_status` 401: bad credentials, bad signature, clock skew, IP not allowlisted. `http_status` 403: the key is good but may not do this (`INSUFFICIENT_SCOPE`, `VERIFY_ONLY_NOT_ENABLED`) | No - fix config, or use a key with the right scope |
 | `CheckoutRefusedError` | The gateway refused to open the session (`error_code`) | Depends on the code |
 | `StorefrontError` | The storefront (website) cannot take payments yet, or the key belongs to another one (`error_code`, `http_status`). Subclass of `ApiError` | No - fix the setup |
-| `ChargeError` | The gateway answered a charge with a code instead of a charge (`error_code`, `http_status`, `charge`, `transaction_id`) | Depends on the code; never with a new key |
+| `ChargeError` | The gateway answered a charge with a code instead of a charge (`error_code`, `http_status`, `charge`, `transaction_id`). A coded 404 such as `PAYMENT_METHOD_NOT_FOUND` is a `ChargeError` too | Depends on the code; never with a new key |
 | `RefundError` | The gateway answered a refund call with a code (`error_code`, `http_status`, `retryable`, `retry_stop_after_seconds`). Subclass of `ApiError` | Only when `retryable`, same key |
 | `RevokeError` | The gateway refused to revoke a stored payment method; nothing changed (`error_code`, `http_status`) | `MERCHANT_API_UNAVAILABLE` only |
 | `ApiError` | Unexpected response, or a 4xx like an unknown transaction id (`http_status`, `error_code`, and `result`: the whole JSON body, with `validationErrors` and `params` when the gateway sent them) | No |
 | `RateLimitError` | HTTP 429; you are sending faster than you are allowed (`error_code`, `retry_after_seconds`) | Yes, after you wait |
-| `TransportError` | Network failure or 5xx; you don't know if it landed | Yes, same idempotency key |
+| `TransportError` | Network failure or 5xx; you don't know if it landed. A coded 5xx keeps its code on `error_code` and the body on `result`; `http_status` is None for a network failure | Yes, same idempotency key (the client already retried it) |
 | `WebhookVerificationError` | An incoming webhook is not authentic or not fresh (`error_code`) | No - respond 400 |
 
 All of them inherit from `DominaiteError` if you only care that the call failed.
+
+One rule picks the class: the gateway's code wins over the HTTP status.
+
+- A 5xx keeps its code on `error_code`. A 5xx without a JSON body (a proxy error page) is a
+  `TransportError` with no code.
+- A coded answer to a charge is a `ChargeError`, a 404 and a 5xx included. Only 400, 401, 403
+  and 429 keep their usual classes. Catch `ChargeError` around a charge, not only
+  `TransportError`.
+- A storefront code on checkout is a `StorefrontError`, also in the 200 shape.
 
 Note the two different failure shapes on the create endpoint. A business refusal is HTTP 200
 with `success: false` and raises `CheckoutRefusedError`; input validation is HTTP 400 and raises
@@ -1216,8 +1248,30 @@ except StorefrontError as error:
 ```
 
 An idempotency key first used on another storefront is also refused with
-`STOREFRONT_MISMATCH`, but in the 200 shape, so that one is a `CheckoutRefusedError`. Match on
-`error_code` if you want to handle both. The codes are exported as `STOREFRONT_ERROR_CODES`.
+`STOREFRONT_MISMATCH`, in the 200 shape. That refusal is a `StorefrontError` as well, with
+`http_status` 200, so one `except StorefrontError` handles both. The codes are exported as
+`STOREFRONT_ERROR_CODES`.
+
+### Request ids
+
+Every result and every error carries the gateway's request id. Give it to support when you ask
+about a call. The SDK reads the `Dominaite-Request-Id` response header, and falls back to
+`metadata.requestId` in the body. It is None when the gateway sent neither, and on a network
+failure.
+
+```python
+from dominaite import DominaiteError, request_id_of
+
+try:
+    session = client.create_checkout_session(...)
+    log.info("session opened, request_id=%s", request_id_of(session))
+except DominaiteError as error:
+    log.warning("checkout failed, request_id=%s", error.request_id)
+```
+
+A result is still a plain `dict` (or `list`); `request_id_of(result)` reads the id off it.
+`dict(result)` makes a copy without the id. Calls that answer 204 return None, so they have no
+id to carry.
 
 ### Webhook verification codes
 
@@ -1232,8 +1286,8 @@ body instead of the raw one), `TIMESTAMP_OUT_OF_RANGE` (replay, or your clock dr
 windows, and the IP limit is shared by every key sending from that address, so a busy host can
 trip it while each key is well inside its own budget.
 
-Going over gets you a `RateLimitError`. The SDK does **not** retry it for you, and neither does
-`create_checkout_session_with_retry` - answering "you are sending too much" with more traffic is
+Going over gets you a `RateLimitError`. The SDK does **not** retry it for you, not even under the
+client retry policy - answering "you are sending too much" with more traffic is
 how a short spike turns into a sustained lockout. Wait, then send again:
 
 ```python

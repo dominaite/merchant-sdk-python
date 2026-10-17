@@ -69,16 +69,88 @@ class ErrorCode(str, Enum):
     REFUND_AMOUNT_EXCEEDED = "REFUND_AMOUNT_EXCEEDED"
     REFUND_FAILED = "REFUND_FAILED"
 
+    # Subscription refusals on create (CheckoutRefusedError, HTTP 200 with success false).
+    AGREEMENT_NOT_FOUND = "AGREEMENT_NOT_FOUND"
+    AGREEMENT_NOT_PENDING = "AGREEMENT_NOT_PENDING"
+    AGREEMENT_AMOUNT_MISMATCH = "AGREEMENT_AMOUNT_MISMATCH"
+    AGREEMENT_CONSENT_REQUIRED = "AGREEMENT_CONSENT_REQUIRED"
+    AGREEMENT_SESSION_OPEN = "AGREEMENT_SESSION_OPEN"
+    AGREEMENT_ALREADY_PAID = "AGREEMENT_ALREADY_PAID"
+    AGREEMENT_VARIABLE_AMOUNT_UNSUPPORTED = "AGREEMENT_VARIABLE_AMOUNT_UNSUPPORTED"
+    SUBSCRIPTIONS_NOT_ENABLED = "SUBSCRIPTIONS_NOT_ENABLED"
+
+    # More charge codes (ChargeError). CHARGE_DECLINED (402) is a charge result, not an error.
+    CHARGE_DECLINED = "CHARGE_DECLINED"
+    PAYMENT_METHOD_NOT_FOUND = "PAYMENT_METHOD_NOT_FOUND"
+    CHARGE_IN_PROGRESS = "CHARGE_IN_PROGRESS"
+    CHARGE_CURRENCY_MISMATCH = "CHARGE_CURRENCY_MISMATCH"
+    AGREEMENT_METHOD_MISMATCH = "AGREEMENT_METHOD_MISMATCH"
+    AGREEMENT_CONSENT_MISSING = "AGREEMENT_CONSENT_MISSING"
+    AGREEMENT_CURRENCY_MISMATCH = "AGREEMENT_CURRENCY_MISMATCH"
+    CHARGE_AMOUNT_ABOVE_AGREEMENT = "CHARGE_AMOUNT_ABOVE_AGREEMENT"
+    AGREEMENT_PERIOD_ALREADY_CHARGED = "AGREEMENT_PERIOD_ALREADY_CHARGED"
+    AGREEMENT_ENDED = "AGREEMENT_ENDED"
+    AGREEMENT_NOT_STARTED = "AGREEMENT_NOT_STARTED"
+    CHARGE_AMOUNT_ABOVE_CAP = "CHARGE_AMOUNT_ABOVE_CAP"
+
+    # Plans and agreements (ApiError).
+    PLAN_NOT_FOUND = "PLAN_NOT_FOUND"
+    PLAN_NOT_ACTIVE = "PLAN_NOT_ACTIVE"
+    PAYMENT_METHOD_CURRENCY_MISMATCH = "PAYMENT_METHOD_CURRENCY_MISMATCH"
+    PAYMENT_METHOD_CURRENCY_UNKNOWN = "PAYMENT_METHOD_CURRENCY_UNKNOWN"
+    MAX_AMOUNT_BELOW_PLAN_AMOUNT = "MAX_AMOUNT_BELOW_PLAN_AMOUNT"
+
+    # Webhook endpoints (ApiError).
+    WEBHOOK_NOT_FOUND = "WEBHOOK_NOT_FOUND"
+    WEBHOOK_LIMIT_REACHED = "WEBHOOK_LIMIT_REACHED"
+    WEBHOOK_ALREADY_REGISTERED = "WEBHOOK_ALREADY_REGISTERED"
+    WEBHOOK_URL_REJECTED = "WEBHOOK_URL_REJECTED"
+
+    # Generic codes on any route. VALIDATION_ERROR (400) lists the refused fields in
+    # ``result["error"]["validationErrors"]``; INTERNAL_ERROR comes with a 500.
+    VALIDATION_ERROR = "VALIDATION_ERROR"
+    BAD_REQUEST = "BAD_REQUEST"
+    INTERNAL_ERROR = "INTERNAL_ERROR"
+
+    # Field codes: the ``code`` of one entry in ``result["error"]["validationErrors"]``.
+    REQUIRED = "REQUIRED"
+    MIN_VALUE = "MIN_VALUE"
+    MAX_LENGTH = "MAX_LENGTH"
+    INVALID_FORMAT = "INVALID_FORMAT"
+    INVALID_SELECTION = "INVALID_SELECTION"
+    DATE_IN_FUTURE = "DATE_IN_FUTURE"
+    INVALID_EMAIL = "INVALID_EMAIL"
+    INVALID_CURRENCY = "INVALID_CURRENCY"
+
 
 #: Every ``errorCode`` the API can refuse a checkout session with - a business refusal,
-#: sent as HTTP 200 with ``success: false``. Listed so you can assert your own handling
+#: sent as HTTP 200 with ``success: false``, raised as :class:`CheckoutRefusedError`. A
+#: session with ``agreement_id`` can also be refused with one of
+#: :data:`SUBSCRIPTION_REFUSAL_ERROR_CODES`. Listed so you can assert your own handling
 #: covers all of them; treat an unlisted code as a refusal too rather than crashing.
+#: ``STOREFRONT_MISMATCH`` can also arrive in this shape, on a replay; it is raised as
+#: :class:`StorefrontError`, so it is not here.
 SESSION_REFUSAL_ERROR_CODES: Tuple[str, ...] = (
     "PAYMENT_PROCESSING_UNAVAILABLE",
     "DUPLICATE_REQUEST",
     "ALREADY_PROCESSED",
     "IDEMPOTENCY_KEY_REUSED",
     "PRIOR_ATTEMPT_FAILED",
+)
+
+#: The refusals of a subscription session (``create_checkout_session`` with
+#: ``agreement_id``). Like :data:`SESSION_REFUSAL_ERROR_CODES` they are HTTP 200 with
+#: ``success: false`` and raise :class:`CheckoutRefusedError`; nothing is created.
+#: ``SUBSCRIPTIONS_NOT_ENABLED`` means subscriptions are not on for your account.
+SUBSCRIPTION_REFUSAL_ERROR_CODES: Tuple[str, ...] = (
+    "AGREEMENT_NOT_FOUND",
+    "AGREEMENT_NOT_PENDING",
+    "AGREEMENT_AMOUNT_MISMATCH",
+    "AGREEMENT_CONSENT_REQUIRED",
+    "AGREEMENT_SESSION_OPEN",
+    "AGREEMENT_ALREADY_PAID",
+    "AGREEMENT_VARIABLE_AMOUNT_UNSUPPORTED",
+    "SUBSCRIPTIONS_NOT_ENABLED",
 )
 
 #: Input validation codes on the create endpoint. These are HTTP 400, NOT the
@@ -104,9 +176,10 @@ STOREFRONT_ERROR_CODES: Tuple[str, ...] = (
 )
 
 #: The codes :meth:`DominaiteClient.charge_payment_method` raises as
-#: :class:`ChargeError`, in the gateway's own order. ``CHARGE_DECLINED`` (HTTP 402) is
-#: deliberately not here: a decline is a charge result with ``status`` ``failed``, not
-#: an exception.
+#: :class:`ChargeError`. ``CHARGE_DECLINED`` (HTTP 402) is deliberately not here: a
+#: decline is a charge result with ``status`` ``failed``, not an exception. The two
+#: charge limits (HTTP 429) are a :class:`RateLimitError`. The ``AGREEMENT_*`` codes and
+#: the two amount caps come only with ``agreement_id``.
 CHARGE_ERROR_CODES: Tuple[str, ...] = (
     "PAYMENT_METHOD_NOT_ACTIVE",
     "DUPLICATE_REQUEST",
@@ -115,11 +188,68 @@ CHARGE_ERROR_CODES: Tuple[str, ...] = (
     "CHARGE_FAILED",
     "PAYMENT_METHOD_CHARGES_DISABLED",
     "PAYMENT_PROCESSING_UNAVAILABLE",
+    "PAYMENT_METHOD_NOT_FOUND",
+    "CHARGE_IN_PROGRESS",
+    "CHARGE_CURRENCY_MISMATCH",
+    "AGREEMENT_NOT_FOUND",
+    "AGREEMENT_METHOD_MISMATCH",
+    "AGREEMENT_CONSENT_MISSING",
+    "AGREEMENT_CURRENCY_MISMATCH",
+    "AGREEMENT_AMOUNT_MISMATCH",
+    "CHARGE_AMOUNT_ABOVE_AGREEMENT",
+    "AGREEMENT_PERIOD_ALREADY_CHARGED",
+    "AGREEMENT_ENDED",
+    "AGREEMENT_NOT_STARTED",
+    "CHARGE_AMOUNT_ABOVE_CAP",
 )
 
 #: The codes :meth:`DominaiteClient.revoke_payment_method` raises as
 #: :class:`RevokeError`, in the gateway's own order.
 REVOKE_ERROR_CODES: Tuple[str, ...] = ("UPSTREAM_CONTRACT_ERROR", "MERCHANT_API_UNAVAILABLE")
+
+#: The codes the plan and agreement methods raise as :class:`ApiError`. Nothing was
+#: created or changed on any of them. ``MERCHANT_API_UNAVAILABLE`` (503) is a
+#: :class:`TransportError` that keeps the code.
+RECURRING_ERROR_CODES: Tuple[str, ...] = (
+    "PLAN_NOT_FOUND",
+    "PLAN_NOT_ACTIVE",
+    "AGREEMENT_NOT_FOUND",
+    "AGREEMENT_ENDED",
+    "PAYMENT_METHOD_NOT_FOUND",
+    "PAYMENT_METHOD_NOT_ACTIVE",
+    "PAYMENT_METHOD_CURRENCY_MISMATCH",
+    "PAYMENT_METHOD_CURRENCY_UNKNOWN",
+    "MAX_AMOUNT_BELOW_PLAN_AMOUNT",
+    "AGREEMENT_CONSENT_REQUIRED",
+    "IDEMPOTENCY_KEY_REUSED",
+    "MERCHANT_API_UNAVAILABLE",
+)
+
+#: The codes the webhook endpoint methods raise as :class:`ApiError`. Nothing new was
+#: registered on any of them. ``MERCHANT_API_UNAVAILABLE`` (503) is a
+#: :class:`TransportError` that keeps the code.
+WEBHOOK_ERROR_CODES: Tuple[str, ...] = (
+    "WEBHOOK_NOT_FOUND",
+    "WEBHOOK_LIMIT_REACHED",
+    "WEBHOOK_ALREADY_REGISTERED",
+    "WEBHOOK_URL_REJECTED",
+    "IDEMPOTENCY_KEY_REUSED",
+    "DUPLICATE_REQUEST",
+    "MERCHANT_API_UNAVAILABLE",
+)
+
+#: The ``code`` values of one entry in ``result["error"]["validationErrors"]`` on a 400
+#: ``VALIDATION_ERROR``. Each names why one field was refused.
+FIELD_VALIDATION_CODES: Tuple[str, ...] = (
+    "REQUIRED",
+    "MIN_VALUE",
+    "MAX_LENGTH",
+    "INVALID_FORMAT",
+    "INVALID_SELECTION",
+    "DATE_IN_FUTURE",
+    "INVALID_EMAIL",
+    "INVALID_CURRENCY",
+)
 
 #: The codes :meth:`DominaiteClient.create_refund` and :meth:`DominaiteClient.get_refund`
 #: raise as :class:`RefundError`, in contract order. ``REFUND_FAILED`` is not here: a
@@ -155,7 +285,14 @@ class DominaiteError(Exception):
 
     Catch this if you only care that the payment call failed. Catch the subclasses
     when you want to branch on why.
+
+    ``request_id`` is the id the API gave this call, for support: the
+    ``Dominaite-Request-Id`` response header, else ``metadata.requestId`` in the body. It
+    is None when no answer arrived (a network failure) or the answer carried no id.
     """
+
+    #: The API's id for this call, or None. Give it to support with the time of the call.
+    request_id: Optional[str] = None
 
 
 class ApiError(DominaiteError):
@@ -179,12 +316,15 @@ class ApiError(DominaiteError):
         message: str,
         error_code: Optional[str] = None,
         result: Optional[Dict[str, Any]] = None,
+        *,
+        request_id: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.http_status = http_status
         self.error_code = error_code
         #: The full JSON body the API sent, for fields not modelled above.
         self.result = result if result is not None else {}
+        self.request_id = request_id
 
 
 class RateLimitError(ApiError):
@@ -230,8 +370,10 @@ class RateLimitError(ApiError):
         retry_after_seconds: Optional[int] = None,
         error_code: Optional[str] = None,
         result: Optional[Dict[str, Any]] = None,
+        *,
+        request_id: Optional[str] = None,
     ) -> None:
-        super().__init__(429, message, error_code=error_code, result=result)
+        super().__init__(429, message, error_code=error_code, result=result, request_id=request_id)
         #: Seconds the API asked you to wait, or None when it did not say.
         self.retry_after_seconds = retry_after_seconds
 
@@ -251,9 +393,8 @@ class StorefrontError(ApiError):
       than the request names.
 
     An idempotency key first used on another storefront is refused with
-    ``STOREFRONT_MISMATCH`` too, but in the HTTP 200 shape, so that one arrives as
-    :class:`CheckoutRefusedError`. Match on ``error_code`` rather than the exception
-    type if you want to handle both.
+    ``STOREFRONT_MISMATCH`` too, in the HTTP 200 refusal shape. It is a
+    :class:`StorefrontError` as well, with ``http_status`` 200.
 
     Subclasses :class:`ApiError`, so existing ``except ApiError`` handlers keep
     catching it, with ``http_status`` and ``error_code`` set.
@@ -290,6 +431,8 @@ class AuthenticationError(DominaiteError):
         message: str,
         http_status: int = 401,
         result: Optional[Dict[str, Any]] = None,
+        *,
+        request_id: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.error_code = error_code
@@ -297,6 +440,7 @@ class AuthenticationError(DominaiteError):
         self.http_status = http_status
         #: The full JSON body the API sent, for fields not modelled above.
         self.result = result if result is not None else {}
+        self.request_id = request_id
 
 
 class CheckoutRefusedError(DominaiteError):
@@ -332,12 +476,15 @@ class CheckoutRefusedError(DominaiteError):
         message: str,
         transaction_id: Optional[str] = None,
         result: Optional[Dict[str, Any]] = None,
+        *,
+        request_id: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.error_code = error_code
         self.transaction_id = transaction_id
         #: The full unwrapped refusal payload, for fields not modelled above.
         self.result = result if result is not None else {}
+        self.request_id = request_id
 
 
 class ChargeError(DominaiteError):
@@ -365,6 +512,10 @@ class ChargeError(DominaiteError):
       stored-card charges on for your account, a retry does not help: ask Dominaite support.
       If they are on, retry later with the SAME idempotency key. The code is the same in
       both cases.
+    - ``PAYMENT_METHOD_NOT_FOUND`` or ``AGREEMENT_NOT_FOUND`` (404): the id is not yours
+      or does not exist. Nothing was charged.
+
+    :data:`CHARGE_ERROR_CODES` lists every code, the agreement checks included.
 
     ``result`` is the whole envelope the gateway sent, for fields not modelled above.
     """
@@ -376,6 +527,8 @@ class ChargeError(DominaiteError):
         message: str,
         charge: Optional[Dict[str, Any]] = None,
         result: Optional[Dict[str, Any]] = None,
+        *,
+        request_id: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.http_status = http_status
@@ -386,6 +539,7 @@ class ChargeError(DominaiteError):
         self.transaction_id = charge.get("transactionId") if charge else None
         #: The full envelope, for fields not modelled above.
         self.result = result if result is not None else {}
+        self.request_id = request_id
 
 
 class RevokeError(DominaiteError):
@@ -408,12 +562,15 @@ class RevokeError(DominaiteError):
         error_code: str,
         message: str,
         result: Optional[Dict[str, Any]] = None,
+        *,
+        request_id: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.http_status = http_status
         self.error_code = error_code
         #: The full envelope, for fields not modelled above.
         self.result = result if result is not None else {}
+        self.request_id = request_id
 
 
 class RefundError(ApiError):
@@ -450,8 +607,12 @@ class RefundError(ApiError):
         error_code: str,
         message: str,
         result: Optional[Dict[str, Any]] = None,
+        *,
+        request_id: Optional[str] = None,
     ) -> None:
-        super().__init__(http_status, message, error_code=error_code, result=result)
+        super().__init__(
+            http_status, message, error_code=error_code, result=result, request_id=request_id
+        )
         #: Seconds to keep retrying with the same key, or None when retrying cannot help.
         self.retry_stop_after_seconds = REFUND_RETRY_WINDOWS_SECONDS.get(error_code)
         #: True when the same call with the same key can still succeed.
@@ -485,4 +646,27 @@ class TransportError(DominaiteError):
 
     The request may or may not have reached the API. Safe to retry WITH THE SAME
     idempotency key; a retried key never creates a second payment.
+
+    On a 5xx the API answered, so ``http_status`` is set and ``error_code`` carries the
+    code it sent (``MERCHANT_API_UNAVAILABLE``, ``INTERNAL_ERROR``), None when it sent
+    none. ``result`` is the whole JSON body. All three are None or {} on a network
+    failure, where no answer arrived.
     """
+
+    def __init__(
+        self,
+        message: str,
+        http_status: Optional[int] = None,
+        error_code: Optional[str] = None,
+        result: Optional[Dict[str, Any]] = None,
+        *,
+        request_id: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        #: The 5xx status, or None when no answer arrived.
+        self.http_status = http_status
+        #: The code the API sent with the 5xx, or None.
+        self.error_code = error_code
+        #: The full JSON body the API sent, for fields not modelled above.
+        self.result = result if result is not None else {}
+        self.request_id = request_id

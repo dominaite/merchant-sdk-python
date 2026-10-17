@@ -42,6 +42,7 @@ from dominaite import (
     CheckoutIntegration,
     CheckoutRefusedError,
     DominaiteClient,
+    DominaiteError,
     ErrorCode,
     PaymentStatus,
     RateLimitError,
@@ -53,6 +54,7 @@ from dominaite import (
     is_paid,
     is_terminal,
     order_idempotency_key,
+    request_id_of,
     sign_request,
     sign_webhook,
     verify_webhook,
@@ -142,7 +144,8 @@ class _Recorder:
 
 @pytest.fixture
 def client():
-    return DominaiteClient(KEY_ID, SECRET, base_url=BASE_URL)
+    # The default retry policy stays on; only the wait is skipped.
+    return DominaiteClient(KEY_ID, SECRET, base_url=BASE_URL, sleep=lambda seconds: None)
 
 
 @pytest.fixture
@@ -755,6 +758,46 @@ def test_503_raises_transport_not_refusal(client, urlopen):
         )
 
 
+@pytest.mark.parametrize(
+    "status, code",
+    [(503, "MERCHANT_API_UNAVAILABLE"), (500, "INTERNAL_ERROR")],
+)
+def test_a_coded_5xx_is_a_transport_error_that_keeps_its_code(client, urlopen, status, code):
+    body = {"success": False, "error": {"code": code, "message": "Unavailable", "statusCode": status}}
+    urlopen((status, body))
+
+    with pytest.raises(TransportError) as raised:
+        client.get_status(TRANSACTION_ID)
+
+    assert raised.value.http_status == status
+    assert raised.value.error_code == code
+    assert raised.value.result == body
+
+
+def test_a_coded_5xx_on_a_refund_keeps_its_code(client, urlopen):
+    urlopen((503, {"success": False, "error": {"code": "MERCHANT_API_UNAVAILABLE"}}))
+
+    with pytest.raises(TransportError) as raised:
+        client.list_refunds(TRANSACTION_ID)
+
+    assert raised.value.error_code == "MERCHANT_API_UNAVAILABLE"
+
+
+def test_an_html_502_from_a_proxy_is_a_transport_error(client, monkeypatch):
+    def proxy(request, timeout=None):
+        raise urllib.error.HTTPError(
+            request.full_url, 502, "Bad Gateway", _message({}), io.BytesIO(b"<html>502</html>")
+        )
+
+    _patch_opener(monkeypatch, proxy)
+
+    with pytest.raises(TransportError) as raised:
+        client.get_status(TRANSACTION_ID)
+
+    assert raised.value.http_status == 502
+    assert raised.value.error_code is None
+
+
 def test_network_failure_raises_transport(client, urlopen):
     urlopen(urllib.error.URLError("connection reset"))
 
@@ -1083,8 +1126,8 @@ def test_other_4xx_codes_stay_a_plain_api_error(client, urlopen):
     assert not isinstance(raised.value, StorefrontError)
 
 
-def test_a_storefront_mismatch_on_replay_is_a_refusal_carrying_the_code(client, urlopen):
-    """The replay path answers 200 with success false, not 400."""
+def test_a_storefront_mismatch_on_replay_is_a_storefront_error(client, urlopen):
+    """The replay path answers 200 with success false, not 400, and is the same error."""
     urlopen(
         (
             200,
@@ -1096,7 +1139,7 @@ def test_a_storefront_mismatch_on_replay_is_a_refusal_carrying_the_code(client, 
         )
     )
 
-    with pytest.raises(CheckoutRefusedError) as raised:
+    with pytest.raises(StorefrontError) as raised:
         client.create_checkout_session(
             amount=2500,
             currency="EUR",
@@ -1105,6 +1148,8 @@ def test_a_storefront_mismatch_on_replay_is_a_refusal_carrying_the_code(client, 
         )
 
     assert raised.value.error_code == ErrorCode.STOREFRONT_MISMATCH
+    assert raised.value.http_status == 200
+    assert not isinstance(raised.value, CheckoutRefusedError)
 
 
 def test_the_retry_helper_does_not_retry_a_storefront_refusal(client, urlopen):
@@ -2122,13 +2167,12 @@ def test_an_agreement_charge_refusal_is_a_charge_error_with_its_code(client, url
     assert caught.value.result == body
 
 
-def test_a_charge_under_an_unknown_agreement_is_an_api_error_404_with_its_code(client, urlopen):
+def test_a_charge_under_an_unknown_agreement_is_a_charge_error_404_with_its_code(client, urlopen):
     urlopen((404, _gateway_error(404, "AGREEMENT_NOT_FOUND", "Agreement not found.")))
 
-    with pytest.raises(ApiError) as caught:
+    with pytest.raises(ChargeError) as caught:
         _charge(client, agreement_id=AGREEMENT_ID)
 
-    assert not isinstance(caught.value, ChargeError)
     assert caught.value.http_status == 404
     assert caught.value.error_code == "AGREEMENT_NOT_FOUND"
 
@@ -2208,15 +2252,25 @@ def test_a_5xx_without_a_code_on_the_charge_route_is_still_a_transport_error(cli
         _charge(client)
 
 
-def test_a_charge_against_a_method_that_is_not_yours_is_an_api_error_404(client, urlopen):
+def test_a_charge_against_a_method_that_is_not_yours_is_a_charge_error_404(client, urlopen):
     urlopen((404, {"success": False, "error": {"code": "PAYMENT_METHOD_NOT_FOUND", "message": "No stored payment method with this id."}}))
+
+    with pytest.raises(ChargeError) as raised:
+        _charge(client)
+
+    assert raised.value.http_status == 404
+    assert raised.value.error_code == "PAYMENT_METHOD_NOT_FOUND"
+    assert raised.value.charge is None
+
+
+def test_a_charge_404_without_a_code_stays_the_generic_api_error(client, urlopen):
+    urlopen((404, {"success": False}))
 
     with pytest.raises(ApiError) as raised:
         _charge(client)
 
-    assert not isinstance(raised.value, ChargeError)
     assert raised.value.http_status == 404
-    assert raised.value.error_code == "PAYMENT_METHOD_NOT_FOUND"
+    assert raised.value.error_code is None
 
 
 def test_a_2xx_without_a_charge_body_is_an_api_error_not_a_half_built_charge(client, urlopen):
@@ -2379,6 +2433,50 @@ def test_create_refund_signs_the_lowercase_transaction_id_path(client, urlopen):
     assert headers["x-signature"] == sign_request(
         SECRET, headers["x-timestamp"], "POST", path, REFUND_KEY, '{"amount":1500}'
     )
+
+
+def test_a_charge_signs_the_lowercase_payment_method_id_path(client, urlopen):
+    """The gateway signs the lowercase pm_ id; an upper-case one must not break the signature."""
+    upper = "pm_" + PAYMENT_METHOD_ID[3:].upper()
+    recorder = urlopen(_placed(), (204, b""))
+
+    client.charge_payment_method(
+        upper, 2500, "EUR", "order-1043", idempotency_key=CHARGE_IDEMPOTENCY_KEY
+    )
+    headers = _headers(recorder.last)
+    assert recorder.last.full_url == BASE_URL + CHARGE_PATH
+    assert headers["x-signature"] == sign_request(
+        SECRET, headers["x-timestamp"], "POST", CHARGE_PATH, CHARGE_IDEMPOTENCY_KEY, CHARGE_BODY
+    )
+
+    client.revoke_payment_method(upper)
+    headers = _headers(recorder.last)
+    revoke_path = PAYMENT_METHODS_PATH + "/" + PAYMENT_METHOD_ID
+    assert recorder.last.full_url == BASE_URL + revoke_path
+    assert headers["x-signature"] == sign_request(
+        SECRET, headers["x-timestamp"], "DELETE", revoke_path, "", ""
+    )
+
+
+@pytest.mark.parametrize("currency", ["eur", "Eur", "EURO", "E1R", 978])
+def test_a_currency_that_is_not_three_upper_case_letters_is_refused_before_sending(
+    client, urlopen, currency
+):
+    recorder = urlopen(_ok())
+
+    with pytest.raises(ValueError, match="currency"):
+        client.create_checkout_session(
+            amount=2500,
+            currency=currency,
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
+        )
+    with pytest.raises(ValueError, match="currency"):
+        _charge(client, currency=currency)
+    with pytest.raises(ValueError, match="currency"):
+        client.create_plan("Gold", 2500, currency, "month", idempotency_key="plan-gold")
+
+    assert recorder.requests == []
 
 
 @pytest.mark.parametrize("key", [None, ""])
@@ -3656,12 +3754,16 @@ def test_the_retry_helper_warns_before_each_retry(urlopen):
         idempotency_key=IDEMPOTENCY_KEY,
     )
 
-    assert len(warned) == 2
-    assert warned[0] == (
-        "dominaite-python: retrying create_checkout_session_with_retry after TransportError "
+    assert len(warned) == 3
+    assert "create_checkout_session_with_retry is deprecated" in warned[0]
+    assert warned[1] == (
+        "dominaite-python: retrying POST /merchant-api/checkout/sessions after HTTP 503 "
         "(attempt 2 of 3)"
     )
-    assert warned[1].endswith("(attempt 3 of 3)")
+    assert warned[2] == (
+        "dominaite-python: retrying POST /merchant-api/checkout/sessions after "
+        "PAYMENT_PROCESSING_UNAVAILABLE (attempt 3 of 3)"
+    )
 
 
 def test_debug_is_off_by_default(urlopen):
@@ -3698,7 +3800,7 @@ def test_debug_writes_one_line_per_request(urlopen):
 
 def test_debug_marks_a_transport_failure_and_leaves_out_the_query(urlopen):
     lines = []
-    client = DominaiteClient(KEY_ID, SECRET, BASE_URL, on_debug=lines.append)
+    client = DominaiteClient(KEY_ID, SECRET, BASE_URL, on_debug=lines.append, max_retries=0)
     urlopen(urllib.error.URLError("refused"))
 
     with pytest.raises(TransportError):
@@ -3739,3 +3841,352 @@ def test_no_line_carries_the_secret_the_signature_the_cashier_token_or_a_body(ur
         assert "{" not in line
         for signature in signatures:
             assert signature not in line
+
+
+# --- request id ----------------------------------------------------------------
+
+BODY_REQUEST_ID = "c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a"
+HEADER_REQUEST_ID = "9f8e7d6c-5b4a-4321-8fed-cba987654321"
+
+
+def _with_metadata(body):
+    return dict(body, metadata={"requestId": BODY_REQUEST_ID, "apiVersion": "1.0"})
+
+
+def test_the_header_request_id_wins_over_the_body(client, urlopen):
+    urlopen((200, _with_metadata(_ok()[1]), {"Dominaite-Request-Id": HEADER_REQUEST_ID}))
+
+    session = client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference="order-1042", idempotency_key=IDEMPOTENCY_KEY
+    )
+
+    assert request_id_of(session) == HEADER_REQUEST_ID
+    assert session == CHECKOUT
+
+
+def test_the_body_request_id_is_the_fallback_when_there_is_no_header(client, urlopen):
+    urlopen((200, _with_metadata({"success": True, "data": {"pong": True}})))
+
+    pong = client.ping()
+
+    assert request_id_of(pong) == BODY_REQUEST_ID
+    assert pong.request_id == BODY_REQUEST_ID
+    assert pong == {"pong": True}
+
+
+def test_the_request_id_is_none_when_the_answer_has_none(client, urlopen):
+    urlopen((200, {"success": True, "data": {"pong": True}}))
+
+    assert request_id_of(client.ping()) is None
+
+
+@pytest.mark.parametrize(
+    "call, answer",
+    [
+        ("status", (200, {"success": True, "data": {"transactionId": TRANSACTION_ID, "status": "pending"}})),
+        ("plans", (200, {"success": True, "data": []})),
+        ("transactions", (200, {"success": True, "data": {"items": [], "nextCursor": None}})),
+        ("refunds", (200, {"success": True, "data": {"transactionId": TRANSACTION_ID, "currency": "EUR", "refundedAmount": 0, "refundableAmount": 2500, "refunds": []}})),
+        ("charge", (201, {"success": True, "data": CHARGE})),
+    ],
+)
+def test_every_result_shape_carries_the_request_id(client, urlopen, call, answer):
+    urlopen((answer[0], _with_metadata(answer[1])))
+    calls = {
+        "status": lambda: client.get_status(TRANSACTION_ID),
+        "plans": lambda: client.list_plans(),
+        "transactions": lambda: client.list_transactions("2026-10-01", "2026-10-02"),
+        "refunds": lambda: client.list_refunds(TRANSACTION_ID),
+        "charge": lambda: _charge(client),
+    }
+
+    assert request_id_of(calls[call]()) == BODY_REQUEST_ID
+
+
+@pytest.mark.parametrize(
+    "status, body, error_type",
+    [
+        (401, {"success": False, "error": {"code": "INVALID_SIGNATURE"}}, AuthenticationError),
+        (429, {"success": False, "error": {"code": "RATE_LIMIT_EXCEEDED"}}, RateLimitError),
+        (400, {"success": False, "error": {"code": "VALIDATION_ERROR"}}, ApiError),
+        (409, {"success": False, "error": {"code": "STOREFRONT_INACTIVE"}}, StorefrontError),
+        (503, {"success": False, "error": {"code": "MERCHANT_API_UNAVAILABLE"}}, TransportError),
+        (200, {"success": True, "data": {"success": False, "errorCode": "ALREADY_PROCESSED"}}, CheckoutRefusedError),
+    ],
+)
+def test_every_error_carries_the_request_id(client, urlopen, status, body, error_type):
+    urlopen((status, _with_metadata(body)))
+
+    with pytest.raises(error_type) as raised:
+        client.create_checkout_session(
+            amount=2500, currency="EUR", order_reference="order-1042", idempotency_key=IDEMPOTENCY_KEY
+        )
+
+    assert raised.value.request_id == BODY_REQUEST_ID
+    assert request_id_of(raised.value) == BODY_REQUEST_ID
+
+
+def test_charge_and_refund_errors_carry_the_request_id(client, urlopen):
+    urlopen(
+        (409, _with_metadata({"success": False, "error": {"code": "CHARGE_IN_PROGRESS"}}), {"Dominaite-Request-Id": HEADER_REQUEST_ID}),
+        (422, _with_metadata({"success": False, "error": {"code": "PAYMENT_NOT_REFUNDABLE"}})),
+    )
+
+    with pytest.raises(ChargeError) as charge:
+        _charge(client)
+    with pytest.raises(RefundError) as refund:
+        client.create_refund(TRANSACTION_ID, idempotency_key="refund-1")
+
+    assert charge.value.request_id == HEADER_REQUEST_ID
+    assert refund.value.request_id == BODY_REQUEST_ID
+
+
+def test_a_network_failure_has_no_request_id(client, urlopen):
+    urlopen(urllib.error.URLError("connection reset"))
+
+    with pytest.raises(TransportError) as raised:
+        client.ping()
+
+    assert raised.value.request_id is None
+    assert raised.value.http_status is None
+
+
+def test_the_debug_line_names_the_body_request_id_when_there_is_no_header(urlopen):
+    lines = []
+    client = DominaiteClient(KEY_ID, SECRET, base_url=BASE_URL, on_debug=lines.append)
+    urlopen((200, _with_metadata({"success": True, "data": {"pong": True}})))
+
+    client.ping()
+
+    assert lines and lines[-1].endswith("request_id=" + BODY_REQUEST_ID)
+
+
+# --- the client retry policy ----------------------------------------------------
+
+
+class _Clock:
+    """Records every wait the client asks for, without waiting."""
+
+    def __init__(self):
+        self.waits = []
+
+    def __call__(self, seconds):
+        self.waits.append(seconds)
+
+
+def _retrying_client(max_retries=2, rng=lambda: 0.5, **kwargs):
+    clock = _Clock()
+    client = DominaiteClient(
+        KEY_ID, SECRET, BASE_URL, max_retries=max_retries, sleep=clock, random=rng, **kwargs
+    )
+    return client, clock
+
+
+def _signature_inputs(request):
+    """What the signature covers apart from the timestamp: method, path, key and body."""
+    headers = _headers(request)
+    body = request.data.decode("utf-8") if request.data is not None else ""
+    path = urllib.parse.urlsplit(request.full_url).path[len(urllib.parse.urlsplit(BASE_URL).path):]
+    assert headers["x-signature"] == sign_request(
+        SECRET, headers["x-timestamp"], request.get_method(), path, headers.get("idempotency-key", ""), body
+    )
+    return (request.get_method(), path, headers.get("idempotency-key"), body)
+
+
+def test_a_transport_failure_then_success_on_a_charge_reuses_the_key_and_the_signed_body(urlopen):
+    client, _ = _retrying_client()
+    recorder = urlopen(urllib.error.URLError("connection reset"), _placed())
+
+    charge = _charge(client)
+
+    assert charge == CHARGE_RESULT
+    assert len(recorder.requests) == 2
+    first, second = (_signature_inputs(request) for request in recorder.requests)
+    assert first == second == ("POST", CHARGE_PATH, CHARGE_IDEMPOTENCY_KEY, CHARGE_BODY)
+
+
+def test_a_transport_failure_then_success_on_a_refund_reuses_the_key_and_the_signed_body(urlopen):
+    client, _ = _retrying_client()
+    recorder = urlopen(urllib.error.URLError("timed out"), _accepted())
+
+    client.create_refund(TRANSACTION_ID, amount=1500, idempotency_key=REFUND_KEY)
+
+    assert len(recorder.requests) == 2
+    first, second = (_signature_inputs(request) for request in recorder.requests)
+    path = PAYMENTS_PATH + "/" + TRANSACTION_ID + "/refunds"
+    assert first == second == ("POST", path, REFUND_KEY, '{"amount":1500}')
+
+
+def test_max_retries_0_sends_once(urlopen):
+    client, clock = _retrying_client(max_retries=0)
+    recorder = urlopen(urllib.error.URLError("down"))
+
+    with pytest.raises(TransportError):
+        _charge(client)
+
+    assert len(recorder.requests) == 1
+    assert clock.waits == []
+
+
+def test_the_default_policy_sends_three_times_then_raises(urlopen):
+    clock = _Clock()
+    client = DominaiteClient(KEY_ID, SECRET, BASE_URL, sleep=clock)
+    recorder = urlopen((503, {"success": False, "error": {"code": "MERCHANT_API_UNAVAILABLE"}}))
+
+    with pytest.raises(TransportError) as raised:
+        client.get_status(TRANSACTION_ID)
+
+    assert len(recorder.requests) == 3
+    assert len(clock.waits) == 2
+    assert raised.value.error_code == "MERCHANT_API_UNAVAILABLE"
+
+
+def test_a_429_is_raised_without_a_retry_and_keeps_retry_after(urlopen):
+    client, clock = _retrying_client()
+    recorder = urlopen(
+        (429, {"success": False, "error": {"code": "RATE_LIMIT_EXCEEDED"}}, {"Retry-After": "17"})
+    )
+
+    with pytest.raises(RateLimitError) as raised:
+        _charge(client)
+
+    assert len(recorder.requests) == 1
+    assert clock.waits == []
+    assert raised.value.retry_after_seconds == 17
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        (400, {"success": False, "error": {"code": "VALIDATION_ERROR"}}),
+        (401, {"success": False, "error": {"code": "INVALID_SIGNATURE"}}),
+        (409, {"success": False, "error": {"code": "CHARGE_IN_PROGRESS"}}),
+        (502, {"success": False, "data": CHARGE, "error": {"code": "CHARGE_OUTCOME_UNKNOWN"}}),
+        (502, {"success": False, "error": {"code": "CHARGE_FAILED"}}),
+    ],
+    ids=["400", "401", "409", "502-outcome-unknown", "502-charge-failed"],
+)
+def test_an_answer_about_the_call_is_not_retried(urlopen, answer):
+    client, _ = _retrying_client()
+    recorder = urlopen(answer)
+
+    with pytest.raises(DominaiteError):
+        _charge(client)
+
+    assert len(recorder.requests) == 1
+
+
+def test_payment_processing_unavailable_on_a_charge_is_retried_with_the_same_key(urlopen):
+    client, _ = _retrying_client()
+    unavailable = (503, {"success": False, "error": {"code": "PAYMENT_PROCESSING_UNAVAILABLE"}})
+    recorder = urlopen(unavailable, _placed())
+
+    assert _charge(client) == CHARGE_RESULT
+    assert [_headers(r)["idempotency-key"] for r in recorder.requests] == [CHARGE_IDEMPOTENCY_KEY] * 2
+
+
+def test_a_payment_processing_refusal_on_create_is_retried(urlopen):
+    client, _ = _retrying_client()
+    refusal = (200, {"success": False, "errorCode": "PAYMENT_PROCESSING_UNAVAILABLE"})
+    recorder = urlopen(refusal, _ok())
+
+    session = client.create_checkout_session(
+        amount=2500, currency="EUR", order_reference="order-1042", idempotency_key=IDEMPOTENCY_KEY
+    )
+
+    assert session == CHECKOUT
+    assert len(recorder.requests) == 2
+
+
+def test_a_patch_and_a_delete_are_never_retried(urlopen):
+    client, _ = _retrying_client()
+    recorder = urlopen(urllib.error.URLError("down"))
+
+    with pytest.raises(TransportError):
+        client.update_plan("plan_0123456789abcdef0123456789abcdef", name="Gold")
+    with pytest.raises(TransportError):
+        client.revoke_payment_method(PAYMENT_METHOD_ID)
+
+    assert len(recorder.requests) == 2
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        urllib.error.URLError("timed out"),
+        (503, {"success": False, "error": {"code": "MERCHANT_API_UNAVAILABLE"}}),
+    ],
+)
+def test_a_webhook_endpoint_create_is_sent_once(urlopen, failure):
+    """A replay of a create that already succeeded answers without the secret, so the SDK
+    never repeats it on its own, whatever max_retries says."""
+    client, clock = _retrying_client(max_retries=2)
+    recorder = urlopen(failure, (201, {"success": True, "data": dict(WEBHOOK_ENDPOINT)}))
+
+    with pytest.raises(TransportError):
+        client.create_webhook_endpoint(**_webhook_arguments())
+
+    assert len(recorder.requests) == 1
+    assert clock.waits == []
+
+
+@pytest.mark.parametrize("rng_value", [0.001, 0.25, 0.999999])
+def test_each_wait_stays_inside_its_full_jitter_bound(urlopen, rng_value):
+    client, clock = _retrying_client(max_retries=6, rng=lambda: rng_value)
+    urlopen(urllib.error.URLError("down"))
+
+    with pytest.raises(TransportError):
+        client.ping()
+
+    bounds = [0.5, 1.0, 2.0, 4.0, 8.0, 8.0]
+    assert len(clock.waits) == len(bounds)
+    for wait, bound in zip(clock.waits, bounds):
+        assert 0 <= wait < bound
+        assert wait == pytest.approx(rng_value * bound)
+
+
+def test_a_zero_draw_retries_at_once_without_a_wait(urlopen):
+    client, clock = _retrying_client(max_retries=2, rng=lambda: 0.0)
+    recorder = urlopen(urllib.error.URLError("down"))
+
+    with pytest.raises(TransportError):
+        client.ping()
+
+    assert len(recorder.requests) == 3
+    assert clock.waits == []
+
+
+def test_the_wait_is_capped_at_eight_seconds(urlopen):
+    client, clock = _retrying_client(max_retries=8, rng=lambda: 1.0)
+    urlopen(urllib.error.URLError("down"))
+
+    with pytest.raises(TransportError):
+        client.ping()
+
+    assert max(clock.waits) == 8.0
+    assert clock.waits[:4] == [0.5, 1.0, 2.0, 4.0]
+
+
+@pytest.mark.parametrize("value", [-1, True, 1.5, "2"])
+def test_max_retries_must_be_a_whole_number_of_at_least_0(value):
+    with pytest.raises(ValueError, match="max_retries"):
+        DominaiteClient(KEY_ID, SECRET, BASE_URL, max_retries=value)
+
+
+def test_the_deprecated_helper_uses_its_own_attempts_not_the_client_policy(urlopen):
+    client, clock = _retrying_client(max_retries=0)
+    recorder = urlopen((503, {}), (503, {}), _ok())
+
+    with pytest.warns(DeprecationWarning):
+        session = client.create_checkout_session_with_retry(
+            amount=2500,
+            currency="EUR",
+            order_reference="order-1042",
+            idempotency_key=IDEMPOTENCY_KEY,
+            max_attempts=3,
+            backoff_seconds=0.5,
+        )
+
+    assert session == CHECKOUT
+    assert len(recorder.requests) == 3
+    assert clock.waits == [0.25, 0.5]

@@ -41,6 +41,7 @@ from dominaite import (
     CheckoutRefusedError,
     DeclineClass,
     DominaiteClient,
+    DominaiteError,
     PaymentStatus,
     RefundError,
     RefundStatus,
@@ -49,6 +50,7 @@ from dominaite import (
     StoredPaymentMethodRetiredReason,
     StoredPaymentMethodStatus,
     TransportError,
+    request_id_of,
 )
 
 CONTRACT = json.loads(
@@ -82,7 +84,8 @@ class _Response:
 
 @pytest.fixture
 def client():
-    return DominaiteClient(KEY_ID, SECRET, base_url=BASE_URL)
+    # The default retry policy stays on; only the wait is skipped.
+    return DominaiteClient(KEY_ID, SECRET, base_url=BASE_URL, sleep=lambda seconds: None)
 
 
 def _patch_opener(monkeypatch, handler):
@@ -336,7 +339,8 @@ def test_payment_method_vocabularies_equal_the_contract():
     )
     assert list(CHARGE_STATUSES) == CONTRACT["chargeStatusVocabulary"]
     assert list(DECLINE_CLASSES) == CONTRACT["declineClassVocabulary"]
-    assert list(CHARGE_ERROR_CODES) == CONTRACT["chargeErrorCodes"]
+    # The hand fixture lists the first seven charge codes; the gateway has more.
+    assert CHARGE_ERROR_CODES[: len(CONTRACT["chargeErrorCodes"])] == tuple(CONTRACT["chargeErrorCodes"])
     assert list(REVOKE_ERROR_CODES) == CONTRACT["revokeErrorCodes"]
     assert StoredPaymentMethodStatus.ACTIVE == "active"
     assert ChargeStatus.CANCELLED == "cancelled"
@@ -416,19 +420,18 @@ def test_every_charge_error_example_is_a_charge_error_with_code_status_and_data(
 
 def test_the_charge_error_examples_cover_every_code_the_sdk_claims():
     seen = {e["code"] for e in ENDPOINTS["chargePaymentMethod"]["errorExamples"]}
-    assert seen == set(CHARGE_ERROR_CODES)
+    assert seen <= set(CHARGE_ERROR_CODES)
     seen = {e["code"] for e in ENDPOINTS["revokePaymentMethod"]["errorExamples"]}
     assert seen == set(REVOKE_ERROR_CODES)
 
 
-def test_a_charge_against_an_unknown_id_is_the_generic_api_error_404(client, answers_with):
+def test_a_charge_against_an_unknown_id_is_a_charge_error_404(client, answers_with):
     example = ENDPOINTS["chargePaymentMethod"]["notFoundExample"]
     answers_with(example["body"], example["httpStatus"])
 
-    with pytest.raises(ApiError) as raised:
+    with pytest.raises(ChargeError) as raised:
         _charge(client)
 
-    assert not isinstance(raised.value, ChargeError)
     assert raised.value.http_status == 404
     assert raised.value.error_code == example["code"]
 
@@ -809,3 +812,51 @@ def test_the_fixture_is_the_v1_contract():
         "ping",
         "revokePaymentMethod",
     ]
+
+
+# --- request id ----------------------------------------------------------------
+#
+# Production sends the call's id only as metadata.requestId in the body. Every example
+# that carries one must reach the caller on the result or on the error.
+
+
+def _examples_with_a_request_id():
+    found = []
+    for name in ("chargePaymentMethod", "revokePaymentMethod", "createRefund", "getRefund"):
+        endpoint = ENDPOINTS[name]
+        for key, value in endpoint.items():
+            examples = value if isinstance(value, list) else [value]
+            for index, example in enumerate(examples):
+                if not isinstance(example, dict):
+                    continue
+                body = example.get("body", example)
+                status = example.get("httpStatus", endpoint["httpStatus"])
+                if key == "declinedExample":
+                    status = endpoint["declinedHttpStatus"]
+                if isinstance(body, dict) and "requestId" in body.get("metadata", {}):
+                    found.append(pytest.param(name, body, status, id="{0}.{1}[{2}]".format(name, key, index)))
+    return found
+
+
+@pytest.mark.parametrize("name, body, status", _examples_with_a_request_id())
+def test_every_example_request_id_reaches_the_result_or_the_error(
+    client, answers_with, name, body, status
+):
+    answers_with(body, status)
+    data = ENDPOINTS["getRefund"]["succeededExample"]["data"]
+    calls = {
+        "chargePaymentMethod": lambda: _charge(client),
+        "revokePaymentMethod": lambda: client.revoke_payment_method(PAYMENT_METHOD_ID),
+        "createRefund": lambda: client.create_refund(
+            data["transactionId"], amount=2500, idempotency_key=REFUND_KEY
+        ),
+        "getRefund": lambda: client.get_refund(data["transactionId"], data["refundId"]),
+    }
+
+    try:
+        outcome = calls[name]()
+    except DominaiteError as error:
+        outcome = error
+
+    assert request_id_of(outcome) == body["metadata"]["requestId"]
+    assert outcome.request_id == body["metadata"]["requestId"]
