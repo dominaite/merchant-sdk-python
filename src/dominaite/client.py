@@ -4,6 +4,7 @@ import datetime
 import hashlib
 import hmac
 import json
+import platform
 import re
 import time
 import urllib.error
@@ -99,6 +100,23 @@ _REFUND_ID_RE = _PAYMENT_METHOD_ID_RE
 #: Plan and agreement ids (``plan_...``, ``agr_...``) are signed exactly as sent and are
 #: case-sensitive, so they are never case-changed; the same single-segment rule applies.
 _RECURRING_ID_RE = _PAYMENT_METHOD_ID_RE
+
+#: CR, LF and the other control characters. A User-Agent suffix carrying one could split
+#: the header, so the constructor refuses it.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _user_agent(suffix: Optional[str]) -> str:
+    """``dominaite-python/<version> (python <version>)``, then the caller's suffix."""
+    base = "dominaite-python/{0} (python {1})".format(__version__, platform.python_version())
+    if suffix is None:
+        return base
+    if not isinstance(suffix, str):
+        raise ValueError("user_agent must be a string")
+    if _CONTROL_CHARS_RE.search(suffix):
+        raise ValueError("user_agent must not contain control characters")
+    trimmed = suffix.strip()
+    return base + " " + trimmed if trimmed else base
 
 
 class _Reply(NamedTuple):
@@ -491,6 +509,8 @@ class DominaiteClient:
         secret: str,
         base_url: Optional[str] = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        *,
+        user_agent: Optional[str] = None,
     ) -> None:
         """
         :param key_id: Your API key id (``dmk_...``), from the Dominaite dashboard.
@@ -499,6 +519,9 @@ class DominaiteClient:
             own value. Must be ``https://`` unless the host is localhost, 127.0.0.1 or ::1.
             A missing, empty or whitespace-only value raises ``ValueError``.
         :param timeout: Per-request socket timeout in seconds.
+        :param user_agent: Your own identifier, appended to the SDK's User-Agent after one
+            space (for example ``"shop/1.2"``). It helps support find your calls in the
+            access logs. Blank means none; a control character raises ``ValueError``.
         """
         if not key_id.startswith("dmk_"):
             raise ValueError("key_id must start with dmk_")
@@ -510,6 +533,7 @@ class DominaiteClient:
         self._secret = _Secret(secret)
         self._base_url = base_url
         self._timeout = timeout
+        self._user_agent = _user_agent(user_agent)
         # Own opener rather than urlopen(): the default one follows redirects, and the
         # signed headers must never leave the host we addressed.
         self._opener = urllib.request.build_opener(_NoRedirectHandler)
@@ -1635,7 +1659,7 @@ class DominaiteClient:
         headers = {
             "Content-Type": "application/json",
             # Some edges block requests without a real User-Agent - always send one.
-            "User-Agent": "dominaite-python/" + __version__,
+            "User-Agent": self._user_agent,
         }
         if signed:
             timestamp = str(int(time.time()))

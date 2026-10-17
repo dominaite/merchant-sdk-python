@@ -6,13 +6,17 @@ import hashlib
 import io
 import json
 import pickle
+import platform
 import pprint
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 
 import pytest
+
+import dominaite
 
 from dominaite import (
     AGREEMENTS_PATH,
@@ -3490,3 +3494,37 @@ def test_values_the_sdk_has_never_seen_pass_through_and_never_throw(client, urlo
     event = verify_webhook(body, header, WEBHOOK_SECRET, now=int(timestamp))
     assert event["type"] == "payment.settled_v9"
     assert event["data"]["status"] == "settling_v9"
+
+
+# --- User-Agent ----------------------------------------------------------------
+
+
+def test_the_user_agent_names_the_sdk_version_and_the_python_version(client, urlopen):
+    recorder = urlopen((200, {"pong": True}))
+    client.ping()
+    agent = _headers(recorder.last)["user-agent"]
+    assert re.fullmatch(r"dominaite-python/0\.6\.0 \(python [^ ()]+\)", agent), agent
+    assert agent == "dominaite-python/{0} (python {1})".format(
+        dominaite.__version__, platform.python_version()
+    )
+
+
+def test_the_user_agent_suffix_follows_after_one_space(urlopen):
+    recorder = urlopen((200, {"pong": True}))
+    DominaiteClient(KEY_ID, SECRET, BASE_URL, user_agent="  shop/1.2 ").ping()
+    assert re.fullmatch(
+        r"dominaite-python/0\.6\.0 \(python [^ ()]+\) shop/1\.2",
+        _headers(recorder.last)["user-agent"],
+    )
+
+
+def test_a_blank_user_agent_suffix_is_none(urlopen):
+    recorder = urlopen((200, {"pong": True}))
+    DominaiteClient(KEY_ID, SECRET, BASE_URL, user_agent="   ").ping()
+    assert _headers(recorder.last)["user-agent"].endswith(")")
+
+
+@pytest.mark.parametrize("suffix", ["shop\r\nX-Injected: 1", "shop\n", "tab\there", "del\x7f"])
+def test_a_user_agent_suffix_with_a_control_character_is_refused(suffix):
+    with pytest.raises(ValueError, match="control characters"):
+        DominaiteClient(KEY_ID, SECRET, BASE_URL, user_agent=suffix)
