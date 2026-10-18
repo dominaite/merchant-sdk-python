@@ -1182,7 +1182,7 @@ client = DominaiteClient(
   Debug is off until you pass it. Give support the `request_id` when you ask about a call.
 - No line carries the secret, the signature, a cashier token, a query string or a request or
   response body. An exception from either callable is dropped, so it never fails the request.
-- The User-Agent is `dominaite-python/0.6.0 (python 3.12.4)`, then your `user_agent` suffix
+- The User-Agent is `dominaite-python/0.7.0 (python 3.12.4)`, then your `user_agent` suffix
   after one space. A suffix with a control character raises `ValueError`.
 
 ## Errors
