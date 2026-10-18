@@ -3601,7 +3601,7 @@ def test_the_user_agent_names_the_sdk_version_and_the_python_version(client, url
     recorder = urlopen((200, {"pong": True}))
     client.ping()
     agent = _headers(recorder.last)["user-agent"]
-    assert re.fullmatch(r"dominaite-python/0\.6\.0 \(python [^ ()]+\)", agent), agent
+    assert re.fullmatch(r"dominaite-python/%s \(python [^ ()]+\)" % re.escape(dominaite.__version__), agent), agent
     assert agent == "dominaite-python/{0} (python {1})".format(
         dominaite.__version__, platform.python_version()
     )
@@ -3611,7 +3611,7 @@ def test_the_user_agent_suffix_follows_after_one_space(urlopen):
     recorder = urlopen((200, {"pong": True}))
     DominaiteClient(KEY_ID, SECRET, BASE_URL, user_agent="  shop/1.2 ").ping()
     assert re.fullmatch(
-        r"dominaite-python/0\.6\.0 \(python [^ ()]+\) shop/1\.2",
+        r"dominaite-python/%s \(python [^ ()]+\) shop/1\.2" % re.escape(dominaite.__version__),
         _headers(recorder.last)["user-agent"],
     )
 
@@ -3630,9 +3630,10 @@ def test_a_user_agent_suffix_with_a_control_character_is_refused(suffix):
 
 # --- warnings, the SDK notice and the debug log ----------------------------------
 
-NOTICE = 'deprecated; current="0.7.0"; sunset="2027-01-31"; info="https://example.test/upgrade"'
+SDK = "dominaite-python " + dominaite.__version__
+NOTICE = 'deprecated; current="9.1.0"; sunset="2027-01-31"; info="https://example.test/upgrade"'
 NOTICE_MESSAGE = (
-    "dominaite-python 0.6.0 is deprecated; upgrade to 0.7.0 (sunset 2027-01-31). "
+    SDK + " is deprecated; upgrade to 9.1.0 (sunset 2027-01-31). "
     "https://example.test/upgrade"
 )
 
@@ -3640,7 +3641,7 @@ NOTICE_MESSAGE = (
 def test_one_warning_per_distinct_notice_value(urlopen):
     warned = []
     client = DominaiteClient(KEY_ID, SECRET, BASE_URL, on_warning=warned.append)
-    other = 'deprecated; current="0.8.0"'
+    other = 'deprecated; current="9.2.0"'
     urlopen(
         (200, {"pong": True}, {"Dominaite-Sdk-Notice": NOTICE}),
         (200, {"pong": True}, {"Dominaite-Sdk-Notice": NOTICE}),
@@ -3650,7 +3651,7 @@ def test_one_warning_per_distinct_notice_value(urlopen):
     for _ in range(4):
         client.ping()
 
-    assert warned == [NOTICE_MESSAGE, "dominaite-python 0.6.0 is deprecated; upgrade to 0.8.0."]
+    assert warned == [NOTICE_MESSAGE, SDK + " is deprecated; upgrade to 9.2.0."]
 
 
 def test_a_notice_on_an_error_response_also_warns(urlopen):
@@ -3675,8 +3676,8 @@ def test_a_notice_without_sunset_or_info_and_an_unknown_notice_kind(urlopen):
     client.ping()
 
     assert warned == [
-        "dominaite-python 0.6.0 is deprecated.",
-        'dominaite-python 0.6.0: maintenance; at="tonight"',
+        SDK + " is deprecated.",
+        SDK + ': maintenance; at="tonight"',
     ]
 
 
